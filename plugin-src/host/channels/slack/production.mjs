@@ -79,6 +79,7 @@ export async function createProductionController(ctx, config = {}, internals = {
         config: botConfig,
         botToken,
         appToken,
+        sourceChannelLabel: 'Slack',
         harness: workspaceScope.harness,
         state: workspaceScope.state,
         replyTimeoutMs: config.replyTimeoutMs ?? 600_000,

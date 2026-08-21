@@ -74,6 +74,7 @@ export class WeixinRuntime {
   #replyTimeoutMs;
   #maxMessageChars;
   #startRetryDelaysMs;
+  #sourceChannelLabel;
   #status = createWeixinRuntimeStatus();
   #bridge = null;
   #abortController = null;
@@ -90,6 +91,7 @@ export class WeixinRuntime {
     replyTimeoutMs = 600_000,
     maxMessageChars = 4_000,
     startRetryDelaysMs,
+    sourceChannelLabel,
   }) {
     if (!api || !config || !token || !harness || !state) {
       throw new TypeError('WeixinRuntime requires API, account, token, Harness, and state');
@@ -103,6 +105,7 @@ export class WeixinRuntime {
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#maxMessageChars = maxMessageChars;
     this.#startRetryDelaysMs = startRetryDelays(startRetryDelaysMs);
+    this.#sourceChannelLabel = sourceChannelLabel;
   }
 
   get status() {
@@ -144,6 +147,7 @@ export class WeixinRuntime {
         logger: this.#logger,
         replyTimeoutMs: this.#replyTimeoutMs,
         maxMessageChars: this.#maxMessageChars,
+        sourceChannelLabel: this.#sourceChannelLabel,
         signal,
       });
       this.#status.ready = true;

@@ -142,6 +142,7 @@ export class QqHarnessBridge {
   #replyTimeoutMs;
   #signal;
   #fetchImpl;
+  #sourceChannelLabel;
   #queues = new Map();
   #pendingInteractions = new Map();
   #interactionKeys = new Map();
@@ -158,6 +159,7 @@ export class QqHarnessBridge {
     status = createQqBridgeStatus(),
     logger = console,
     replyTimeoutMs = 600_000,
+    sourceChannelLabel,
     signal,
     fetchImpl = fetch,
   }) {
@@ -174,6 +176,7 @@ export class QqHarnessBridge {
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#signal = signal;
     this.#fetchImpl = fetchImpl;
+    this.#sourceChannelLabel = sourceChannelLabel;
     this.#approvals = new HarnessApprovalQueue({ label: 'qq', logger });
   }
 
@@ -422,6 +425,7 @@ export class QqHarnessBridge {
           harness: this.#harness,
           state: this.#state,
           key,
+          channelLabel: this.#sourceChannelLabel,
           ...(hasImages ? { content } : { text }),
           createOptions: { signal: this.#signal },
           existsOptions: { signal: this.#signal },

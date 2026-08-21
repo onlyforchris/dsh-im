@@ -32,6 +32,28 @@ async function createSession(harness, options) {
 }
 
 /**
+ * Tag an inbound prompt with its source channel so the agent can attribute
+ * work (e.g. cross-channel work logs) without guessing from context.
+ */
+export function tagPromptWithChannel(text, content, channelLabel) {
+  const label = typeof channelLabel === 'string' ? channelLabel.trim() : '';
+  if (!label) return { text, content };
+  const tag = `[来源渠道:${label}]`;
+  if (Array.isArray(content)) {
+    const tagged = content.slice();
+    const index = tagged.findIndex((item) => item?.type === 'text');
+    if (index === -1) {
+      tagged.unshift({ type: 'text', text: tag });
+    } else {
+      const body = typeof tagged[index].text === 'string' ? tagged[index].text : '';
+      tagged[index] = { ...tagged[index], text: body ? `${tag}\n${body}` : tag };
+    }
+    return { text, content: tagged };
+  }
+  return { text: text ? `${tag}\n${text}` : tag, content };
+}
+
+/**
  * Resolve, persist, and ask through a session that belongs to the bot's
  * current workspace. A concurrent workspace switch invalidates the scoped
  * session and retries before any prompt is sent to the stale session.
@@ -42,10 +64,12 @@ export async function askInWorkspaceSession({
   key,
   text,
   content,
+  channelLabel,
   createOptions,
   existsOptions,
   askOptions,
 }) {
+  const prompt = tagPromptWithChannel(text, content, channelLabel);
   while (true) {
     try {
       const binding = await withSessionBindingLock(state, key, async () => {
@@ -61,7 +85,7 @@ export async function askInWorkspaceSession({
       if (!binding) continue;
       return {
         sessionId: binding.sessionId,
-        answer: await binding.session.ask(content ?? text, askOptions),
+        answer: await binding.session.ask(prompt.content ?? prompt.text, askOptions),
       };
     } catch (error) {
       if (error?.code !== WORKSPACE_SESSION_STALE) throw error;

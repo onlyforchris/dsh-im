@@ -214,6 +214,7 @@ export class TelegramRuntime {
   #createApi;
   #accessMode;
   #allowedPrivateUserIds;
+  #sourceChannelLabel;
   #status = createTelegramRuntimeStatus();
   #api = null;
   #bridge = null;
@@ -229,6 +230,7 @@ export class TelegramRuntime {
     logger = console,
     replyTimeoutMs = 600_000,
     createApi = (options) => new TelegramApi(options),
+    sourceChannelLabel,
   }) {
     if (!config || !token || !harness || !state) {
       throw new TypeError('TelegramRuntime requires config, token, Harness, and state');
@@ -243,6 +245,7 @@ export class TelegramRuntime {
     const accessPolicy = normalizeTelegramAccessPolicy(config);
     this.#accessMode = accessPolicy.accessMode;
     this.#allowedPrivateUserIds = new Set(accessPolicy.allowedUsers);
+    this.#sourceChannelLabel = sourceChannelLabel;
   }
 
   get status() {
@@ -298,6 +301,7 @@ export class TelegramRuntime {
         status: this.#status,
         logger: this.#logger,
         replyTimeoutMs: this.#replyTimeoutMs,
+        sourceChannelLabel: this.#sourceChannelLabel,
         signal: controller.signal,
       });
 

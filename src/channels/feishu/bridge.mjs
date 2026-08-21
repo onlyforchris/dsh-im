@@ -236,6 +236,7 @@ export class FeishuHarnessBridge {
   #repairMonitorVersion = 0;
   #repairPollIntervalMs;
   #repairLinkWaitMs;
+  #sourceChannelLabel;
   /** Number-tappable menus: conversation key → menu state. */
   #menus = new Map();
   /** Interactive-card message id → route context for button callbacks. */
@@ -255,6 +256,7 @@ export class FeishuHarnessBridge {
     repairPollIntervalMs = REPAIR_POLL_INTERVAL_MS,
     repairLinkWaitMs = REPAIR_LINK_WAIT_MS,
     replyTimeoutMs = 600_000,
+    sourceChannelLabel,
     logger = console,
     signal,
   }) {
@@ -294,6 +296,7 @@ export class FeishuHarnessBridge {
     this.#logger = logger;
     this.#approvals = new HarnessApprovalQueue({ label: 'Feishu', logger });
     this.#signal = signal;
+    this.#sourceChannelLabel = sourceChannelLabel;
     ensureStatus(this.#status);
   }
 
@@ -1200,6 +1203,7 @@ export class FeishuHarnessBridge {
         key,
         text,
         content,
+        channelLabel: this.#sourceChannelLabel,
         createOptions: { signal: this.#signal },
         existsOptions: { signal: this.#signal },
         askOptions: this.#interactionAskOptions(event, key),
@@ -1228,6 +1232,7 @@ export class FeishuHarnessBridge {
             key,
             text,
             content,
+            channelLabel: this.#sourceChannelLabel,
             createOptions: { signal: this.#signal },
             existsOptions: { signal: this.#signal },
             askOptions,
@@ -1256,6 +1261,7 @@ export class FeishuHarnessBridge {
         key,
         text,
         content,
+        channelLabel: this.#sourceChannelLabel,
         createOptions: { signal: this.#signal },
         existsOptions: { signal: this.#signal },
         askOptions: this.#interactionAskOptions(event, key),

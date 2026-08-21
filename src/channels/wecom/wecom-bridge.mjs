@@ -231,6 +231,7 @@ export class WecomHarnessBridge {
   #replyTimeoutMs;
   #generateReqId;
   #signal;
+  #sourceChannelLabel;
   #queues = new Map();
   #pendingInteractions = new Map();
   #interactionKeys = new Map();
@@ -248,6 +249,7 @@ export class WecomHarnessBridge {
     logger = console,
     replyTimeoutMs = 600_000,
     generateStreamId = generateReqId,
+    sourceChannelLabel,
     signal,
   }) {
     if (!client || typeof client.replyStream !== 'function' || typeof client.sendMessage !== 'function') {
@@ -262,6 +264,7 @@ export class WecomHarnessBridge {
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#generateReqId = generateStreamId;
     this.#signal = signal;
+    this.#sourceChannelLabel = sourceChannelLabel;
     this.#approvals = new HarnessApprovalQueue({ label: 'wecom', logger });
   }
 
@@ -552,6 +555,7 @@ export class WecomHarnessBridge {
         key,
         text,
         content,
+        channelLabel: this.#sourceChannelLabel,
         createOptions: { signal: this.#signal },
         existsOptions: { signal: this.#signal },
         askOptions: {

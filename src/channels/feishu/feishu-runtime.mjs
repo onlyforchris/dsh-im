@@ -95,6 +95,7 @@ export class FeishuRuntime {
   #requestTimeoutMs;
   #logger;
   #repair;
+  #sourceChannelLabel;
   #client = null;
   #bridge = null;
   #wsClient = null;
@@ -117,6 +118,7 @@ export class FeishuRuntime {
     replyTimeoutMs = 600000,
     connectTimeoutMs = 15000,
     requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
+    sourceChannelLabel,
     logger = console,
   }) {
     if (!lark) throw new Error('FeishuRuntime requires the Feishu SDK');
@@ -146,6 +148,7 @@ export class FeishuRuntime {
     this.#connectTimeoutMs = connectTimeoutMs;
     this.#requestTimeoutMs = requestTimeoutMs;
     this.#logger = logger;
+    this.#sourceChannelLabel = sourceChannelLabel;
     this.#status = createBridgeStatus({ allowedSenderCount: normalizedOwners.length });
   }
 
@@ -205,6 +208,7 @@ export class FeishuRuntime {
         repair: this.#repair,
         repairOwnerOpenIds: new Set(this.#ownerOpenIds.filter((value) => value !== '*')),
         replyTimeoutMs: this.#replyTimeoutMs,
+        sourceChannelLabel: this.#sourceChannelLabel,
         signal,
         logger: this.#logger,
       });

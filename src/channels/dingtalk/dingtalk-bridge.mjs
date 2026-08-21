@@ -255,6 +255,7 @@ export class DingtalkHarnessBridge {
   #replyTimeoutMs;
   #maxMessageChars;
   #signal;
+  #sourceChannelLabel;
   #queues = new Map();
   #pendingInteractions = new Map();
   #interactionKeys = new Map();
@@ -273,6 +274,7 @@ export class DingtalkHarnessBridge {
     logger = console,
     replyTimeoutMs = 600_000,
     maxMessageChars = 4_000,
+    sourceChannelLabel,
     signal,
   }) {
     if (!api || typeof api.sendText !== 'function') throw new TypeError('DingTalk API is required');
@@ -291,6 +293,7 @@ export class DingtalkHarnessBridge {
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#maxMessageChars = maxMessageChars;
     this.#signal = signal;
+    this.#sourceChannelLabel = sourceChannelLabel;
     ensureStats(this.#status);
     this.#refreshPendingSenders();
   }
@@ -590,6 +593,7 @@ export class DingtalkHarnessBridge {
         harness: this.#harness,
         state: this.#state,
         key,
+        channelLabel: this.#sourceChannelLabel,
         ...(hasImages ? { content } : { text }),
         createOptions: { signal: this.#signal },
         existsOptions: { signal: this.#signal },

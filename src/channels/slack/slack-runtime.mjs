@@ -250,6 +250,7 @@ export class SlackRuntime {
   #connectTimeoutMs;
   #createApi;
   #createWebSocket;
+  #sourceChannelLabel;
   #status = createSlackRuntimeStatus();
   #api = null;
   #bridge = null;
@@ -273,6 +274,7 @@ export class SlackRuntime {
     connectTimeoutMs = 20_000,
     createApi = (options) => new SlackApi(options),
     createWebSocket = (url) => new WebSocket(url),
+    sourceChannelLabel,
   }) {
     if (!config || !botToken || !appToken || !harness || !state) {
       throw new TypeError('SlackRuntime requires config, both tokens, Harness, and state');
@@ -288,6 +290,7 @@ export class SlackRuntime {
     this.#connectTimeoutMs = connectTimeoutMs;
     this.#createApi = createApi;
     this.#createWebSocket = createWebSocket;
+    this.#sourceChannelLabel = sourceChannelLabel;
   }
 
   get status() {
@@ -338,6 +341,7 @@ export class SlackRuntime {
         status: this.#status,
         logger: this.#logger,
         replyTimeoutMs: this.#replyTimeoutMs,
+        sourceChannelLabel: this.#sourceChannelLabel,
         signal: controller.signal,
       });
       let timer;

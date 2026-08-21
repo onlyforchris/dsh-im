@@ -116,7 +116,7 @@ test('IM settings renders nine IM channels plus the AI Office connector', async 
   assert.match(markup, /class="dim-brand"/);
   assert.match(markup, /<strong class="dim-brandName">DSH-IM<\/strong>/);
   assert.doesNotMatch(markup, /dim-brandLogo|<img/);
-  assert.match(markup, /href="https:\/\/github\.com\/xmanrui\/dsh-im"/);
+  assert.match(markup, /href="https:\/\/github\.com\/onlyforchris\/dsh-im"/);
   assert.match(markup, /target="_blank"/);
   assert.match(markup, /rel="noopener noreferrer"/);
   assert.match(markup, /aria-label="dsh-im GitHub"/);
@@ -154,6 +154,8 @@ test('IM settings renders nine IM channels plus the AI Office connector', async 
   assert.match(styles, /\.dim-logoFeishu svg \{ width: 28px; height: 28px; \}/);
   assert.equal((markup.match(/role="tab"/g) ?? []).length, 10);
   assert.equal((markup.match(/aria-selected="true"/g) ?? []).length, 1);
+  assert.equal((markup.match(/dim-channelStatus dim-channelStatus-/g) ?? []).length, 10);
+  assert.match(markup, /已连接 0 · 未连接 0 · 未配置 10/);
   assert.doesNotMatch(markup, /role="switch"|type="checkbox"/);
   assert.doesNotMatch(markup, /dim-chevron|扫码绑定<\/small>|扫码接入<\/small>/);
   assert.doesNotMatch(markup, />INSTANT MESSAGING<|>Channel<|>微信设置</);
@@ -605,7 +607,7 @@ test('client registers a live bilingual locale seat and directory picker for the
     },
     slots: {
       inject(name, install) {
-        assert.equal(name, 'settings.plugins.tab');
+        assert.equal(name, 'settings.section');
         install();
       },
       register(options, component) {

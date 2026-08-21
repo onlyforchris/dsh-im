@@ -93,6 +93,7 @@ export class WeixinHarnessBridge {
   #replyTimeoutMs;
   #maxMessageChars;
   #signal;
+  #sourceChannelLabel;
   #queues = new Map();
   #pendingInteractions = new Map();
   #interactionKeys = new Map();
@@ -112,6 +113,7 @@ export class WeixinHarnessBridge {
     logger = console,
     replyTimeoutMs = 600_000,
     maxMessageChars = 4_000,
+    sourceChannelLabel,
     signal,
   }) {
     if (!api || typeof api.sendText !== 'function') throw new TypeError('Weixin API is required');
@@ -128,6 +130,7 @@ export class WeixinHarnessBridge {
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#maxMessageChars = maxMessageChars;
     this.#signal = signal;
+    this.#sourceChannelLabel = sourceChannelLabel;
     this.#approvals = new HarnessApprovalQueue({ label: 'weixin', logger });
   }
 
@@ -374,6 +377,7 @@ export class WeixinHarnessBridge {
           harness: this.#harness,
           state: this.#state,
           key,
+          channelLabel: this.#sourceChannelLabel,
           ...(hasImages ? { content } : { text }),
           createOptions: { signal: this.#signal },
           existsOptions: { signal: this.#signal },

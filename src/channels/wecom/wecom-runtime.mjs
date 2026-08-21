@@ -32,6 +32,7 @@ export class WecomRuntime {
   #connectTimeoutMs;
   #maxReconnectAttempts;
   #createClient;
+  #sourceChannelLabel;
   #status = createWecomRuntimeStatus();
   #client = null;
   #bridge = null;
@@ -48,6 +49,7 @@ export class WecomRuntime {
     replyTimeoutMs = 600_000,
     connectTimeoutMs = 20_000,
     maxReconnectAttempts = 10,
+    sourceChannelLabel,
     createClient = (options) => new WSClient(options),
   }) {
     if (!config || !secret || !harness || !state) {
@@ -61,6 +63,7 @@ export class WecomRuntime {
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#connectTimeoutMs = connectTimeoutMs;
     this.#maxReconnectAttempts = maxReconnectAttempts;
+    this.#sourceChannelLabel = sourceChannelLabel;
     this.#createClient = createClient;
   }
 
@@ -109,6 +112,7 @@ export class WecomRuntime {
       status: this.#status,
       logger: this.#logger,
       replyTimeoutMs: this.#replyTimeoutMs,
+      sourceChannelLabel: this.#sourceChannelLabel,
       signal,
     });
 

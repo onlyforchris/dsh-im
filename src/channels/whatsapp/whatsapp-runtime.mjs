@@ -299,6 +299,7 @@ export class WhatsappRuntime {
   #replyTimeoutMs;
   #connectTimeoutMs;
   #createSession;
+  #sourceChannelLabel;
   #status = createWhatsappRuntimeStatus();
   #abortController = null;
   #session = null;
@@ -315,6 +316,7 @@ export class WhatsappRuntime {
     replyTimeoutMs = 600_000,
     connectTimeoutMs = 30_000,
     createSession = createWhatsappWebSession,
+    sourceChannelLabel,
   }) {
     if (!config || !authDir || !harness || !state || typeof createSession !== 'function') {
       throw new TypeError('WhatsappRuntime requires config, auth directory, Harness, state, and session factory');
@@ -327,6 +329,7 @@ export class WhatsappRuntime {
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#connectTimeoutMs = connectTimeoutMs;
     this.#createSession = createSession;
+    this.#sourceChannelLabel = sourceChannelLabel;
   }
 
   get status() {
@@ -399,6 +402,7 @@ export class WhatsappRuntime {
         status: this.#status,
         logger: this.#logger,
         replyTimeoutMs: this.#replyTimeoutMs,
+        sourceChannelLabel: this.#sourceChannelLabel,
         signal: controller.signal,
       });
       const now = Date.now();

@@ -35,6 +35,7 @@ export class QqRuntime {
   #connectTimeoutMs;
   #createBot;
   #typingMiddleware;
+  #sourceChannelLabel;
   #status = createQqRuntimeStatus();
   #bot = null;
   #bridge = null;
@@ -52,6 +53,7 @@ export class QqRuntime {
     connectTimeoutMs = 20_000,
     createBot = (options) => new QQBot(options),
     typingMiddleware = typingIndicator,
+    sourceChannelLabel,
   }) {
     if (!config || !appSecret || !harness || !state) {
       throw new TypeError('QqRuntime requires config, app secret, Harness, and state');
@@ -63,6 +65,7 @@ export class QqRuntime {
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#connectTimeoutMs = connectTimeoutMs;
+    this.#sourceChannelLabel = sourceChannelLabel;
     this.#createBot = createBot;
     this.#typingMiddleware = typingMiddleware;
   }
@@ -138,6 +141,7 @@ export class QqRuntime {
       status: this.#status,
       logger: this.#logger,
       replyTimeoutMs: this.#replyTimeoutMs,
+      sourceChannelLabel: this.#sourceChannelLabel,
       signal: controller.signal,
     });
     bot.use?.(this.#typingMiddleware({

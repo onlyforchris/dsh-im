@@ -55,6 +55,10 @@ const EN = Object.freeze({
   '本机暂时无法访问 AI Office。': 'AI Office cannot currently be reached from this machine.',
   'AI Office 连接已中断。': 'The AI Office connection was interrupted.',
   '帮助与反馈 · 前往 GitHub': 'Help & feedback · Open GitHub',
+  '已连接': 'Connected',
+  '已配置，未连接': 'Configured, not connected',
+  '未配置': 'Not configured',
+  '已连接 ${statusCounts.connected} · 未连接 ${statusCounts.offline} · 未配置 ${unconfigured}': '${statusCounts.connected} connected · ${statusCounts.offline} offline · ${unconfigured} not configured',
   '微信': 'WeChat',
   '飞书': 'Feishu',
   '钉钉': 'DingTalk',
@@ -482,7 +486,9 @@ function channelName(value) {
 }
 
 function translateDynamic(text) {
-  let match = /^(\d+) \/ (\d+) 在线$/.exec(text);
+  let match = /^已连接 (\d+) · 未连接 (\d+) · 未配置 (\d+)$/.exec(text);
+  if (match) return `${match[1]} connected · ${match[2]} offline · ${match[3]} not configured`;
+  match = /^(\d+) \/ (\d+) 在线$/.exec(text);
   if (match) return `${match[1]}/${match[2]} online`;
   match = /^已接入 (\d+) 个机器人，其中 (\d+) 个在线$/.exec(text);
   if (match) return `${match[2]} of ${match[1]} bots online`;

@@ -134,6 +134,7 @@ export class DingtalkRuntime {
   #connectPollIntervalMs;
   #api;
   #streamFactory;
+  #sourceChannelLabel;
   #status;
   #client = null;
   #bridge = null;
@@ -155,6 +156,7 @@ export class DingtalkRuntime {
     connectPollIntervalMs = 25,
     api = createDingtalkApi(),
     streamFactory = defaultStreamFactory,
+    sourceChannelLabel,
   }) {
     if (!config || !nonEmptyString(config.clientId) || !nonEmptyString(clientSecret)) {
       throw new TypeError('DingtalkRuntime requires app credentials');
@@ -172,6 +174,7 @@ export class DingtalkRuntime {
     this.#connectPollIntervalMs = connectPollIntervalMs;
     this.#api = api;
     this.#streamFactory = streamFactory;
+    this.#sourceChannelLabel = sourceChannelLabel;
     this.#status = createDingtalkRuntimeStatus({
       pendingSenders: this.#pendingSenders(),
       approvedSenders: approvedSenderCount(config),
@@ -236,6 +239,7 @@ export class DingtalkRuntime {
         logger: this.#logger,
         replyTimeoutMs: this.#replyTimeoutMs,
         maxMessageChars: this.#maxMessageChars,
+        sourceChannelLabel: this.#sourceChannelLabel,
         signal,
       });
 

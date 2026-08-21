@@ -143,6 +143,7 @@ export async function createProductionController(ctx, config = {}, internals = {
         appSecret,
         domain: botConfig.domain,
         ownerOpenIds: botConfig.ownerOpenIds ?? [botConfig.ownerOpenId],
+        sourceChannelLabel: '飞书',
         harness: workspaceScope.harness,
         state: workspaceScope.state,
         replyTimeoutMs: config.replyTimeoutMs ?? 600_000,

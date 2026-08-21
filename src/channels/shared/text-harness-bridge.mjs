@@ -59,6 +59,7 @@ export class TextHarnessBridge {
   #logger;
   #replyTimeoutMs;
   #signal;
+  #sourceChannelLabel;
   #queues = new Map();
   #pendingInteractions = new Map();
   #interactionKeys = new Map();
@@ -75,6 +76,7 @@ export class TextHarnessBridge {
     status = createTextBridgeStatus(),
     logger = console,
     replyTimeoutMs = 600_000,
+    sourceChannelLabel,
     signal,
   }) {
     if (!descriptor?.key || !descriptor?.label) throw new TypeError('A channel descriptor is required');
@@ -88,6 +90,7 @@ export class TextHarnessBridge {
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#signal = signal;
+    this.#sourceChannelLabel = sourceChannelLabel;
     this.#approvals = new HarnessApprovalQueue({
       label: descriptor.key,
       logger,
@@ -382,6 +385,7 @@ export class TextHarnessBridge {
         key: conversationKey,
         text,
         content,
+        channelLabel: this.#sourceChannelLabel,
         createOptions: this.#signal ? { signal: this.#signal } : undefined,
         existsOptions: this.#signal ? { signal: this.#signal } : undefined,
         askOptions: {

@@ -99,6 +99,7 @@ export async function createProductionController(ctx, config = {}, internals = {
       return new Runtime({
         config: botConfig,
         appSecret,
+        sourceChannelLabel: 'QQ',
         harness: workspaceScope.harness,
         state: workspaceScope.state,
         replyTimeoutMs: config.replyTimeoutMs ?? 600_000,

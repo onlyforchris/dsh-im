@@ -48,11 +48,12 @@ import { WorkspaceDirectoryPickerContext } from './workspace-editor.js';
 export const name = 'im-settings';
 export const inject = ['slots', 'connection', 'locale', 'workspaces'];
 
+// 个人 fork 调整：按实际使用频率排序（飞书/钉钉/企微为主力渠道）。
 const CHANNELS = Object.freeze([
-  { id: 'weixin', label: '微信' },
   { id: 'feishu', label: '飞书' },
   { id: 'dingtalk', label: '钉钉' },
   { id: 'wecom', label: '企业微信' },
+  { id: 'weixin', label: '微信' },
   { id: 'qq', label: 'QQ' },
   { id: 'slack', label: 'Slack' },
   { id: 'telegram', label: 'Telegram' },
@@ -60,6 +61,67 @@ const CHANNELS = Object.freeze([
   { id: 'whatsapp', label: 'WhatsApp' },
   { id: 'office', label: 'AI Office', note: '（实验功能）' },
 ]);
+
+const CHANNEL_STATUS_LABELS = Object.freeze({
+  connected: '已连接',
+  offline: '已配置，未连接',
+  unconfigured: '未配置',
+  unknown: '状态未知',
+});
+
+function unwrapStatusValue(result) {
+  if (result && typeof result === 'object' && result.ok === true) return result.value;
+  return result;
+}
+
+function channelStatusFromSnapshot(value) {
+  const bots = Array.isArray(value?.bots) ? value.bots : [];
+  if (bots.length > 0) {
+    return bots.some((bot) => bot?.connected === true) ? 'connected' : 'offline';
+  }
+  if (value?.configured === true) return value?.connected === true ? 'connected' : 'offline';
+  return 'unconfigured';
+}
+
+// 轮询全部渠道的 connection.status，驱动左栏状态点与头部汇总。
+function useChannelStatuses(rpcCalls) {
+  const [statuses, setStatuses] = React.useState({});
+  React.useEffect(() => {
+    let disposed = false;
+    const fetchAll = async () => {
+      const entries = await Promise.all(CHANNELS.map(async (channel) => {
+        const rpcCall = rpcCalls[channel.id];
+        if (typeof rpcCall !== 'function') return [channel.id, 'unknown'];
+        try {
+          const snapshot = unwrapStatusValue(await rpcCall('connection.status', {}));
+          return [channel.id, channelStatusFromSnapshot(snapshot)];
+        } catch {
+          return [channel.id, 'unknown'];
+        }
+      }));
+      if (!disposed) setStatuses(Object.fromEntries(entries));
+    };
+    void fetchAll();
+    const timer = setInterval(fetchAll, 15_000);
+    return () => {
+      disposed = true;
+      clearInterval(timer);
+    };
+    // rpcCalls 在 apply 中创建一次，引用稳定。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  return statuses;
+}
+
+function ChannelStatusDot({ state }) {
+  const tone = CHANNEL_STATUS_LABELS[state] ? state : 'unknown';
+  return h('span', {
+    className: `dim-channelStatus dim-channelStatus-${tone}`,
+    title: CHANNEL_STATUS_LABELS[tone],
+    'aria-label': CHANNEL_STATUS_LABELS[tone],
+    role: 'status',
+  });
+}
 
 function WeixinLogo() {
   return h('span', { className: 'dim-logo dim-logoWeixin', 'aria-hidden': 'true' },
@@ -135,19 +197,40 @@ export function IMSettingsTab({
   officeRpcCall,
   workspaceDirectoryPicker,
 }) {
-  const [selected, setSelected] = React.useState('weixin');
+  const [selected, setSelected] = React.useState('feishu');
   const githubTooltipId = React.useId();
+  const statuses = useChannelStatuses({
+    dingtalk: dingtalkRpcCall,
+    discord: discordRpcCall,
+    feishu: feishuRpcCall,
+    qq: qqRpcCall,
+    slack: slackRpcCall,
+    telegram: telegramRpcCall,
+    wecom: wecomRpcCall,
+    weixin: weixinRpcCall,
+    whatsapp: whatsappRpcCall,
+    office: officeRpcCall,
+  });
+  const statusCounts = CHANNELS.reduce((counts, channel) => {
+    const state = statuses[channel.id];
+    if (state === 'connected') counts.connected += 1;
+    else if (state === 'offline') counts.offline += 1;
+    return counts;
+  }, { connected: 0, offline: 0 });
+  const unconfigured = CHANNELS.length - statusCounts.connected - statusCounts.offline;
   const active = CHANNELS.find((channel) => channel.id === selected) ?? CHANNELS[0];
   return h(WorkspaceDirectoryPickerContext.Provider, { value: workspaceDirectoryPicker },
     h('section', { className: 'dim-page', 'aria-label': 'IM机器人设置' },
     h('header', { className: 'dim-title' },
       h('div', { className: 'dim-brand' },
         h('strong', { className: 'dim-brandName' }, 'DSH-IM'),
-        h('p', null, '让 DeepSeek Harness 触手可及')),
+        h('p', null, '让 DeepSeek Harness 触手可及'),
+        h('p', { className: 'dim-channelSummary', role: 'status' },
+          `已连接 ${statusCounts.connected} · 未连接 ${statusCounts.offline} · 未配置 ${unconfigured}`)),
       h('span', { className: 'dim-githubAction' },
         h('a', {
           className: 'dim-githubLink',
-          href: 'https://github.com/xmanrui/dsh-im',
+          href: 'https://github.com/onlyforchris/dsh-im',
           target: '_blank',
           rel: 'noopener noreferrer',
           'aria-label': 'dsh-im GitHub',
@@ -177,7 +260,8 @@ export function IMSettingsTab({
         h('span', { className: 'dim-channelCopy' },
           h('strong', null, channel.label),
           channel.note ? h('small', { className: 'dim-channelNote' }, channel.note) : null,
-        )))),
+        ),
+        h(ChannelStatusDot, { state: statuses[channel.id] })))),
       h('div', { className: 'dim-divider', 'aria-hidden': 'true' }),
       h('main', {
         className: 'dim-panel',
@@ -258,8 +342,9 @@ export function apply(ctx) {
     pickDirectory: () => ctx.workspaces.pickDirectory(),
   });
 
-  ctx.slots.inject('settings.plugins.tab', () => ctx.slots.register({
-    name: 'settings.plugins.tab',
+  // 个人 fork 调整：从「设置 → 插件」子标签提升为设置页一级菜单（顶部导航可见）。
+  ctx.slots.inject('settings.section', () => ctx.slots.register({
+    name: 'settings.section',
     id: 'im',
     order: 20,
     label: () => t('IM机器人'),

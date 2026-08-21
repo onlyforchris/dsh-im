@@ -103,6 +103,7 @@ export async function createProductionController(ctx, config = {}, internals = {
         api,
         config: accountConfig,
         token,
+        sourceChannelLabel: '微信',
         harness: workspaceScope.harness,
         state: workspaceScope.state,
         replyTimeoutMs: config.replyTimeoutMs ?? 600_000,
