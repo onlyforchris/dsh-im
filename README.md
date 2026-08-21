@@ -1,6 +1,6 @@
 <p align="center">
-  <img src="assets/logo-dsh-im-connecting-readme-3x2.png" alt="DSH-IM — Connecting DeepSeek Harness" width="420" height="280" align="middle">&nbsp;&nbsp;
-  <img src="assets/logo-plugin-phone.png" alt="DSH-IM phone logo" width="280" height="280" align="middle">
+  <img src="assets/logo-dsh-im-connecting-readme-3x2.png" alt="DSH-IM — Connecting DeepSeek Harness" width="420" align="middle">&nbsp;&nbsp;
+  <img src="assets/logo-plugin-phone.png" alt="DSH-IM logo" width="200" align="middle">
 </p>
 
 ---
@@ -10,11 +10,8 @@
   <p><strong>Connecting DeepSeek Harness</strong></p>
 
   <p>
-    <img src="https://dsh-im-random-badge.xmanrui-dsh-im.workers.dev" alt="滑动变祖器：今天是梁子或今天是梁圣（随机）">
-    <a href="LICENSE"><img src="https://img.shields.io/github/license/xmanrui/dsh-im" alt="MIT 许可证"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/github/license/onlyforchris/dsh-im" alt="MIT 许可证"></a>
     <img src="https://img.shields.io/badge/agent-DeepSeek%20Harness-5865f2" alt="DeepSeek Harness">
-    <a href="https://dshfind.com/zh/plugins/xmanrui/dsh-im?ref=badge"><img src="https://dshfind.com/api/badge/xmanrui/dsh-im?lang=zh" alt="dshfind"></a>
-    <a href="https://dshfind.com/zh/plugins/xmanrui/dsh-im"><img src="https://img.shields.io/badge/dshfind-%E5%88%86%E7%B1%BB%E7%AC%AC%E4%B8%80-d97706" alt="dshfind: 分类第一"></a>
   </p>
 
   <p>
@@ -188,23 +185,21 @@ IM 管理 RPC 默认仅接受回环浏览器。如果 Web profile 在受信任�
 
 ## 联系方式
 
-欢迎通过邮箱、微信或小红书联系我。
+欢迎通过 GitHub 或邮箱联系我。
 
 <table>
   <tr>
+    <th align="center">GitHub</th>
     <th align="center">邮箱</th>
-    <th align="center">微信</th>
-    <th align="center">小红书</th>
   </tr>
   <tr>
     <td align="center" valign="middle">
-      <a href="mailto:longmanr307@gmail.com">longmanr307@gmail.com</a>
+      <a href="https://github.com/onlyforchris">@onlyforchris</a>
     </td>
-    <td align="center" valign="top">
-      <a href="docs/images/weixin.jpg"><img src="docs/images/weixin.jpg" alt="微信二维码" width="240"></a>
-    </td>
-    <td align="center" valign="top">
-      <a href="docs/images/xhs.jpg"><img src="docs/images/xhs.jpg" alt="小红书二维码" width="240"></a>
+    <td align="center" valign="middle">
+      <a href="mailto:zhangjim117@163.com">zhangjim117@163.com</a>
     </td>
   </tr>
 </table>
+
+> 本项目是 [xmanrui/dsh-im](https://github.com/xmanrui/dsh-im)（MIT 许可）的个人 fork，感谢原作者的工作。

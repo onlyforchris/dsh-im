@@ -1,6 +1,6 @@
 <p align="center">
-  <img src="assets/logo-dsh-im-connecting-readme-3x2.png" alt="DSH-IM — Connecting DeepSeek Harness" width="420" height="280" align="middle">&nbsp;&nbsp;
-  <img src="assets/logo-plugin-phone.png" alt="DSH-IM phone logo" width="280" height="280" align="middle">
+  <img src="assets/logo-dsh-im-connecting-readme-3x2.png" alt="DSH-IM — Connecting DeepSeek Harness" width="420" align="middle">&nbsp;&nbsp;
+  <img src="assets/logo-plugin-phone.png" alt="DSH-IM logo" width="200" align="middle">
 </p>
 
 ---
@@ -185,23 +185,21 @@ IM management RPCs accept loopback browsers by default. When a Web profile is de
 
 ## Contact
 
-You can reach me by email, WeChat, or Xiaohongshu.
+You can reach me on GitHub or by email.
 
 <table>
   <tr>
+    <th align="center">GitHub</th>
     <th align="center">Email</th>
-    <th align="center">WeChat</th>
-    <th align="center">Xiaohongshu</th>
   </tr>
   <tr>
     <td align="center" valign="middle">
-      <a href="mailto:longmanr307@gmail.com">longmanr307@gmail.com</a>
+      <a href="https://github.com/onlyforchris">@onlyforchris</a>
     </td>
-    <td align="center" valign="top">
-      <a href="docs/images/weixin.jpg"><img src="docs/images/weixin.jpg" alt="WeChat QR code" width="240"></a>
-    </td>
-    <td align="center" valign="top">
-      <a href="docs/images/xhs.jpg"><img src="docs/images/xhs.jpg" alt="Xiaohongshu QR code" width="240"></a>
+    <td align="center" valign="middle">
+      <a href="mailto:zhangjim117@163.com">zhangjim117@163.com</a>
     </td>
   </tr>
 </table>
+
+> This project is a personal fork of [xmanrui/dsh-im](https://github.com/xmanrui/dsh-im) (MIT License). Credit to the original author.
