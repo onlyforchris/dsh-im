@@ -71,21 +71,27 @@ Heartbeat 成功响应必须是 JSON：`{"ok":true,"protocolVersion":"office-har
 
 ## 安装
 
-推荐从 npm 安装已发布的稳定版本：
+从 [GitHub Releases](https://github.com/onlyforchris/dsh-im/releases) 下载 `.tgz` 后，使用 DSH 标准插件命令安装：
 
 ```sh
-dsh plugin --profile web add -w @xmanrui/dsh-im
+dsh plugin --profile web add ./onlyforchris-dsh-im-0.16.5.tgz
 ```
 
 重启 `dsh web`，然后打开「设置 → 插件 → IM机器人」。
 
+`@onlyforchris/dsh-im` 发布到 npm 后，也可以直接安装固定版本：
+
+```sh
+dsh plugin --profile web add --save-exact @onlyforchris/dsh-im@0.16.5
+```
+
 如需试用尚未发布到 npm 的最新代码，可以改用 GitHub 源安装器：
 
 ```sh
-npx -y github:xmanrui/dsh-im install
+npx -y github:onlyforchris/dsh-im install
 ```
 
-GitHub 源安装会直接拉取并构建 Git 依赖；pnpm 10 及以上版本可能要求先在 profile 的 `pnpm-workspace.yaml` 中允许该依赖执行构建脚本。普通用户建议优先使用 npm 稳定版。
+GitHub 源安装会直接拉取并构建 Git 依赖；pnpm 10 及以上版本可能要求先在 profile 的 `pnpm-workspace.yaml` 中允许该依赖执行构建脚本。普通用户建议优先使用 Release 的固定 `.tgz`。
 
 安装后，在对应渠道页面按照内置引导完成扫码或凭据配置。所有 Secret 和 Token 只提交给本机 Harness Host，并写入受保护的凭据存储；状态接口和机器人列表不会回传这些凭据。
 
@@ -101,7 +107,7 @@ GitHub 源安装会直接拉取并构建 Git 依赖；pnpm 10 及以上版本可
 | 命令 | 作用 |
 | --- | --- |
 | `/help` | 显示机器人支持的命令和用法。 |
-| `/new` | 解除当前聊天的会话绑定，让下一条普通消息开启全新 Harness 会话。 |
+| `/new` | 立即创建并绑定全新 Harness 会话，同时返回新的 Session ID。 |
 | `/status` | 检查当前机器人与 DeepSeek Harness 的连接状态。 |
 | `/models` | 按序号列出当前配置的全部可用模型。 |
 | `/model` | 查看当前聊天绑定会话正在使用的模型。 |
@@ -122,7 +128,7 @@ GitHub 源安装会直接拉取并构建 Git 依赖；pnpm 10 及以上版本可
 
 - `/help` 不需要参数，也不会创建会话；它会返回当前机器人支持的完整命令列表。
 - `/status` 不需要参数，也不会向模型发送消息或改变会话绑定；它用于确认当前机器人能够连接 DeepSeek Harness。
-- `/new` 只解除当前聊天在 dsh-im 中保存的会话绑定，不会删除、清空或归档旧 Session。下一条普通消息会在当前工作区创建并绑定一个新 Session。任务正在运行或等待问题、审批时，应先完成交互或使用 `/stop`，再使用 `/new`。
+- `/new` 会在当前工作区立即创建并绑定一个新 Session，同时返回新的 Session ID；它不会删除、清空或归档旧 Session。任务正在运行或等待问题、审批时，应先完成交互或使用 `/stop`，再使用 `/new`。
 - `/models` 不需要参数，也不会创建会话。它为 Harness 当前配置的全部可用模型分配序号，同时显示可稳定复制的 `Provider/模型ID`；某个 Provider 查询失败时，其他 Provider 的结果仍会显示。
 - `/model` 不带参数时只查看当前会话模型；带参数时接受 `/models` 列出的序号或完整模型 ID，例如 `/model 2`。完整 ID 必须精确匹配。聊天尚无会话时，有效的切换命令会创建并绑定一个空白会话，但不会触发模型回复。切换只影响当前会话；Harness 还会尝试把它保存为以后新会话的默认模型，已有其他会话不受影响。
 - 正在运行任务或等待审批、问题回答时不能切换模型；请等待完成，或先使用 `/stop`。含图片的会话无法切换到不支持图片输入的模型。
@@ -147,7 +153,7 @@ GitHub 源安装会直接拉取并构建 Git 依赖；pnpm 10 及以上版本可
 
 - **图片识别**：九个内置渠道都可以把 JPEG、PNG、WebP，以及以图片文件方式发送的 GIF 交给 Harness；图片可以附带文字说明。单张图片上限为 5 MB，单条消息中的图片总大小上限为 20 MB。
 - **在机器人卡片切换工作区**：设置页中的每张机器人卡片都会显示当前 Harness 工作区。可以直接填写已有目录的绝对路径，也可以打开目录选择器。切换只清除该机器人的旧聊天映射，不会删除、清空或归档旧 Session；已经开始的回复可以继续完成，后续消息使用新工作区。
-- **检查连接并发送测试消息**：机器人在线时，点击卡片上的「检查连接」会检查平台连接，并向该机器人最近记录的私聊发送一条“DeepSeek Harness 连接测试成功”消息；WhatsApp 会发送到账号自聊。测试消息不会创建 Harness Session，也不会调用模型。机器人必须至少收到过一条私聊才能记住测试目标，否则页面会提示尚无可用的测试会话。
+- **检查连接并发送测试消息**：机器人在线时，点击卡片上的「检查连接」会检查平台连接，并向该机器人最近记录的私聊发送一条“DeepSeek Harness 连接测试成功”消息；WhatsApp 会发送到账号自聊。测试消息不会创建 Harness Session，也不会调用模型。首次接入仍需至少收到一条私聊；此后飞书、钉钉、企业微信和微信会从已持久化的会话绑定恢复收件人，DSH 重启后无需再次唤醒。
 - **重试连接和移除接入**：机器人离线时，卡片上的操作会变为「重试连接」；不再使用时可以点击「移除接入」。这些操作都只作用于所选机器人，不影响其他机器人或渠道。
 - **多机器人独立管理**：同一渠道可以接入多个机器人。每个机器人分别保存凭据、连接状态、工作区和聊天会话映射，卡片上的工作区、连接检查、重试和移除操作互不影响。
 - **流式回复和进度提示**：插件会按各平台能力显示正在思考、工具执行和逐步生成的回答；不支持原生流式接口的平台会通过编辑消息、卡片更新或最终消息完成回复。
@@ -174,7 +180,7 @@ node bin/dsh-im.mjs install --source .
 IM 管理 RPC 默认仅接受回环浏览器。如果 Web profile 在受信任的局域网内对外提供服务，可在该 profile 的 `cordis.patch.yml` 中显式开放给 Connection 已信任的 Host authority：
 
 ```yaml
-- id: xmanrui-dsh-im
+- id: onlyforchris-dsh-im
   config:
     rpcAuthority: trusted-host
 ```

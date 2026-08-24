@@ -3,6 +3,7 @@ import { createWeixinBridgeStatus, WeixinHarnessBridge } from './weixin-bridge.m
 import {
   connectionTestTarget,
   connectionTestTargetUnavailable,
+  latestBoundConversation,
 } from '../shared/connection-test.mjs';
 
 const DEFAULT_START_RETRY_DELAYS_MS = Object.freeze([250, 1_000, 3_000]);
@@ -75,6 +76,7 @@ export class WeixinRuntime {
   #maxMessageChars;
   #startRetryDelaysMs;
   #sourceChannelLabel;
+  #workspaceSessionCommandsEnabled;
   #status = createWeixinRuntimeStatus();
   #bridge = null;
   #abortController = null;
@@ -92,6 +94,7 @@ export class WeixinRuntime {
     maxMessageChars = 4_000,
     startRetryDelaysMs,
     sourceChannelLabel,
+    workspaceSessionCommandsEnabled = true,
   }) {
     if (!api || !config || !token || !harness || !state) {
       throw new TypeError('WeixinRuntime requires API, account, token, Harness, and state');
@@ -106,6 +109,7 @@ export class WeixinRuntime {
     this.#maxMessageChars = maxMessageChars;
     this.#startRetryDelaysMs = startRetryDelays(startRetryDelaysMs);
     this.#sourceChannelLabel = sourceChannelLabel;
+    this.#workspaceSessionCommandsEnabled = workspaceSessionCommandsEnabled !== false;
   }
 
   get status() {
@@ -148,6 +152,7 @@ export class WeixinRuntime {
         replyTimeoutMs: this.#replyTimeoutMs,
         maxMessageChars: this.#maxMessageChars,
         sourceChannelLabel: this.#sourceChannelLabel,
+        workspaceSessionCommandsEnabled: this.#workspaceSessionCommandsEnabled,
         signal,
       });
       this.#status.ready = true;
@@ -270,13 +275,13 @@ export class WeixinRuntime {
     return this.status;
   }
 
-  async sendConnectionTest(text) {
+  async sendNotification(text) {
     const remembered = connectionTestTarget(this.#state);
     const toUserId = typeof remembered?.toUserId === 'string' && remembered.toUserId.trim()
       ? remembered.toUserId.trim()
       : typeof this.#config.ownerUserId === 'string' && this.#config.ownerUserId.trim()
         ? this.#config.ownerUserId.trim()
-        : null;
+        : latestBoundConversation(this.#state, 'p2p:')?.id ?? null;
     if (!toUserId) throw connectionTestTargetUnavailable('微信机器人');
     if (!this.#status.ready || !this.#abortController) {
       throw new Error('Weixin runtime is not connected');
@@ -289,5 +294,9 @@ export class WeixinRuntime {
       signal: this.#abortController.signal,
     });
     return { sent: true };
+  }
+
+  async sendConnectionTest(text) {
+    return this.sendNotification(text);
   }
 }

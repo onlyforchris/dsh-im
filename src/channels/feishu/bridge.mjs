@@ -29,7 +29,7 @@ import {
   runModelCommand,
 } from '../shared/model-command.mjs';
 import { runWorkspaceCommand, resolveSessionListWorkspace, workspacePathSnapshot } from '../shared/workspace-command.mjs';
-import { askInWorkspaceSession } from '../shared/workspace-session.mjs';
+import { askInWorkspaceSession, resetWorkspaceSession } from '../shared/workspace-session.mjs';
 import {
   MENU_PAGE_SIZE,
   menuCard,
@@ -325,7 +325,9 @@ export class FeishuHarnessBridge {
 
     if (event.message.chat_type === 'p2p') {
       const chatId = nonEmptyString(event.message.chat_id);
-      if (chatId) rememberConnectionTestTarget(this.#state, { chatId });
+      if (chatId) void Promise.resolve(
+        rememberConnectionTestTarget(this.#state, { chatId }),
+      ).catch(() => this.#logger.warn?.('[dsh-feishu] unable to persist the private target'));
     }
 
     this.#acceptedMessageIds.add(messageId);
@@ -589,8 +591,13 @@ export class FeishuHarnessBridge {
       return;
     }
     if (commandText === '/new') {
-      await this.#state.clearSession(key);
-      await this.#send(event.message.chat_id, '已开启全新 Harness 会话。');
+      const sessionId = await resetWorkspaceSession({
+        harness: this.#harness,
+        state: this.#state,
+        key,
+        createOptions: { signal: this.#signal },
+      });
+      await this.#send(event.message.chat_id, `已开启全新 Harness 会话。\nID：${sessionId}`);
       return;
     }
     if (commandText === '/status') {
@@ -1013,8 +1020,13 @@ export class FeishuHarnessBridge {
       return;
     }
     if (action === 'new') {
-      await this.#state.clearSession(key);
-      await this.#send(chatId, '已开启全新 Harness 会话。');
+      const sessionId = await resetWorkspaceSession({
+        harness: this.#harness,
+        state: this.#state,
+        key,
+        createOptions: { signal: this.#signal },
+      });
+      await this.#send(chatId, `已开启全新 Harness 会话。\nID：${sessionId}`);
       return;
     }
     if (action === 'status') {
@@ -1204,6 +1216,8 @@ export class FeishuHarnessBridge {
         text,
         content,
         channelLabel: this.#sourceChannelLabel,
+        fromUserId: senderOpenId(event),
+        msgId: messageId,
         createOptions: { signal: this.#signal },
         existsOptions: { signal: this.#signal },
         askOptions: this.#interactionAskOptions(event, key),
@@ -1233,6 +1247,8 @@ export class FeishuHarnessBridge {
             text,
             content,
             channelLabel: this.#sourceChannelLabel,
+            fromUserId: senderOpenId(event),
+            msgId: messageId,
             createOptions: { signal: this.#signal },
             existsOptions: { signal: this.#signal },
             askOptions,
@@ -1262,6 +1278,8 @@ export class FeishuHarnessBridge {
         text,
         content,
         channelLabel: this.#sourceChannelLabel,
+        fromUserId: senderOpenId(event),
+        msgId: messageId,
         createOptions: { signal: this.#signal },
         existsOptions: { signal: this.#signal },
         askOptions: this.#interactionAskOptions(event, key),

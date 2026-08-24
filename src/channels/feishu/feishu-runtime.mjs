@@ -3,8 +3,9 @@ import { FeishuHarnessBridge } from './bridge.mjs';
 import { cardActionProbeCard } from './feishu-cards.mjs';
 import { VerifiedFeishuChannel } from './feishu-channel.mjs';
 import {
+  connectionTestTarget,
   connectionTestTargetUnavailable,
-  sendRememberedConnectionTest,
+  latestBoundConversation,
 } from '../shared/connection-test.mjs';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
@@ -465,16 +466,16 @@ export class FeishuRuntime {
       return { sent: true };
     }
 
-    return sendRememberedConnectionTest({
-      state: this.#state,
-      text,
-      channelLabel: '飞书机器人',
-      send: async (target, content) => {
-        const chatId = typeof target?.chatId === 'string' ? target.chatId.trim() : '';
-        if (!chatId) throw connectionTestTargetUnavailable('飞书机器人');
-        await send('chat_id', chatId, content);
-      },
-    });
+    const chatId = nonEmptyString(connectionTestTarget(this.#state)?.chatId);
+    if (chatId) {
+      await send('chat_id', chatId, text);
+      return { sent: true };
+    }
+    const boundOpenId = nonEmptyString(connectionTestTarget(this.#state)?.openId)
+      ?? latestBoundConversation(this.#state, 'p2p:')?.id;
+    if (!boundOpenId) throw connectionTestTargetUnavailable('飞书机器人');
+    await send('open_id', boundOpenId, text);
+    return { sent: true };
   }
 
   async stop({ preserveError = false } = {}) {

@@ -449,6 +449,11 @@ export class HarnessClient {
     this.#controlOwnerships = this.#interactionRegistry.controls;
   }
 
+  /** Absolute workspace path this client creates sessions in. */
+  get workspace() {
+    return this.#workspace;
+  }
+
   async rpc(method, payload = {}, timeoutMs = 30_000, options = {}) {
     const rpcId = options.rpcId ?? `${this.#rpcIdPrefix}-${randomUUID()}`;
     const timeoutSignal = AbortSignal.timeout(timeoutMs);

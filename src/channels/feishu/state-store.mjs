@@ -1,7 +1,18 @@
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
-const EMPTY_STATE = Object.freeze({ version: 1, sessions: {}, seenMessageIds: [] });
+const EMPTY_STATE = Object.freeze({
+  version: 1,
+  sessions: {},
+  seenMessageIds: [],
+  connectionTestTarget: null,
+});
+
+function connectionTestTarget(value) {
+  const chatId = typeof value?.chatId === 'string' ? value.chatId.trim() : '';
+  const openId = typeof value?.openId === 'string' ? value.openId.trim() : '';
+  return chatId ? { chatId } : openId ? { openId } : null;
+}
 
 export class StateStore {
   #path;
@@ -15,10 +26,14 @@ export class StateStore {
   async load() {
     try {
       const parsed = JSON.parse(await readFile(this.#path, 'utf8'));
+      const sessions = parsed.sessions && typeof parsed.sessions === 'object' ? parsed.sessions : {};
+      const p2pKey = Object.keys(sessions).findLast((key) => key.startsWith('p2p:'));
       this.#state = {
         version: 1,
-        sessions: parsed.sessions && typeof parsed.sessions === 'object' ? parsed.sessions : {},
+        sessions,
         seenMessageIds: Array.isArray(parsed.seenMessageIds) ? parsed.seenMessageIds.slice(-1000) : [],
+        connectionTestTarget: connectionTestTarget(parsed.connectionTestTarget)
+          ?? connectionTestTarget({ openId: p2pKey?.slice(4) }),
       };
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
@@ -43,6 +58,17 @@ export class StateStore {
 
   async clearSessions() {
     this.#state.sessions = {};
+    await this.#persist();
+  }
+
+  connectionTestTarget() {
+    return structuredClone(this.#state.connectionTestTarget);
+  }
+
+  async setConnectionTestTarget(target) {
+    const normalized = connectionTestTarget(target);
+    if (!normalized) throw new TypeError('Feishu connection test target is required');
+    this.#state.connectionTestTarget = normalized;
     await this.#persist();
   }
 

@@ -98,6 +98,36 @@ test('Weixin remembers any authorized private inbound as a connection-test targe
   assert.equal(connectionTestTarget(rejectedFixture.state), null);
 });
 
+test('Weixin can disable workspace and session management commands for a recruiting bot', async () => {
+  const fixture = stateFixture();
+  const sent = [];
+  const bridge = new WeixinHarnessBridge({
+    api: { sendText: async (request) => sent.push(request) },
+    baseUrl: 'https://ilinkai.weixin.qq.com/',
+    token: 'host-token',
+    ownerUserId: 'owner-user',
+    harness: {
+      ask: async () => assert.fail('disabled management commands must not reach Harness'),
+      listWorkspaces: async () => assert.fail('disabled management commands must not list workspaces'),
+    },
+    state: fixture.state,
+    workspaceSessionCommandsEnabled: false,
+  });
+
+  for (const [index, command] of [
+    '/workspace D:\\other',
+    '/workspacelist',
+    '/sessionlist',
+    '/session session-other',
+  ].entries()) {
+    await bridge.accept(message(`disabled-management-${index}`, command));
+    assert.equal(sent.at(-1).text, '当前机器人未开放工作区或会话管理命令。');
+  }
+
+  await bridge.accept(message('disabled-management-help', '/help'));
+  assert.doesNotMatch(sent.at(-1).text, /\/(?:workspace|session)/);
+});
+
 test('Weixin sends image-only messages to Harness as structured content', async () => {
   const fixture = stateFixture();
   fixture.sessions.set('p2p:owner-user', 'session-image');
@@ -1095,6 +1125,7 @@ test('bridge commands are local and internal failures return a generic message',
     ownerUserId: 'owner-user',
     harness: {
       ensureRunning: async () => true,
+      createSession: async () => 'new-session',
       sessionExists: async () => true,
       ask: async () => { throw new Error('private path /secret and token-shaped detail'); },
     },
@@ -1103,7 +1134,8 @@ test('bridge commands are local and internal failures return a generic message',
   });
 
   await bridge.accept(message('new', '/new'));
-  assert.equal(fixture.sessions.has('p2p:owner-user'), false);
+  assert.equal(fixture.sessions.get('p2p:owner-user'), 'new-session');
+  assert.equal(sent[0], '已开启新会话。\nID：new-session');
   await bridge.accept(message('failure', '触发失败'));
   assert.match(sent.at(-1), /消息处理失败/);
   assert.doesNotMatch(sent.at(-1), /private path|secret|token-shaped/);

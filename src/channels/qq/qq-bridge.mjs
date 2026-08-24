@@ -426,6 +426,8 @@ export class QqHarnessBridge {
           state: this.#state,
           key,
           channelLabel: this.#sourceChannelLabel,
+          fromUserId: key,
+          msgId: messageId,
           ...(hasImages ? { content } : { text }),
           createOptions: { signal: this.#signal },
           existsOptions: { signal: this.#signal },

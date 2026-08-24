@@ -14,15 +14,29 @@ export function rememberConnectionTestTarget(state, target) {
   if (!state || !target || typeof target !== 'object') return false;
   try {
     targets.set(stateIdentity(state), structuredClone(target));
-    return true;
+    return typeof stateIdentity(state)?.setConnectionTestTarget === 'function'
+      ? stateIdentity(state).setConnectionTestTarget(target)
+      : true;
   } catch {
     return false;
   }
 }
 
 export function connectionTestTarget(state) {
-  const target = state ? targets.get(stateIdentity(state)) : null;
+  const identity = stateIdentity(state);
+  const target = identity
+    ? targets.get(identity) ?? identity.connectionTestTarget?.()
+    : null;
   return target ? structuredClone(target) : null;
+}
+
+export function latestBoundConversation(state, prefix) {
+  const normalizedPrefix = cleanText(prefix);
+  const sessions = stateIdentity(state)?.snapshot?.()?.sessions;
+  if (!normalizedPrefix || !sessions || typeof sessions !== 'object') return null;
+  const key = Object.keys(sessions).findLast((value) => value.startsWith(normalizedPrefix));
+  const id = key ? cleanText(key.slice(normalizedPrefix.length)) : null;
+  return id ? { key, id } : null;
 }
 
 export function connectionTestMessage(botName, channelLabel = '机器人') {

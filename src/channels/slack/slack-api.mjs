@@ -285,7 +285,7 @@ export class SlackApi {
           'content-type': body === undefined
             ? 'application/x-www-form-urlencoded;charset=utf-8'
             : 'application/json;charset=utf-8',
-          'user-agent': 'DeepSeek-Harness-dsh-im (https://github.com/xmanrui/dsh-im, 0.2.2)',
+          'user-agent': 'DeepSeek-Harness-dsh-im (https://github.com/onlyforchris/dsh-im, 0.16.5)',
         },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         signal: requestSignal(signal, timeoutMs),

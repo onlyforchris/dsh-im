@@ -3,7 +3,11 @@ import {
   createDingtalkBridgeStatus,
   DingtalkHarnessBridge,
 } from './dingtalk-bridge.mjs';
-import { sendRememberedConnectionTest } from '../shared/connection-test.mjs';
+import {
+  connectionTestTarget,
+  latestBoundConversation,
+  sendRememberedConnectionTest,
+} from '../shared/connection-test.mjs';
 
 function nonEmptyString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
@@ -353,6 +357,29 @@ export class DingtalkRuntime {
   }
 
   async sendConnectionTest(text) {
+    const userId = connectionTestTarget(this.#state)?.userId
+      ?? latestBoundConversation(this.#state, 'p2p:')?.id;
+    if (userId && typeof this.#api.createAiCard === 'function'
+      && typeof this.#api.finishAiCard === 'function') {
+      if (!this.#status.ready || !this.#abortController) {
+        throw new Error('DingTalk runtime is not connected');
+      }
+      const card = await this.#api.createAiCard({
+        clientId: this.#config.clientId,
+        clientSecret: this.#clientSecret,
+        target: { type: 'user', userId },
+        initialText: text,
+        signal: this.#abortController.signal,
+      });
+      await this.#api.finishAiCard({
+        clientId: this.#config.clientId,
+        clientSecret: this.#clientSecret,
+        cardInstanceId: card.cardInstanceId,
+        text,
+        signal: this.#abortController.signal,
+      });
+      return { sent: true };
+    }
     return sendRememberedConnectionTest({
       state: this.#state,
       text,

@@ -3,6 +3,13 @@ import test from 'node:test';
 
 import { createImHostPlugin, inject, name } from '../plugin-src/host/index.mjs';
 
+function hostContext(extra = {}) {
+  return {
+    effect(register) { register()?.(); },
+    ...extra,
+  };
+}
+
 test('Host composes nine IM channels and the AI Office connector inside one plugin context', async () => {
   const calls = [];
   const plugin = createImHostPlugin({
@@ -17,7 +24,7 @@ test('Host composes nine IM channels and the AI Office connector inside one plug
     applyWhatsapp: async (ctx, config) => calls.push(['whatsapp', ctx, config]),
     applyOffice: async (ctx, config) => calls.push(['office', ctx, config]),
   });
-  const ctx = { marker: 'shared-context' };
+  const ctx = hostContext({ marker: 'shared-context' });
   const config = {
     rpcAuthority: 'trusted-host',
     feishu: { domain: 'feishu' },
@@ -60,7 +67,7 @@ test('Host does not start Weixin when Feishu activation fails', async () => {
     applyQq: async () => { throw new Error('QQ must not start'); },
   });
 
-  await assert.rejects(() => plugin.apply({}, {}), /feishu unavailable/);
+  await assert.rejects(() => plugin.apply(hostContext(), {}), /feishu unavailable/);
   assert.equal(weixinStarted, false);
 });
 
@@ -74,7 +81,7 @@ test('Host does not start DingTalk when Weixin activation fails', async () => {
     applyQq: async () => { throw new Error('QQ must not start'); },
   });
 
-  await assert.rejects(() => plugin.apply({}, {}), /weixin unavailable/);
+  await assert.rejects(() => plugin.apply(hostContext(), {}), /weixin unavailable/);
   assert.equal(dingtalkStarted, false);
 });
 
@@ -88,7 +95,7 @@ test('Host does not start Enterprise WeChat when DingTalk activation fails', asy
     applyQq: async () => { throw new Error('QQ must not start'); },
   });
 
-  await assert.rejects(() => plugin.apply({}, {}), /dingtalk unavailable/);
+  await assert.rejects(() => plugin.apply(hostContext(), {}), /dingtalk unavailable/);
   assert.equal(wecomStarted, false);
 });
 
@@ -102,6 +109,6 @@ test('Host does not start QQ when Enterprise WeChat activation fails', async () 
     applyQq: async () => { qqStarted = true; },
   });
 
-  await assert.rejects(() => plugin.apply({}, {}), /wecom unavailable/);
+  await assert.rejects(() => plugin.apply(hostContext(), {}), /wecom unavailable/);
   assert.equal(qqStarted, false);
 });

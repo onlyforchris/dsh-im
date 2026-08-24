@@ -1,6 +1,6 @@
 {
-  "name": "@xmanrui/dsh-im",
-  "version": "0.16.2",
+  "name": "@onlyforchris/dsh-im",
+  "version": "0.16.5",
   "description": "把九种 IM 机器人和公网 AI Office 接入本机 DeepSeek Harness。 Connect nine IM channels and a public AI Office to a local DeepSeek Harness.",
   "keywords": [
     "deepseek-harness",
@@ -23,10 +23,14 @@
     "ai-office"
   ],
   "author": {
-    "name": "xmanrui",
-    "url": "https://github.com/xmanrui"
+    "name": "onlyforchris",
+    "url": "https://github.com/onlyforchris"
   },
   "contributors": [
+    {
+      "name": "xmanrui",
+      "url": "https://github.com/xmanrui"
+    },
     {
       "name": "C3H3-AI",
       "url": "https://github.com/C3H3-AI"
@@ -36,10 +40,10 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/xmanrui/dsh-im.git"
+    "url": "git+https://github.com/onlyforchris/dsh-im.git"
   },
-  "homepage": "https://github.com/xmanrui/dsh-im#readme",
-  "bugs": "https://github.com/xmanrui/dsh-im/issues",
+  "homepage": "https://github.com/onlyforchris/dsh-im#readme",
+  "bugs": "https://github.com/onlyforchris/dsh-im/issues",
   "publishConfig": {
     "access": "public"
   },

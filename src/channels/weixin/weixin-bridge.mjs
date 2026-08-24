@@ -20,7 +20,7 @@ import {
   runModelCommand,
 } from '../shared/model-command.mjs';
 import { runWorkspaceCommand } from '../shared/workspace-command.mjs';
-import { askInWorkspaceSession } from '../shared/workspace-session.mjs';
+import { askInWorkspaceSession, resetWorkspaceSession } from '../shared/workspace-session.mjs';
 import {
   hasInboundImages,
   imagePromptUserMessage,
@@ -30,16 +30,22 @@ import { rememberConnectionTestTarget } from '../shared/connection-test.mjs';
 
 const INTERACTION_RESOLVED_TEXT = '这个问题已在其他客户端处理，无需再次回答。';
 
-const HELP_TEXT = [
+const WORKSPACE_SESSION_COMMAND = /^\/(?:workspace(?:list)?|session(?:list)?)(?:\s|$)/i;
+const WORKSPACE_SESSION_HELP = [
+  '/workspace 工作区绝对路径  切换工作区',
+  '/workspacelist  列出工作区绝对路径',
+  '/sessionlist [工作区序号或绝对路径]  列出会话 ID 和标题',
+  '/session Session ID 或当前工作区序号  将当前聊天绑定到指定会话',
+];
+
+function helpText(workspaceSessionCommandsEnabled) {
+  return [
   '微信已连接 DeepSeek Harness。',
   '',
   '直接发送文字、图片或带文字识别结果的语音即可继续当前会话。',
   '/new  开启一个全新会话',
   '/compact  压缩当前会话的较早上下文',
-  '/workspace 工作区绝对路径  切换工作区',
-  '/workspacelist  列出工作区绝对路径',
-  '/sessionlist [工作区序号或绝对路径]  列出会话 ID 和标题',
-  '/session Session ID 或当前工作区序号  将当前聊天绑定到指定会话',
+  ...(workspaceSessionCommandsEnabled ? WORKSPACE_SESSION_HELP : []),
   '/models  按序号列出所有可用模型',
   '/model [序号或完整模型ID]  查看或切换当前会话模型',
   '示例：先发 /models，再发 /model 2',
@@ -47,7 +53,8 @@ const HELP_TEXT = [
   '/steer 补充指令  纠偏当前任务',
   '/status  检查连接状态',
   '/help  显示本帮助',
-].join('\n');
+  ].join('\n');
+}
 
 function conversationKey(userId) {
   return `p2p:${userId}`;
@@ -94,6 +101,7 @@ export class WeixinHarnessBridge {
   #maxMessageChars;
   #signal;
   #sourceChannelLabel;
+  #workspaceSessionCommandsEnabled;
   #queues = new Map();
   #pendingInteractions = new Map();
   #interactionKeys = new Map();
@@ -114,6 +122,7 @@ export class WeixinHarnessBridge {
     replyTimeoutMs = 600_000,
     maxMessageChars = 4_000,
     sourceChannelLabel,
+    workspaceSessionCommandsEnabled = true,
     signal,
   }) {
     if (!api || typeof api.sendText !== 'function') throw new TypeError('Weixin API is required');
@@ -131,6 +140,7 @@ export class WeixinHarnessBridge {
     this.#maxMessageChars = maxMessageChars;
     this.#signal = signal;
     this.#sourceChannelLabel = sourceChannelLabel;
+    this.#workspaceSessionCommandsEnabled = workspaceSessionCommandsEnabled !== false;
     this.#approvals = new HarnessApprovalQueue({ label: 'weixin', logger });
   }
 
@@ -147,7 +157,9 @@ export class WeixinHarnessBridge {
       || this.#acceptedMessageIds.has(messageId)) return Promise.resolve();
     this.#acceptedMessageIds.add(messageId);
     if (sender === this.#ownerUserId) {
-      rememberConnectionTestTarget(this.#state, { toUserId: sender });
+      void Promise.resolve(
+        rememberConnectionTestTarget(this.#state, { toUserId: sender }),
+      ).catch(() => this.#logger.warn?.('[dsh-weixin] unable to persist the private target'));
     }
     const key = conversationKey(sender);
     const contextToken = nonEmptyString(message?.context_token) ?? undefined;
@@ -327,7 +339,12 @@ export class WeixinHarnessBridge {
 
       const command = text.trim().toLowerCase();
       if (!hasImages && command === '/help') {
-        await this.#send(sender, HELP_TEXT, contextToken, runId);
+        await this.#send(
+          sender,
+          helpText(this.#workspaceSessionCommandsEnabled),
+          contextToken,
+          runId,
+        );
         await this.#state.markSeen(messageId);
         return;
       }
@@ -338,8 +355,24 @@ export class WeixinHarnessBridge {
         return;
       }
       if (!hasImages && command === '/new') {
-        await this.#state.clearSession(key);
-        await this.#send(sender, '已开启新会话。请发送你的问题。', contextToken, runId);
+        const sessionId = await resetWorkspaceSession({
+          harness: this.#harness,
+          state: this.#state,
+          key,
+          createOptions: { signal: this.#signal },
+        });
+        await this.#send(sender, `已开启新会话。\nID：${sessionId}`, contextToken, runId);
+        await this.#state.markSeen(messageId);
+        return;
+      }
+      if (!hasImages && !this.#workspaceSessionCommandsEnabled
+        && WORKSPACE_SESSION_COMMAND.test(text.trim())) {
+        await this.#send(
+          sender,
+          '当前机器人未开放工作区或会话管理命令。',
+          contextToken,
+          runId,
+        );
         await this.#state.markSeen(messageId);
         return;
       }
@@ -372,12 +405,16 @@ export class WeixinHarnessBridge {
         ? await promptContentForMessage(promptMessage, { signal: this.#signal })
         : undefined;
       let answer;
+      let shortCircuited = false;
       try {
-        ({ answer } = await askInWorkspaceSession({
+        ({ answer, shortCircuited } = await askInWorkspaceSession({
           harness: this.#harness,
           state: this.#state,
           key,
           channelLabel: this.#sourceChannelLabel,
+          fromUserId: sender,
+          msgId: messageId,
+          logger: this.#logger,
           ...(hasImages ? { content } : { text }),
           createOptions: { signal: this.#signal },
           existsOptions: { signal: this.#signal },
@@ -400,10 +437,14 @@ export class WeixinHarnessBridge {
           this.#approvals.closeRoute(key),
         ]);
       }
-      await this.#send(sender, answer, contextToken, runId);
+      if (answer) {
+        await this.#send(sender, answer, contextToken, runId);
+        this.#status.messagesReplied += 1;
+        this.#status.lastReplyAt = new Date().toISOString();
+      } else if (shortCircuited) {
+        this.#logger?.info?.('[dsh-weixin] recruiting short-circuit silent (duplicate/empty)');
+      }
       await this.#state.markSeen(messageId);
-      this.#status.messagesReplied += 1;
-      this.#status.lastReplyAt = new Date().toISOString();
       this.#status.lastError = null;
     } catch (error) {
       if (error?.code === 'turn-stopped') {

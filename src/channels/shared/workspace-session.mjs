@@ -1,4 +1,5 @@
 import { withSessionBindingLock } from './session-binding-lock.mjs';
+import { runImPreAsk } from './im-pre-ask.mjs';
 
 export const WORKSPACE_SESSION_STALE = 'workspace-session-stale';
 
@@ -31,14 +32,34 @@ async function createSession(harness, options) {
     : harness.createSession(options);
 }
 
+export async function resetWorkspaceSession({ harness, state, key, createOptions }) {
+  while (true) {
+    try {
+      const sessionId = await withSessionBindingLock(state, key, async () => {
+        const created = await createSession(harness, createOptions);
+        return await state.setSession(key, created) === false ? null : created;
+      });
+      if (sessionId) return sessionId;
+    } catch (error) {
+      if (error?.code !== WORKSPACE_SESSION_STALE) throw error;
+    }
+  }
+}
+
 /**
- * Tag an inbound prompt with its source channel so the agent can attribute
- * work (e.g. cross-channel work logs) without guessing from context.
+ * Tag an inbound prompt with channel + sender + msgId so downstream plugins
+ * can route without guessing.
+ * Format: `[来源渠道:微信｜发送人:<id>｜消息ID:<id>]`
  */
-export function tagPromptWithChannel(text, content, channelLabel) {
+export function tagPromptWithChannel(text, content, channelLabel, meta = {}) {
   const label = typeof channelLabel === 'string' ? channelLabel.trim() : '';
   if (!label) return { text, content };
-  const tag = `[来源渠道:${label}]`;
+  const fromUserId = typeof meta.fromUserId === 'string' ? meta.fromUserId.trim() : '';
+  const msgId = typeof meta.msgId === 'string' ? meta.msgId.trim() : '';
+  let tag = `[来源渠道:${label}`;
+  if (fromUserId) tag += `｜发送人:${fromUserId}`;
+  if (msgId) tag += `｜消息ID:${msgId}`;
+  tag += ']';
   if (Array.isArray(content)) {
     const tagged = content.slice();
     const index = tagged.findIndex((item) => item?.type === 'text');
@@ -53,10 +74,20 @@ export function tagPromptWithChannel(text, content, channelLabel) {
   return { text: text ? `${tag}\n${text}` : tag, content };
 }
 
+function extractPlainText(text, content) {
+  if (typeof text === 'string' && text.trim()) return text.trim();
+  if (Array.isArray(content)) {
+    const block = content.find((b) => b?.type === 'text' && typeof b.text === 'string');
+    if (block) {
+      return String(block.text).replace(/^\[来源渠道:[^\]]+\]\s*/u, '').trim();
+    }
+  }
+  return '';
+}
+
 /**
  * Resolve, persist, and ask through a session that belongs to the bot's
- * current workspace. A concurrent workspace switch invalidates the scoped
- * session and retries before any prompt is sent to the stale session.
+ * current workspace. Runs optional `im/pre-ask` gate before Harness.
  */
 export async function askInWorkspaceSession({
   harness,
@@ -65,11 +96,45 @@ export async function askInWorkspaceSession({
   text,
   content,
   channelLabel,
+  fromUserId,
+  msgId,
   createOptions,
   existsOptions,
   askOptions,
+  logger,
+  workspace,
 }) {
-  const prompt = tagPromptWithChannel(text, content, channelLabel);
+  const plainText = extractPlainText(text, content);
+  const resolvedWorkspace =
+    workspace
+    || (typeof harness?.workspace === 'string' ? harness.workspace : '')
+    || (typeof harness?.workspace === 'function' ? harness.workspace() : '')
+    || '';
+  const pre = await runImPreAsk({
+    channelLabel: channelLabel || '',
+    fromUserId: fromUserId || '',
+    msgId: msgId || '',
+    text: plainText,
+    content,
+    workspace: resolvedWorkspace,
+    logger,
+  });
+  if (pre.kind === 'reply') {
+    return {
+      sessionId: state.sessionFor?.(key) || '',
+      answer: pre.text,
+      shortCircuited: true,
+    };
+  }
+  if (pre.kind === 'silent') {
+    return {
+      sessionId: state.sessionFor?.(key) || '',
+      answer: '',
+      shortCircuited: true,
+    };
+  }
+
+  const prompt = tagPromptWithChannel(text, content, channelLabel, { fromUserId, msgId });
   while (true) {
     try {
       const binding = await withSessionBindingLock(state, key, async () => {

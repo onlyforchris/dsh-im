@@ -1,4 +1,4 @@
-export const WHATSAPP_STYLE_ID = 'xmanrui-dsh-im-whatsapp-settings';
+export const WHATSAPP_STYLE_ID = 'onlyforchris-dsh-im-whatsapp-settings';
 
 const CSS = String.raw`
 .dwa-page { --ddt-accent: #25d366; --ddt-accent-deep: #128c7e; --ddt-accent-wash: #eafbf0; }
@@ -11,7 +11,7 @@ export function installWhatsappStyles() {
   const existing = document.querySelector(`style[data-plugin-css="${WHATSAPP_STYLE_ID}"]`);
   if (existing) return () => {};
   const style = document.createElement('style');
-  style.dataset.plugin = '@xmanrui/dsh-im';
+  style.dataset.plugin = '@onlyforchris/dsh-im';
   style.dataset.pluginCss = WHATSAPP_STYLE_ID;
   style.textContent = CSS;
   document.head.appendChild(style);

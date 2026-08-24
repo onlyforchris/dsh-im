@@ -15,7 +15,7 @@ import {
   runModelCommand,
 } from '../shared/model-command.mjs';
 import { runWorkspaceCommand } from '../shared/workspace-command.mjs';
-import { askInWorkspaceSession } from '../shared/workspace-session.mjs';
+import { askInWorkspaceSession, resetWorkspaceSession } from '../shared/workspace-session.mjs';
 import {
   hasInboundImages,
   ImagePromptError,
@@ -288,7 +288,9 @@ export class WecomHarnessBridge {
     const key = conversationKey(frame);
     this.#acceptedMessageIds.add(messageId);
     if (body.chattype === 'single') {
-      rememberConnectionTestTarget(this.#state, { chatId });
+      void Promise.resolve(
+        rememberConnectionTestTarget(this.#state, { chatId }),
+      ).catch(() => this.#logger.warn?.('[dsh-wecom] unable to persist the private target'));
     }
     const pending = this.#pendingInteractions.get(key);
     const commandMessage = wecomInboundMessage(frame, this.#client);
@@ -508,8 +510,13 @@ export class WecomHarnessBridge {
         return;
       }
       if (!hasImages && command === '/new') {
-        await this.#state.clearSession(key);
-        await this.#sendImmediate(frame, chatId, '已开启新会话。请发送你的问题。');
+        const sessionId = await resetWorkspaceSession({
+          harness: this.#harness,
+          state: this.#state,
+          key,
+          createOptions: { signal: this.#signal },
+        });
+        await this.#sendImmediate(frame, chatId, `已开启新会话。\nID：${sessionId}`);
         await this.#state.markSeen(messageId);
         return;
       }
@@ -556,6 +563,8 @@ export class WecomHarnessBridge {
         text,
         content,
         channelLabel: this.#sourceChannelLabel,
+        fromUserId: senderId,
+        msgId: messageId,
         createOptions: { signal: this.#signal },
         existsOptions: { signal: this.#signal },
         askOptions: {

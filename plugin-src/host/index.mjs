@@ -8,6 +8,7 @@ import { apply as applyTelegram } from './channels/telegram/index.mjs';
 import { apply as applyWecom } from './channels/wecom/index.mjs';
 import { apply as applyWeixin } from './channels/weixin/index.mjs';
 import { apply as applyWhatsapp } from './channels/whatsapp/index.mjs';
+import { installImPreAsk } from '../../src/channels/shared/im-pre-ask.mjs';
 
 export const name = 'dsh-im-host';
 export const inject = ['connection', 'credentials', 'webServer', 'typertGateway'];
@@ -34,6 +35,17 @@ export function createImHostPlugin(internals = {}) {
     name,
     inject,
     async apply(ctx, config = {}) {
+      // 通用扩展点：业务插件 ctx.on('im/pre-ask') 可短路固定回执（不进 LLM）
+      const disposePreAsk = installImPreAsk(async (payload) => {
+        if (typeof ctx.waterfall !== 'function') return { kind: 'continue' };
+        return ctx.waterfall(
+          'im/pre-ask',
+          payload,
+          () => Promise.resolve({ kind: 'continue' }),
+        );
+      });
+      ctx.effect(() => disposePreAsk, 'dsh-im: im/pre-ask gate');
+
       await startFeishu(ctx, channelConfig(config, 'feishu'));
       await startWeixin(ctx, channelConfig(config, 'weixin'));
       await startDingtalk(ctx, channelConfig(config, 'dingtalk'));

@@ -386,6 +386,8 @@ export class TextHarnessBridge {
         text,
         content,
         channelLabel: this.#sourceChannelLabel,
+        fromUserId: senderId,
+        msgId: messageId,
         createOptions: this.#signal ? { signal: this.#signal } : undefined,
         existsOptions: this.#signal ? { signal: this.#signal } : undefined,
         askOptions: {

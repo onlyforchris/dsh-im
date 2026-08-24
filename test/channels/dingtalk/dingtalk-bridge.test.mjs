@@ -95,6 +95,7 @@ test('DingTalk remembers any private inbound session webhook for connection test
   await privateBridge.accept(message('help-private', '/help'));
   assert.deepEqual(connectionTestTarget(privateFixture.state), {
     sessionWebhook: 'https://oapi.dingtalk.com/robot/reply?ticket=help-private',
+    userId: 'staff-approved',
   });
   assert.match(privateSent.at(-1).text, /\/help/);
 
@@ -554,6 +555,7 @@ test('commands stay local and unsafe session webhooks are rejected before Harnes
     clientSecret: 'host-secret',
     harness: {
       ensureRunning: async () => true,
+      createSession: async () => 'new-session',
       sessionExists: async () => true,
       ask: async () => { asked += 1; },
     },
@@ -562,12 +564,12 @@ test('commands stay local and unsafe session webhooks are rejected before Harnes
   });
 
   await bridge.accept(message('new', '/new'));
-  assert.equal(fixture.sessions.has('p2p:staff-approved'), false);
+  assert.equal(fixture.sessions.get('p2p:staff-approved'), 'new-session');
   await bridge.accept(message('unsafe', '不应执行', {
     sessionWebhook: 'https://oapi.dingtalk.com.attacker.example/reply?private=one',
   }));
   assert.equal(asked, 0);
-  assert.equal(sent[0], '已开启新会话。请发送你的问题。');
+  assert.equal(sent[0], '已开启新会话。\nID：new-session');
   assert.equal(sent.length, 1);
   assert.equal(bridge.status.lastError, '钉钉消息没有安全的回复地址。');
 });

@@ -8,6 +8,7 @@ import { WeixinStateStore } from '../../../../src/channels/weixin/state-store.mj
 import { createWeixinApi } from '../../../../src/channels/weixin/weixin-api.mjs';
 import { WeixinController } from '../../../../src/channels/weixin/weixin-controller.mjs';
 import { WeixinRuntime } from '../../../../src/channels/weixin/weixin-runtime.mjs';
+import { NotificationOutbox } from '../../../../src/channels/weixin/notification-outbox.mjs';
 import {
   BotWorkspaceStore,
   createBotWorkspaceScope,
@@ -108,6 +109,7 @@ export async function createProductionController(ctx, config = {}, internals = {
         state: workspaceScope.state,
         replyTimeoutMs: config.replyTimeoutMs ?? 600_000,
         maxMessageChars: config.maxMessageChars ?? 4_000,
+        workspaceSessionCommandsEnabled: config.workspaceSessionCommandsEnabled !== false,
         logger: {
           error: (...args) => logger.error?.(`[${botId}]`, ...args),
           warn: (...args) => logger.warn?.(`[${botId}]`, ...args),
@@ -131,6 +133,17 @@ export async function createProductionController(ctx, config = {}, internals = {
     },
   });
   const controller = createWorkspaceAwareController(coreController, { workspaces, stateFor });
+  if (config.notificationOutboxDir && !config.notificationBotId) {
+    throw new TypeError('notificationBotId is required when notificationOutboxDir is configured');
+  }
+  const notificationOutbox = config.notificationOutboxDir
+    ? new NotificationOutbox({
+        dir: config.notificationOutboxDir,
+        pollIntervalMs: config.notificationPollIntervalMs ?? 5_000,
+        logger,
+        send: (text) => controller.sendNotification(config.notificationBotId, text),
+      })
+    : null;
   const supervisor = createSupervisor({
     controller,
     harness,
@@ -138,10 +151,12 @@ export async function createProductionController(ctx, config = {}, internals = {
     retryDelaysMs: config.retryDelaysMs,
     healthyIntervalMs: config.healthyIntervalMs,
   }).start();
+  await notificationOutbox?.start();
   return {
     controller,
     ready: supervisor.ready,
     async close() {
+      await notificationOutbox?.close();
       await supervisor.close();
       await controller.close();
       harness.stopManagedProcess();

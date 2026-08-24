@@ -1,4 +1,4 @@
-export const DINGTALK_STYLE_ID = 'xmanrui-dsh-dingtalk-settings';
+export const DINGTALK_STYLE_ID = 'onlyforchris-dsh-im-dingtalk-settings';
 
 const CSS = String.raw`
 .ddt-page {
@@ -132,7 +132,7 @@ export function installDingtalkStyles() {
   const existing = document.querySelector(`style[data-plugin-css="${DINGTALK_STYLE_ID}"]`);
   if (existing) return () => {};
   const style = document.createElement('style');
-  style.dataset.plugin = '@xmanrui/dsh-dingtalk';
+  style.dataset.plugin = '@onlyforchris/dsh-im';
   style.dataset.pluginCss = DINGTALK_STYLE_ID;
   style.textContent = CSS;
   document.head.appendChild(style);

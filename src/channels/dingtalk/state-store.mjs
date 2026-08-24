@@ -7,6 +7,7 @@ const EMPTY_STATE = Object.freeze({
   sessions: {},
   seenMessageIds: [],
   pendingSenders: {},
+  connectionTestTarget: null,
 });
 
 function nonEmptyString(value) {
@@ -15,6 +16,11 @@ function nonEmptyString(value) {
 
 function displayName(value) {
   return (nonEmptyString(value) ?? '钉钉用户').slice(0, 100);
+}
+
+function connectionTestTarget(value) {
+  const userId = nonEmptyString(value?.userId);
+  return userId ? { userId } : null;
 }
 
 function normalizePendingSender(value, fallbackRequestId) {
@@ -67,6 +73,10 @@ function normalizeState(value) {
       ? [...new Set(value.seenMessageIds.map(nonEmptyString).filter(Boolean))].slice(-1_000)
       : [],
     pendingSenders,
+    connectionTestTarget: connectionTestTarget(value.connectionTestTarget)
+      ?? connectionTestTarget({
+        userId: Object.keys(sessions).findLast((key) => key.startsWith('p2p:'))?.slice(4),
+      }),
   };
 }
 
@@ -119,6 +129,17 @@ export class DingtalkStateStore {
 
   async clearSessions() {
     this.#state.sessions = {};
+    await this.#persist();
+  }
+
+  connectionTestTarget() {
+    return structuredClone(this.#state.connectionTestTarget);
+  }
+
+  async setConnectionTestTarget(target) {
+    const normalized = connectionTestTarget(target);
+    if (!normalized) throw new TypeError('DingTalk connection test target is required');
+    this.#state.connectionTestTarget = normalized;
     await this.#persist();
   }
 

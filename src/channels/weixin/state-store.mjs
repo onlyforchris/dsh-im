@@ -6,7 +6,13 @@ const EMPTY_STATE = Object.freeze({
   sessions: {},
   seenMessageIds: [],
   getUpdatesBuf: '',
+  connectionTestTarget: null,
 });
+
+function connectionTestTarget(value) {
+  const toUserId = typeof value?.toUserId === 'string' ? value.toUserId.trim() : '';
+  return toUserId ? { toUserId } : null;
+}
 
 function normalizeState(value) {
   if (!value || typeof value !== 'object') return structuredClone(EMPTY_STATE);
@@ -25,6 +31,10 @@ function normalizeState(value) {
       ? value.seenMessageIds.filter((id) => typeof id === 'string').slice(-1_000)
       : [],
     getUpdatesBuf: typeof value.getUpdatesBuf === 'string' ? value.getUpdatesBuf : '',
+    connectionTestTarget: connectionTestTarget(value.connectionTestTarget)
+      ?? connectionTestTarget({
+        toUserId: Object.keys(sessions).findLast((key) => key.startsWith('p2p:'))?.slice(4),
+      }),
   };
 }
 
@@ -64,6 +74,17 @@ export class WeixinStateStore {
 
   async clearSessions() {
     this.#state.sessions = {};
+    await this.#persist();
+  }
+
+  connectionTestTarget() {
+    return structuredClone(this.#state.connectionTestTarget);
+  }
+
+  async setConnectionTestTarget(target) {
+    const normalized = connectionTestTarget(target);
+    if (!normalized) throw new TypeError('Weixin connection test target is required');
+    this.#state.connectionTestTarget = normalized;
     await this.#persist();
   }
 

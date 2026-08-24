@@ -19,7 +19,7 @@ import {
   runModelCommand,
 } from '../shared/model-command.mjs';
 import { runWorkspaceCommand } from '../shared/workspace-command.mjs';
-import { askInWorkspaceSession } from '../shared/workspace-session.mjs';
+import { askInWorkspaceSession, resetWorkspaceSession } from '../shared/workspace-session.mjs';
 import {
   hasInboundImages,
   imagePromptUserMessage,
@@ -328,7 +328,9 @@ export class DingtalkHarnessBridge {
       // An unsafe reply route must never be able to submit an approval.
     }
     if (sessionWebhook && String(message.conversationType) !== '2') {
-      rememberConnectionTestTarget(this.#state, { sessionWebhook });
+      void Promise.resolve(
+        rememberConnectionTestTarget(this.#state, { sessionWebhook, userId: sender }),
+      ).catch(() => this.#logger.warn?.('[dsh-dingtalk] unable to persist the private target'));
     }
     const pending = this.#pendingInteractions.get(key);
     const promptMessage = dingtalkInboundMessage(message, {
@@ -546,8 +548,13 @@ export class DingtalkHarnessBridge {
         return;
       }
       if (isPlainText && !hasImages && command === '/new') {
-        await this.#state.clearSession(key);
-        await this.#send(sessionWebhook, '已开启新会话。请发送你的问题。');
+        const sessionId = await resetWorkspaceSession({
+          harness: this.#harness,
+          state: this.#state,
+          key,
+          createOptions: { signal: this.#signal },
+        });
+        await this.#send(sessionWebhook, `已开启新会话。\nID：${sessionId}`);
         return;
       }
       const workspaceCommand = isPlainText && !hasImages
@@ -594,6 +601,8 @@ export class DingtalkHarnessBridge {
         state: this.#state,
         key,
         channelLabel: this.#sourceChannelLabel,
+        fromUserId: sender,
+        msgId: messageId,
         ...(hasImages ? { content } : { text }),
         createOptions: { signal: this.#signal },
         existsOptions: { signal: this.#signal },

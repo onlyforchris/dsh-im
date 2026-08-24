@@ -286,6 +286,18 @@ export class WeixinController {
     });
   }
 
+  async sendNotification(botId, text) {
+    const config = this.#configStore.get(botId);
+    if (!config) throw new Error('Unknown Weixin account');
+    return this.#withBotTransition(botId, async () => {
+      const runtime = this.#runtimes.get(botId);
+      if (!runtime?.status?.ready || typeof runtime.sendNotification !== 'function') {
+        throw new Error('Weixin runtime is not connected');
+      }
+      return runtime.sendNotification(text);
+    });
+  }
+
   async deleteBot(botId) {
     const config = this.#configStore.get(botId);
     if (!config) throw new Error('Unknown Weixin account');

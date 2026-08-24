@@ -1938,6 +1938,7 @@ function sessionsHarness(count) {
   }));
   return {
     ensureRunning: async () => true,
+    createSession: async () => 'session-new',
     currentWorkspace: () => workspace,
     listWorkspaceSessions: async () => ({ workspace, sessions }),
     listWorkspaces: async () => [workspace],
@@ -1999,6 +2000,8 @@ test('card buttons from an allowed sender work', async () => {
   await bridge.onCardAction(cardActionEvent('om_card_1', 'new', 'ou_owner'));
   await bridge.waitForIdle();
   assert.equal(sent.length, 2, 'allowed operator click should send a reply');
+  assert.equal(fixture.sessions.get('p2p:ou_owner'), 'session-new');
+  assert.match(sent.at(-1).content, /ID：session-new/);
 });
 
 test('card buttons honor the wildcard sender allowlist', async () => {
@@ -2127,7 +2130,8 @@ test('session pagination preserves an explicitly selected workspace', async () =
   await bridge.onCardAction(cardActionEvent('om_card_1', 'sessions:1', 'ou_owner'));
   await bridge.waitForIdle();
   assert.equal(useActionsFromCard(cards(sent).at(-1).content)[0], 'selected-11');
-  assert.match(JSON.stringify(cards(sent).at(-1).content), new RegExp(workspaceB.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  const workspaceText = cards(sent).at(-1).content.body.elements[0].text.content;
+  assert.match(workspaceText, /dsh-im-card-selected-/);
 });
 
 const REPAIR_APP_ID = 'cli_repair_test';

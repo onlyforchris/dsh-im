@@ -1,4 +1,4 @@
-export const IM_STYLE_ID = 'xmanrui-dsh-im-settings';
+export const IM_STYLE_ID = 'onlyforchris-dsh-im-settings';
 
 const CSS = String.raw`
 .dim-page {
@@ -280,7 +280,7 @@ export function installImStyles() {
   const existing = document.querySelector(`style[data-plugin-css="${IM_STYLE_ID}"]`);
   if (existing) return () => {};
   const style = document.createElement('style');
-  style.dataset.plugin = '@xmanrui/dsh-im';
+  style.dataset.plugin = '@onlyforchris/dsh-im';
   style.dataset.pluginCss = IM_STYLE_ID;
   style.textContent = CSS;
   document.head.appendChild(style);

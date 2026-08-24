@@ -9,11 +9,8 @@
   <p><strong>Connecting DeepSeek Harness</strong></p>
 
   <p>
-    <img src="https://dsh-im-random-badge.xmanrui-dsh-im.workers.dev" alt="滑动变祖器：今天是梁子或今天是梁圣（随机）">
-    <a href="LICENSE"><img src="https://img.shields.io/github/license/xmanrui/dsh-im" alt="MIT license"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/github/license/onlyforchris/dsh-im" alt="MIT license"></a>
     <img src="https://img.shields.io/badge/agent-DeepSeek%20Harness-5865f2" alt="DeepSeek Harness">
-    <a href="https://dshfind.com/zh/plugins/xmanrui/dsh-im?ref=badge"><img src="https://dshfind.com/api/badge/xmanrui/dsh-im?lang=zh" alt="dshfind"></a>
-    <a href="https://dshfind.com/zh/plugins/xmanrui/dsh-im"><img src="https://img.shields.io/badge/dshfind-%E5%88%86%E7%B1%BB%E7%AC%AC%E4%B8%80-d97706" alt="dshfind: 分类第一"></a>
   </p>
 
   <p>
@@ -71,21 +68,27 @@ A successful heartbeat response must be JSON: `{"ok":true,"protocolVersion":"off
 
 ## Installation
 
-Install the published stable release from npm (recommended):
+Download the `.tgz` from [GitHub Releases](https://github.com/onlyforchris/dsh-im/releases), then install it through the standard DSH plugin command:
 
 ```sh
-dsh plugin --profile web add -w @xmanrui/dsh-im
+dsh plugin --profile web add ./onlyforchris-dsh-im-0.16.5.tgz
 ```
 
 Restart `dsh web`, then open **Settings → Plugins → IM Bot**.
 
+After `@onlyforchris/dsh-im` is published to npm, the exact version can also be installed directly:
+
+```sh
+dsh plugin --profile web add --save-exact @onlyforchris/dsh-im@0.16.5
+```
+
 To try the latest code before it is published to npm, use the GitHub-source installer instead:
 
 ```sh
-npx -y github:xmanrui/dsh-im install
+npx -y github:onlyforchris/dsh-im install
 ```
 
-A GitHub-source installation fetches and builds a Git dependency directly. With pnpm 10 or newer, the profile may first need an `allowBuilds` entry in `pnpm-workspace.yaml`. Most users should prefer the stable npm release.
+A GitHub-source installation fetches and builds a Git dependency directly. With pnpm 10 or newer, the profile may first need an `allowBuilds` entry in `pnpm-workspace.yaml`. Most users should prefer the pinned `.tgz` from Releases.
 
 After installation, follow the built-in instructions on each channel page to scan a QR code or enter credentials. Secrets and Tokens are sent only to the local Harness Host and stored through its protected credential provider; status responses and bot lists never return them.
 
@@ -101,7 +104,7 @@ Each Telegram bot has its own access-mode control on its bot card. Existing and 
 | Command | Description |
 | --- | --- |
 | `/help` | Show the commands and usage supported by the bot. |
-| `/new` | Unbind the current chat so its next ordinary message starts a new Harness Session. |
+| `/new` | Immediately create and bind a new Harness Session, then return its Session ID. |
 | `/status` | Check the connection between the current bot and DeepSeek Harness. |
 | `/models` | List every currently configured model with a number. |
 | `/model` | Show the model used by the Session bound to this chat. |
@@ -122,7 +125,7 @@ Example: send `/models`, then `/model 2` to switch to the second model in the li
 
 - `/help` takes no arguments and never creates a Session. It returns the complete command list supported by the current bot.
 - `/status` takes no arguments, never prompts the model, and does not change the Session binding. It confirms that the current bot can reach DeepSeek Harness.
-- `/new` only removes the current chat's saved dsh-im Session binding; it never deletes, empties, or archives the old Session. The next ordinary message creates and binds a new Session in the current workspace. If a task is running or waiting for a question or approval, finish the interaction or use `/stop` before `/new`.
+- `/new` immediately creates and binds a new Session in the current workspace and returns its Session ID. It never deletes, empties, or archives the old Session. If a task is running or waiting for a question or approval, finish the interaction or use `/stop` before `/new`.
 - `/models` takes no arguments and never creates a Session. It assigns a number to every currently configured Harness model and also shows its stable, copyable `provider/model-id`. If one provider fails, models from the remaining providers are still shown.
 - Bare `/model` only displays the current Session model. A model can be selected by the number or exact full ID returned by `/models`, for example `/model 2`. When the chat has no Session yet, a valid switch creates and binds a blank Session without prompting the model. The switch affects only that Session; Harness also attempts to save it as the default for future Sessions, while other existing Sessions remain unchanged.
 - A model cannot be switched while a task is running or waiting for an approval or question answer. Wait for it to finish or use `/stop` first. A Session containing images cannot switch to a model that does not accept image input.
@@ -147,7 +150,7 @@ Example: send `/models`, then `/model 2` to switch to the second model in the li
 
 - **Image understanding**: all nine built-in channels can send JPEG, PNG, WebP, and GIF files sent as images to Harness, with an optional text description. Each image is limited to 5 MB, and all images in one message are limited to 20 MB in total.
 - **Switch workspaces from a bot card**: every bot card on the settings page shows its current Harness workspace. Enter an existing absolute directory path directly or open the directory picker. Switching clears only that bot's old chat mappings; it never deletes, empties, or archives old Sessions. Replies already in progress may finish, while later messages use the new workspace.
-- **Check the connection and send a test message**: when a bot is online, clicking **Check connection** verifies the platform connection and sends a “DeepSeek Harness connection test succeeded” message to the bot's most recently remembered direct conversation; WhatsApp uses the account's self-chat. The test neither creates a Harness Session nor invokes the model. The bot must have received at least one direct message before it has a remembered test target; otherwise the page reports that no test conversation is available yet.
+- **Check the connection and send a test message**: when a bot is online, clicking **Check connection** verifies the platform connection and sends a “DeepSeek Harness connection test succeeded” message to the bot's most recently remembered direct conversation; WhatsApp uses the account's self-chat. The test neither creates a Harness Session nor invokes the model. A new integration must receive one direct message first; after that, Feishu, DingTalk, Enterprise WeChat, and Weixin recover the recipient from the persisted Session binding across DSH restarts.
 - **Retry a connection or remove an integration**: when a bot is offline, its card action changes to **Retry connection**. Use **Remove integration** when the bot is no longer needed. Each action affects only the selected bot and leaves other bots and channels unchanged.
 - **Manage multiple bots independently**: a channel can have multiple connected bots. Credentials, connection state, workspace, and chat-to-Session mappings are kept separately for every bot, so card actions do not affect sibling bots.
 - **Streaming replies and progress**: the plugin uses each platform's available capabilities to show thinking state, tool progress, and incremental answers. Platforms without a native streaming API complete replies through message edits, card updates, or a final message.
@@ -174,7 +177,7 @@ node bin/dsh-im.mjs install --source .
 IM management RPCs accept loopback browsers by default. When a Web profile is deliberately served on a trusted LAN, opt the plugin into the Host authorities already trusted by Connection in that profile's `cordis.patch.yml`:
 
 ```yaml
-- id: xmanrui-dsh-im
+- id: onlyforchris-dsh-im
   config:
     rpcAuthority: trusted-host
 ```

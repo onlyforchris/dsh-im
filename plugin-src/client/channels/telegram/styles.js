@@ -1,4 +1,4 @@
-export const TELEGRAM_STYLE_ID = 'xmanrui-dsh-im-telegram-settings';
+export const TELEGRAM_STYLE_ID = 'onlyforchris-dsh-im-telegram-settings';
 
 const CSS = String.raw`
 .dtg-page { --ddt-accent: #229ed9; --ddt-accent-deep: #1687bd; --ddt-accent-wash: #eaf7fd; }
@@ -37,7 +37,7 @@ export function installTelegramStyles() {
   const existing = document.querySelector(`style[data-plugin-css="${TELEGRAM_STYLE_ID}"]`);
   if (existing) return () => {};
   const style = document.createElement('style');
-  style.dataset.plugin = '@xmanrui/dsh-im';
+  style.dataset.plugin = '@onlyforchris/dsh-im';
   style.dataset.pluginCss = TELEGRAM_STYLE_ID;
   style.textContent = CSS;
   document.head.appendChild(style);
