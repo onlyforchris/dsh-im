@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 import { WeixinApiError } from '../../../src/channels/weixin/weixin-api.mjs';
@@ -72,13 +75,47 @@ test('runtime sends a connection test to the bound Weixin owner without reply co
   });
 
   await runtime.start();
-  assert.deepEqual(await runtime.sendConnectionTest('连接测试'), { sent: true });
+  assert.deepEqual(await runtime.sendConnectionTest('连接测试'), { sent: true, mode: 'text' });
   assert.equal(sends.length, 1);
   assert.equal(sends[0].toUserId, 'owner-user');
   assert.equal(sends[0].text, '连接测试');
   assert.equal(sends[0].contextToken, undefined);
   assert.equal(sends[0].runId, undefined);
   await runtime.stop();
+});
+
+test('runtime sends a local notification image to the bound owner', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-weixin-runtime-image-'));
+  const imagePath = join(dir, 'digest.png');
+  await writeFile(imagePath, Buffer.from('png'));
+  const sends = [];
+  const runtime = new WeixinRuntime({
+    api: {
+      notifyStart: async () => {},
+      notifyStop: async () => {},
+      sendImage: async (request) => sends.push(request),
+      sendText: async () => assert.fail('image success must not use text fallback'),
+      getUpdates: async ({ signal }) => new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      }),
+    },
+    config: { botId: 'wx_owner', baseUrl: 'https://ilinkai.weixin.qq.com/', ownerUserId: 'owner-user' },
+    token: 'bot-token',
+    harness: { ensureRunning: async () => true },
+    state: { getUpdatesBuf: () => '' },
+  });
+  try {
+    await runtime.start();
+    assert.deepEqual(
+      await runtime.sendNotification('招聘摘要', { type: 'image', path: imagePath }),
+      { sent: true, mode: 'image' },
+    );
+    assert.equal(sends[0].toUserId, 'owner-user');
+    assert.equal(Buffer.from(sends[0].data).toString(), 'png');
+  } finally {
+    await runtime.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test('runtime verifies the token, consumes getUpdates, replies, persists cursor, and aborts on stop', async () => {

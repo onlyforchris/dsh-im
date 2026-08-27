@@ -1,4 +1,11 @@
-import { createDecipheriv, randomBytes, randomUUID } from 'node:crypto';
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  randomBytes,
+  randomUUID,
+} from 'node:crypto';
+import { request as httpsRequest } from 'node:https';
 
 import { fetchImageBuffer } from '../shared/image-prompt.mjs';
 
@@ -8,6 +15,7 @@ export const DEFAULT_BOT_TYPE = '3';
 export const WEIXIN_CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
 
 const WEIXIN_CDN_HOST = 'novac2c.cdn.weixin.qq.com';
+const MAX_OUTBOUND_IMAGE_BYTES = 10 * 1024 * 1024;
 
 const ILINK_APP_ID = 'bot';
 const ILINK_CLIENT_VERSION = (2 << 16) | (4 << 8) | 6;
@@ -41,6 +49,58 @@ function strictBase64(value) {
   const text = nonEmptyString(value);
   if (!text || text.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(text)) return null;
   return Buffer.from(text, 'base64');
+}
+
+function encryptWeixinImage(plaintext, key) {
+  const cipher = createCipheriv('aes-128-ecb', key, null);
+  return Buffer.concat([cipher.update(plaintext), cipher.final()]);
+}
+
+function trustedCdnUploadUrl(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new WeixinApiError('invalid-upload-url', '微信图片上传地址无效。');
+  }
+  if (url.protocol !== 'https:' || url.hostname !== WEIXIN_CDN_HOST
+    || (url.port && url.port !== '443') || !url.pathname.startsWith('/c2c/upload')) {
+    throw new WeixinApiError('untrusted-upload-url', '微信图片上传地址不受信任。');
+  }
+  return url;
+}
+
+function headerValue(headers, name) {
+  const value = headers?.[name];
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function postWeixinCdn(url, body, { signal } = {}) {
+  const target = trustedCdnUploadUrl(url);
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError(signal));
+      return;
+    }
+    const request = httpsRequest(target, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/octet-stream',
+        'content-length': String(body.length),
+      },
+    }, (response) => {
+      response.resume();
+      response.on('end', () => resolve({
+        status: response.statusCode ?? 0,
+        headers: response.headers,
+      }));
+    });
+    const onAbort = () => request.destroy(abortError(signal));
+    signal?.addEventListener('abort', onAbort, { once: true });
+    request.on('error', reject);
+    request.on('close', () => signal?.removeEventListener('abort', onAbort));
+    request.end(body);
+  });
 }
 
 /** Parse the two AES key encodings used by Weixin iLink image messages. */
@@ -258,8 +318,9 @@ function validateLoginResponse(value) {
   return value;
 }
 
-export function createWeixinApi({ fetchImpl = fetch } = {}) {
+export function createWeixinApi({ fetchImpl = fetch, cdnPostImpl = postWeixinCdn } = {}) {
   if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function');
+  if (typeof cdnPostImpl !== 'function') throw new TypeError('cdnPostImpl must be a function');
 
   return Object.freeze({
     inboundImages(message) {
@@ -345,6 +406,85 @@ export function createWeixinApi({ fetchImpl = fetch } = {}) {
       });
       if (response?.ret !== undefined && response.ret !== 0) {
         throw new WeixinApiError('send-rejected', '微信服务拒绝了回复消息。');
+      }
+      return true;
+    },
+
+    async sendImage({ baseUrl, token, toUserId, data, contextToken, runId, signal }) {
+      const recipient = nonEmptyString(toUserId);
+      const plaintext = Buffer.from(data ?? []);
+      if (!recipient || plaintext.length === 0 || plaintext.length > MAX_OUTBOUND_IMAGE_BYTES) {
+        throw new TypeError('toUserId and an image up to 10 MB are required');
+      }
+      const filekey = randomBytes(16).toString('hex');
+      const aesKey = randomBytes(16);
+      const ciphertext = encryptWeixinImage(plaintext, aesKey);
+      const upload = await requestJson(fetchImpl, {
+        method: 'POST',
+        baseUrl,
+        endpoint: 'ilink/bot/getuploadurl',
+        token,
+        signal,
+        body: {
+          filekey,
+          media_type: 1,
+          to_user_id: recipient,
+          rawsize: plaintext.length,
+          rawfilemd5: createHash('md5').update(plaintext).digest('hex'),
+          filesize: ciphertext.length,
+          no_need_thumb: true,
+          aeskey: aesKey.toString('hex'),
+          base_info: baseInfo(),
+        },
+      });
+      if (upload?.ret !== undefined && upload.ret !== 0) {
+        throw new WeixinApiError('upload-url-rejected', '微信服务拒绝了图片上传请求。');
+      }
+      const uploadUrl = nonEmptyString(upload?.upload_full_url)
+        ?? (nonEmptyString(upload?.upload_param)
+          ? `${WEIXIN_CDN_BASE_URL}/upload?encrypted_query_param=${encodeURIComponent(upload.upload_param)}&filekey=${encodeURIComponent(filekey)}`
+          : null);
+      if (!uploadUrl) throw new WeixinApiError('missing-upload-url', '微信服务没有返回图片上传地址。');
+      const uploaded = await cdnPostImpl(uploadUrl, ciphertext, { signal });
+      if (uploaded?.status !== 200) {
+        throw new WeixinApiError('cdn-upload-failed', `微信图片上传失败（HTTP ${uploaded?.status ?? 0}）。`);
+      }
+      const downloadParam = nonEmptyString(headerValue(uploaded.headers, 'x-encrypted-param'));
+      if (!downloadParam) {
+        throw new WeixinApiError('missing-download-param', '微信图片上传未返回下载参数。');
+      }
+      const response = await requestJson(fetchImpl, {
+        method: 'POST',
+        baseUrl,
+        endpoint: 'ilink/bot/sendmessage',
+        token,
+        signal,
+        body: {
+          msg: {
+            from_user_id: '',
+            to_user_id: recipient,
+            client_id: `dsh-weixin-${randomUUID()}`,
+            message_type: 2,
+            message_state: 2,
+            item_list: [{
+              type: 2,
+              image_item: {
+                media: {
+                  encrypt_query_param: downloadParam,
+                  aes_key: Buffer.from(aesKey.toString('hex'), 'ascii').toString('base64'),
+                  encrypt_type: 1,
+                },
+                mid_size: ciphertext.length,
+              },
+            }],
+            ...(nonEmptyString(contextToken) ? { context_token: contextToken.trim() } : {}),
+            ...(nonEmptyString(runId) ? { run_id: runId.trim() } : {}),
+          },
+          base_info: baseInfo(),
+        },
+      });
+      if (response?.ret !== undefined && response.ret !== 0) {
+        throw new WeixinApiError('send-rejected', '微信服务拒绝了图片消息。');
       }
       return true;
     },

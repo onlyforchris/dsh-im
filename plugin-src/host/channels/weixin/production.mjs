@@ -141,7 +141,7 @@ export async function createProductionController(ctx, config = {}, internals = {
         dir: config.notificationOutboxDir,
         pollIntervalMs: config.notificationPollIntervalMs ?? 5_000,
         logger,
-        send: (text) => controller.sendNotification(config.notificationBotId, text),
+        send: (text, media) => controller.sendNotification(config.notificationBotId, text, media),
       })
     : null;
   const supervisor = createSupervisor({

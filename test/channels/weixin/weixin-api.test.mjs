@@ -171,6 +171,40 @@ test('sendText emits the iLink message envelope without reflecting the token in 
   assert.doesNotMatch(calls[0].init.body, /host-only-token/);
 });
 
+test('sendImage uploads encrypted PNG bytes and emits an iLink image item', async () => {
+  const calls = [];
+  const uploads = [];
+  const api = createWeixinApi({
+    fetchImpl: async (url, init) => {
+      calls.push({ url: url.toString(), init });
+      return jsonResponse(calls.length === 1 ? { ret: 0, upload_param: 'upload-token' } : { ret: 0 });
+    },
+    cdnPostImpl: async (url, body) => {
+      uploads.push({ url: url.toString(), body: Buffer.from(body) });
+      return { status: 200, headers: { 'x-encrypted-param': 'download-token' } };
+    },
+  });
+  await api.sendImage({
+    baseUrl: 'https://ilinkai.weixin.qq.com',
+    token: 'host-only-token',
+    toUserId: 'wx-user',
+    data: Buffer.from('png bytes'),
+  });
+
+  const uploadRequest = JSON.parse(calls[0].init.body);
+  assert.equal(uploadRequest.media_type, 1);
+  assert.equal(uploadRequest.no_need_thumb, true);
+  assert.match(uploadRequest.aeskey, /^[0-9a-f]{32}$/);
+  assert.match(uploads[0].url, /^https:\/\/novac2c\.cdn\.weixin\.qq\.com\/c2c\/upload\?/);
+  assert.equal(uploads[0].body.length % 16, 0);
+  const sent = JSON.parse(calls[1].init.body);
+  const image = sent.msg.item_list[0];
+  assert.equal(image.type, 2);
+  assert.equal(image.image_item.media.encrypt_query_param, 'download-token');
+  assert.match(Buffer.from(image.image_item.media.aes_key, 'base64').toString('ascii'), /^[0-9a-f]{32}$/);
+  assert.equal(image.image_item.mid_size, uploads[0].body.length);
+});
+
 test('getUpdates converts its own long-poll timeout into an empty successful poll', async () => {
   const api = createWeixinApi({
     fetchImpl: async (_url, init) => new Promise((_resolve, reject) => {

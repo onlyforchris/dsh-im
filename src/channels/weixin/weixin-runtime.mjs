@@ -1,3 +1,5 @@
+import { readFile } from 'node:fs/promises';
+
 import { WeixinApiError } from './weixin-api.mjs';
 import { createWeixinBridgeStatus, WeixinHarnessBridge } from './weixin-bridge.mjs';
 import {
@@ -275,7 +277,7 @@ export class WeixinRuntime {
     return this.status;
   }
 
-  async sendNotification(text) {
+  async sendNotification(text, media) {
     const remembered = connectionTestTarget(this.#state);
     const toUserId = typeof remembered?.toUserId === 'string' && remembered.toUserId.trim()
       ? remembered.toUserId.trim()
@@ -286,6 +288,28 @@ export class WeixinRuntime {
     if (!this.#status.ready || !this.#abortController) {
       throw new Error('Weixin runtime is not connected');
     }
+    if (media?.type === 'image') {
+      try {
+        await this.#api.sendImage({
+          baseUrl: this.#config.baseUrl,
+          token: this.#token,
+          toUserId,
+          data: await readFile(media.path),
+          signal: this.#abortController.signal,
+        });
+        return { sent: true, mode: 'image' };
+      } catch (error) {
+        this.#logger.warn?.('[dsh-weixin] image notification failed; sending text fallback:', error);
+        await this.#api.sendText({
+          baseUrl: this.#config.baseUrl,
+          token: this.#token,
+          toUserId,
+          text,
+          signal: this.#abortController.signal,
+        });
+        return { sent: true, mode: 'text-fallback' };
+      }
+    }
     await this.#api.sendText({
       baseUrl: this.#config.baseUrl,
       token: this.#token,
@@ -293,7 +317,7 @@ export class WeixinRuntime {
       text,
       signal: this.#abortController.signal,
     });
-    return { sent: true };
+    return { sent: true, mode: 'text' };
   }
 
   async sendConnectionTest(text) {
