@@ -53,7 +53,7 @@ function abortable(promise, signal) {
   });
 }
 
-test('runtime sends a connection test to the bound Weixin owner without reply context', async () => {
+test('runtime sends a connection test with the remembered Weixin reply context', async () => {
   const sends = [];
   const runtime = new WeixinRuntime({
     api: {
@@ -71,7 +71,12 @@ test('runtime sends a connection test to the bound Weixin owner without reply co
     },
     token: 'bot-token',
     harness: { ensureRunning: async () => true },
-    state: { getUpdatesBuf: () => '' },
+    state: {
+      getUpdatesBuf: () => '',
+      connectionTestTarget: () => ({
+        toUserId: 'owner-user', contextToken: 'context-owner', runId: 'run-owner',
+      }),
+    },
   });
 
   await runtime.start();
@@ -79,12 +84,12 @@ test('runtime sends a connection test to the bound Weixin owner without reply co
   assert.equal(sends.length, 1);
   assert.equal(sends[0].toUserId, 'owner-user');
   assert.equal(sends[0].text, '连接测试');
-  assert.equal(sends[0].contextToken, undefined);
-  assert.equal(sends[0].runId, undefined);
+  assert.equal(sends[0].contextToken, 'context-owner');
+  assert.equal(sends[0].runId, 'run-owner');
   await runtime.stop();
 });
 
-test('runtime sends a local notification image to the bound owner', async () => {
+test('runtime falls back to text for a local notification image', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-weixin-runtime-image-'));
   const imagePath = join(dir, 'digest.png');
   await writeFile(imagePath, Buffer.from('png'));
@@ -93,8 +98,11 @@ test('runtime sends a local notification image to the bound owner', async () => 
     api: {
       notifyStart: async () => {},
       notifyStop: async () => {},
-      sendImage: async (request) => sends.push(request),
-      sendText: async () => assert.fail('image success must not use text fallback'),
+      sendImage: async () => assert.fail('known-broken image upload must stay disabled'),
+      sendText: async (request) => {
+        sends.push(request);
+        return { accepted: true, ret: 0, errcode: null };
+      },
       getUpdates: async ({ signal }) => new Promise((_resolve, reject) => {
         signal.addEventListener('abort', () => reject(signal.reason), { once: true });
       }),
@@ -102,16 +110,26 @@ test('runtime sends a local notification image to the bound owner', async () => 
     config: { botId: 'wx_owner', baseUrl: 'https://ilinkai.weixin.qq.com/', ownerUserId: 'owner-user' },
     token: 'bot-token',
     harness: { ensureRunning: async () => true },
-    state: { getUpdatesBuf: () => '' },
+    state: {
+      getUpdatesBuf: () => '',
+      connectionTestTarget: () => ({
+        toUserId: 'owner-user', contextToken: 'context-owner', runId: 'run-owner',
+      }),
+    },
   });
   try {
     await runtime.start();
     assert.deepEqual(
       await runtime.sendNotification('招聘摘要', { type: 'image', path: imagePath }),
-      { sent: true, mode: 'image' },
+      {
+        sent: true,
+        mode: 'text-fallback',
+        provider: { accepted: true, ret: 0, errcode: null },
+      },
     );
     assert.equal(sends[0].toUserId, 'owner-user');
-    assert.equal(Buffer.from(sends[0].data).toString(), 'png');
+    assert.equal(sends[0].contextToken, 'context-owner');
+    assert.equal(sends[0].text, '招聘摘要');
   } finally {
     await runtime.stop();
     await rm(dir, { recursive: true, force: true });

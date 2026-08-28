@@ -37,11 +37,21 @@ test('Enterprise WeChat runtime sends a connection test only to the remembered p
     code: 'test-target-unavailable',
   });
   rememberConnectionTestTarget(state, { chatId: 'member-private' });
-  assert.deepEqual(await runtime.sendConnectionTest('测试'), { sent: true });
-  assert.deepEqual(client.sent, [{
-    chatId: 'member-private',
-    body: { msgtype: 'markdown', markdown: { content: '测试' } },
-  }]);
+  assert.deepEqual(await runtime.sendConnectionTest('测试'), { sent: true, mode: 'text' });
+  assert.deepEqual(
+    await runtime.sendNotification('图片通知摘要', { type: 'image' }),
+    { sent: true, mode: 'text-fallback' },
+  );
+  assert.deepEqual(client.sent, [
+    {
+      chatId: 'member-private',
+      body: { msgtype: 'markdown', markdown: { content: '测试' } },
+    },
+    {
+      chatId: 'member-private',
+      body: { msgtype: 'markdown', markdown: { content: '图片通知摘要' } },
+    },
+  ]);
   await runtime.stop();
 });
 

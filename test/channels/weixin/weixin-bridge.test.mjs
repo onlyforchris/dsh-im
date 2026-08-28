@@ -82,7 +82,9 @@ test('Weixin remembers any authorized private inbound as a connection-test targe
   });
 
   await bridge.accept(message('help-owner', '/help'));
-  assert.deepEqual(connectionTestTarget(fixture.state), { toUserId: 'owner-user' });
+  assert.deepEqual(connectionTestTarget(fixture.state), {
+    toUserId: 'owner-user', contextToken: 'context-help-owner',
+  });
   assert.match(sent.at(-1).text, /\/help/);
 
   const rejectedFixture = stateFixture();

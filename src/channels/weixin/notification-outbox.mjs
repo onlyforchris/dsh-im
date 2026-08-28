@@ -72,7 +72,11 @@ export class NotificationOutbox {
       const media = await this.#validatedMedia(event.media);
       const delivery = await this.#send(event.text, media);
       if (delivery?.mode === 'image' || delivery?.mode === 'text' || delivery?.mode === 'text-fallback') {
-        event.delivery = { mode: delivery.mode, delivered_at: new Date().toISOString() };
+        event.delivery = {
+          mode: delivery.mode,
+          delivered_at: new Date().toISOString(),
+          ...(delivery.provider ? { provider: delivery.provider } : {}),
+        };
         await writeFile(processing, `${JSON.stringify(event, null, 2)}\n`, 'utf8');
       }
       await rename(processing, join(this.#dir, 'sent', name));

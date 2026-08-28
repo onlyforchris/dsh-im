@@ -8,6 +8,7 @@ import { WecomQrAuth } from '../../../../src/channels/wecom/qr-auth.mjs';
 import { WecomStateStore } from '../../../../src/channels/wecom/state-store.mjs';
 import { WecomController } from '../../../../src/channels/wecom/wecom-controller.mjs';
 import { WecomRuntime } from '../../../../src/channels/wecom/wecom-runtime.mjs';
+import { NotificationOutbox } from '../../../../src/channels/weixin/notification-outbox.mjs';
 import {
   BotWorkspaceStore,
   createBotWorkspaceScope,
@@ -131,6 +132,20 @@ export async function createProductionController(ctx, config = {}, internals = {
     },
   });
   const controller = createWorkspaceAwareController(coreController, { workspaces, stateFor });
+  const notificationOutbox = config.notificationOutboxDir
+    ? new NotificationOutbox({
+        dir: config.notificationOutboxDir,
+        pollIntervalMs: config.notificationPollIntervalMs ?? 5_000,
+        logger,
+        send: (text, media) => {
+          const bots = configStore.list();
+          const botId = config.notificationBotId
+            ?? (bots.length === 1 ? bots[0].botId : undefined);
+          if (!botId) throw new TypeError('dsh-wecom: notificationBotId is required when multiple bots exist');
+          return controller.sendNotification(botId, text, media);
+        },
+      })
+    : null;
   const supervisor = createSupervisor({
     controller,
     harness,
@@ -138,10 +153,12 @@ export async function createProductionController(ctx, config = {}, internals = {
     retryDelaysMs: config.retryDelaysMs,
     healthyIntervalMs: config.healthyIntervalMs,
   }).start();
+  await notificationOutbox?.start();
   return {
     controller,
     ready: supervisor.ready,
     async close() {
+      await notificationOutbox?.close();
       await supervisor.close();
       await controller.close();
       harness.stopManagedProcess();

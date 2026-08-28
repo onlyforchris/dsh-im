@@ -84,6 +84,8 @@ export function createWeixinBridgeStatus() {
     lastMessageAt: null,
     lastReplyAt: null,
     lastRejectedAt: null,
+    lastOutboundAt: null,
+    lastOutboundReceipt: null,
     lastError: null,
   };
 }
@@ -156,14 +158,18 @@ export class WeixinHarnessBridge {
     if (!messageId || !sender || this.#state.hasSeen(messageId)
       || this.#acceptedMessageIds.has(messageId)) return Promise.resolve();
     this.#acceptedMessageIds.add(messageId);
+    const contextToken = nonEmptyString(message?.context_token) ?? undefined;
+    const runId = nonEmptyString(message?.run_id) ?? undefined;
     if (sender === this.#ownerUserId) {
       void Promise.resolve(
-        rememberConnectionTestTarget(this.#state, { toUserId: sender }),
+        rememberConnectionTestTarget(this.#state, {
+          toUserId: sender,
+          ...(contextToken ? { contextToken } : {}),
+          ...(runId ? { runId } : {}),
+        }),
       ).catch(() => this.#logger.warn?.('[dsh-weixin] unable to persist the private target'));
     }
     const key = conversationKey(sender);
-    const contextToken = nonEmptyString(message?.context_token) ?? undefined;
-    const runId = nonEmptyString(message?.run_id) ?? undefined;
     const pending = this.#pendingInteractions.get(key);
     const commandText = nonEmptyString(extractWeixinText(message)) ?? '';
     const commandRunner = isControlCommand(commandText)
@@ -777,15 +783,30 @@ export class WeixinHarnessBridge {
   }
 
   async #send(toUserId, text, contextToken, runId) {
+    // 对话回复：带 contextToken/runId（0.16.5 已验证可送达的实现）。
     for (const chunk of splitWeixinText(text, this.#maxMessageChars)) {
-      await this.#api.sendText({
-        baseUrl: this.#baseUrl,
-        token: this.#token,
-        toUserId,
-        text: chunk,
-        contextToken,
-        runId,
-      });
+      try {
+        const receipt = await this.#api.sendText({
+          baseUrl: this.#baseUrl,
+          token: this.#token,
+          toUserId,
+          text: chunk,
+          contextToken,
+          runId,
+        });
+        if (receipt && typeof receipt === 'object') {
+          this.#status.lastOutboundAt = new Date().toISOString();
+          this.#status.lastOutboundReceipt = receipt;
+        }
+        const badRet = receipt?.ret !== undefined && receipt?.ret !== null && Number(receipt.ret) !== 0;
+        const badCode = receipt?.errcode !== undefined && receipt?.errcode !== null && Number(receipt.errcode) !== 0;
+        if (badRet || badCode) {
+          this.#status.lastError = `微信回复被拒绝（ret=${receipt?.ret}, errcode=${receipt?.errcode}${receipt?.errmsg ? `, ${receipt.errmsg}` : ''}）`;
+        }
+      } catch (error) {
+        this.#status.lastError = error?.message ?? String(error);
+        throw error;
+      }
     }
   }
 }

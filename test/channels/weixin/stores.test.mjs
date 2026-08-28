@@ -26,7 +26,7 @@ test('config store persists non-secret account facts atomically with restrictive
   const raw = await readFile(path, 'utf8');
   assert.match(raw, /"accountId": "account@im\.bot"/);
   assert.doesNotMatch(raw, /bot_token|secret-token/);
-  assert.equal((await stat(path)).mode & 0o777, 0o600);
+  if (process.platform !== 'win32') assert.equal((await stat(path)).mode & 0o777, 0o600);
   assert.deepEqual((await new WeixinConfigStore(path).load()).list(), store.list());
 });
 
@@ -53,14 +53,20 @@ test('state store retains sessions, deduplication, and the getUpdates cursor', a
   await state.setSession('p2p:user', 'session-1');
   await state.markSeen('message-1');
   await state.setGetUpdatesBuf('cursor-2');
-  await state.setConnectionTestTarget({ toUserId: 'user' });
+  await state.setConnectionTestTarget({
+    toUserId: ' user ', contextToken: ' context ', runId: ' run ',
+  });
 
   const restored = await new WeixinStateStore(path).load();
   assert.equal(restored.sessionFor('p2p:user'), 'session-1');
   assert.equal(restored.hasSeen('message-1'), true);
   assert.equal(restored.getUpdatesBuf(), 'cursor-2');
-  assert.deepEqual(restored.connectionTestTarget(), { toUserId: 'user' });
+  assert.deepEqual(restored.connectionTestTarget(), {
+    toUserId: 'user', contextToken: 'context', runId: 'run',
+  });
   await restored.clearSessions();
-  assert.deepEqual(restored.connectionTestTarget(), { toUserId: 'user' });
-  assert.equal((await stat(path)).mode & 0o777, 0o600);
+  assert.deepEqual(restored.connectionTestTarget(), {
+    toUserId: 'user', contextToken: 'context', runId: 'run',
+  });
+  if (process.platform !== 'win32') assert.equal((await stat(path)).mode & 0o777, 0o600);
 });

@@ -1,5 +1,3 @@
-import { readFile } from 'node:fs/promises';
-
 import { WeixinApiError } from './weixin-api.mjs';
 import { createWeixinBridgeStatus, WeixinHarnessBridge } from './weixin-bridge.mjs';
 import {
@@ -285,39 +283,32 @@ export class WeixinRuntime {
         ? this.#config.ownerUserId.trim()
         : latestBoundConversation(this.#state, 'p2p:')?.id ?? null;
     if (!toUserId) throw connectionTestTargetUnavailable('微信机器人');
+    const contextToken = typeof remembered?.contextToken === 'string' && remembered.contextToken.trim()
+      ? remembered.contextToken.trim()
+      : undefined;
+    const runId = typeof remembered?.runId === 'string' && remembered.runId.trim()
+      ? remembered.runId.trim()
+      : undefined;
     if (!this.#status.ready || !this.#abortController) {
       throw new Error('Weixin runtime is not connected');
     }
-    if (media?.type === 'image') {
-      try {
-        await this.#api.sendImage({
-          baseUrl: this.#config.baseUrl,
-          token: this.#token,
-          toUserId,
-          data: await readFile(media.path),
-          signal: this.#abortController.signal,
-        });
-        return { sent: true, mode: 'image' };
-      } catch (error) {
-        this.#logger.warn?.('[dsh-weixin] image notification failed; sending text fallback:', error);
-        await this.#api.sendText({
-          baseUrl: this.#config.baseUrl,
-          token: this.#token,
-          toUserId,
-          text,
-          signal: this.#abortController.signal,
-        });
-        return { sent: true, mode: 'text-fallback' };
-      }
-    }
-    await this.#api.sendText({
+    // 纯文本发送（退回 0.16.5 已验证可送达的实现）。
+    // 早期 sendImage/CDN 上传链路有缺陷（CDN 500），
+    // 且图片链路不达；文本 8/26 前一直可送达。故通知统一走 sendText，忽略 media。
+    const receipt = await this.#api.sendText({
       baseUrl: this.#config.baseUrl,
       token: this.#token,
       toUserId,
       text,
+      contextToken,
+      runId,
       signal: this.#abortController.signal,
     });
-    return { sent: true, mode: 'text' };
+    return {
+      sent: true,
+      mode: media ? 'text-fallback' : 'text',
+      ...(receipt && typeof receipt === 'object' ? { provider: receipt } : {}),
+    };
   }
 
   async sendConnectionTest(text) {

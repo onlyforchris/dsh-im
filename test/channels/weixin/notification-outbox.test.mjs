@@ -24,6 +24,7 @@ test('notification outbox retries once then archives the sent event', async () =
     send: async (text) => {
       if (!ready) throw new Error('offline');
       sent.push(text);
+      return { mode: 'text', provider: { accepted: true, ret: 0, errcode: null } };
     },
   });
   try {
@@ -32,7 +33,9 @@ test('notification outbox retries once then archives the sent event', async () =
     ready = true;
     await outbox.scan();
     assert.deepEqual(sent, ['招聘评分更新']);
-    assert.equal(JSON.parse(await readFile(join(dir, 'sent', 'score-ready-test.json'))).event_id, event.event_id);
+    const archived = JSON.parse(await readFile(join(dir, 'sent', 'score-ready-test.json')));
+    assert.equal(archived.event_id, event.event_id);
+    assert.deepEqual(archived.delivery.provider, { accepted: true, ret: 0, errcode: null });
   } finally {
     await outbox.close();
     await rm(dir, { recursive: true, force: true });

@@ -133,15 +133,31 @@ export async function createProductionController(ctx, config = {}, internals = {
     },
   });
   const controller = createWorkspaceAwareController(coreController, { workspaces, stateFor });
-  if (config.notificationOutboxDir && !config.notificationBotId) {
-    throw new TypeError('notificationBotId is required when notificationOutboxDir is configured');
-  }
   const notificationOutbox = config.notificationOutboxDir
     ? new NotificationOutbox({
         dir: config.notificationOutboxDir,
         pollIntervalMs: config.notificationPollIntervalMs ?? 5_000,
         logger,
-        send: (text, media) => controller.sendNotification(config.notificationBotId, text, media),
+        send: (text, media) => {
+          // 动态解析 botId，防 rebind 后配置漂移（不再依赖硬编码配置）：
+          // 1. 优先配置的 botId（若仍在账号表）
+          // 2. 否则回落到账号表里最近连接的账号
+          // 3. 都没有则报错抛出（由 NotificationOutbox 转为 retry）
+          const configuredId = config.notificationBotId;
+          const bots = configStore.list();
+          const fallbackBot = bots
+            .slice()
+            .sort((a, b) => {
+              const ra = String(a?.connectedAt ?? '').localeCompare(String(b?.connectedAt ?? ''));
+              return ra; // 升序 → 最后一个即 connectedAt 最新
+            })
+            .at(-1);
+          const botId = bots.some((bot) => bot.botId === configuredId)
+            ? configuredId
+            : (fallbackBot?.botId ?? configuredId);
+          if (!botId) throw new TypeError('dsh-weixin: no bot account available for notification delivery');
+          return controller.sendNotification(botId, text, media);
+        },
       })
     : null;
   const supervisor = createSupervisor({

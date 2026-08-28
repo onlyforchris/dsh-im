@@ -293,11 +293,16 @@ async function requestJson(fetchImpl, {
         { status: response.status },
       );
     }
+    let payload;
     try {
-      return await response.json();
+      payload = await response.json();
     } catch (error) {
       throw new WeixinApiError('invalid-response', '微信服务返回了无法解析的响应。', { cause: error });
     }
+    // 注意：errcode 非零仅在【发送类】请求上视为拒绝（见 sendText/sendImage 自身检查）。
+    // getupdates 长轮询由 runtime #runMonitor 统一按 ret/errcode 处理，这里不抛，
+    // 避免长轮询中间态（如 -14）被当作硬错误连续 3 次打死 monitor。
+    return payload;
   } catch (error) {
     if (signal?.aborted) throw abortError(signal);
     if (timedOut) {
@@ -384,30 +389,72 @@ export function createWeixinApi({ fetchImpl = fetch, cdnPostImpl = postWeixinCdn
       const recipient = nonEmptyString(toUserId);
       const content = nonEmptyString(text);
       if (!recipient || !content) throw new TypeError('toUserId and text are required');
-      const response = await requestJson(fetchImpl, {
-        method: 'POST',
-        baseUrl,
+      const clientId = `dsh-weixin-${randomUUID()}`;
+      const audit = process.env.DSH_WEIXIN_SEND_AUDIT === '1';
+      const auditBase = {
         endpoint: 'ilink/bot/sendmessage',
-        token,
-        signal,
-        body: {
-          msg: {
-            from_user_id: '',
-            to_user_id: recipient,
-            client_id: `dsh-weixin-${randomUUID()}`,
-            message_type: 2,
-            message_state: 2,
-            item_list: [{ type: 1, text_item: { text: content } }],
-            ...(nonEmptyString(contextToken) ? { context_token: contextToken.trim() } : {}),
-            ...(nonEmptyString(runId) ? { run_id: runId.trim() } : {}),
+        clientId,
+        recipientSuffix: recipient.slice(-4),
+        contextPresent: Boolean(nonEmptyString(contextToken)),
+        contextLength: nonEmptyString(contextToken)?.length ?? 0,
+        runIdPresent: Boolean(nonEmptyString(runId)),
+        messageType: 2,
+        messageState: 2,
+      };
+      if (audit) console.info('[dsh-weixin-send-audit]', JSON.stringify({ phase: 'request', ...auditBase }));
+      let response;
+      try {
+        response = await requestJson(fetchImpl, {
+          method: 'POST',
+          baseUrl,
+          endpoint: 'ilink/bot/sendmessage',
+          token,
+          signal,
+          body: {
+            msg: {
+              from_user_id: '',
+              to_user_id: recipient,
+              client_id: clientId,
+              message_type: 2,
+              message_state: 2,
+              item_list: [{ type: 1, text_item: { text: content } }],
+              ...(nonEmptyString(contextToken) ? { context_token: contextToken.trim() } : {}),
+              ...(nonEmptyString(runId) ? { run_id: runId.trim() } : {}),
+            },
+            base_info: baseInfo(),
           },
-          base_info: baseInfo(),
-        },
-      });
-      if (response?.ret !== undefined && response.ret !== 0) {
-        throw new WeixinApiError('send-rejected', '微信服务拒绝了回复消息。');
+        });
+      } catch (error) {
+        if (audit) console.error('[dsh-weixin-send-audit]', JSON.stringify({
+          phase: 'error', ...auditBase, code: error?.code ?? null,
+          status: error?.status ?? null, message: String(error?.message ?? '').slice(0, 200),
+        }));
+        throw error;
       }
-      return true;
+      if (audit) console.info('[dsh-weixin-send-audit]', JSON.stringify({
+        phase: 'response', ...auditBase, ret: response?.ret ?? null,
+        errcode: response?.errcode ?? null, errmsg: String(response?.errmsg ?? '').slice(0, 200),
+      }));
+      if (response?.errcode !== undefined && Number(response.errcode) !== 0) {
+        throw new WeixinApiError(
+          'api-error',
+          `微信服务拒绝了回复消息（errcode ${response.errcode}${typeof response.errmsg === 'string' ? `, ${response.errmsg}` : ''}）。`,
+        );
+      }
+      if (response?.ret !== undefined && response.ret !== 0) {
+        throw new WeixinApiError(
+          'send-rejected',
+          `微信服务拒绝了回复消息（ret ${response.ret}${typeof response.errmsg === 'string' ? `, ${response.errmsg}` : ''}）。`,
+          { ret: response.ret },
+        );
+      }
+      return Object.freeze({
+        accepted: true,
+        ret: response?.ret ?? null,
+        errcode: response?.errcode ?? null,
+        errmsg: typeof response?.errmsg === 'string' ? response.errmsg : null,
+        ...(response?.msg_id ? { msgId: response.msg_id } : {}),
+      });
     },
 
     async sendImage({ baseUrl, token, toUserId, data, contextToken, runId, signal }) {

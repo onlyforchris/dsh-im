@@ -152,7 +152,7 @@ test('sendText emits the iLink message envelope without reflecting the token in 
       return jsonResponse({ ret: 0 });
     },
   });
-  await api.sendText({
+  const receipt = await api.sendText({
     baseUrl: 'https://ilinkai.weixin.qq.com',
     token: 'host-only-token',
     toUserId: 'wx-user',
@@ -169,6 +169,25 @@ test('sendText emits the iLink message envelope without reflecting the token in 
   assert.equal(body.base_info.channel_version, '2.4.6');
   assert.equal(body.base_info.bot_agent, 'DeepSeekHarness/0.16.0');
   assert.doesNotMatch(calls[0].init.body, /host-only-token/);
+  assert.deepEqual(receipt, { accepted: true, ret: 0, errcode: null, errmsg: null });
+});
+
+test('sendText rejects HTTP 200 responses with a non-zero iLink errcode', async () => {
+  const api = createWeixinApi({
+    fetchImpl: async () => jsonResponse({ errcode: -14, errmsg: 'session timeout' }),
+  });
+
+  await assert.rejects(
+    api.sendText({
+      baseUrl: 'https://ilinkai.weixin.qq.com',
+      token: 'host-only-token',
+      toUserId: 'wx-user',
+      text: 'Harness reply',
+    }),
+    (error) => error instanceof WeixinApiError
+      && error.code === 'api-error'
+      && /errcode -14/.test(error.message),
+  );
 });
 
 test('sendImage uploads encrypted PNG bytes and emits an iLink image item', async () => {

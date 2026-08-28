@@ -211,6 +211,10 @@ export class WecomRuntime {
   }
 
   async sendConnectionTest(text) {
+    return this.sendNotification(text);
+  }
+
+  async sendNotification(text, media) {
     const remembered = connectionTestTarget(this.#state);
     const chatId = nonEmptyString(remembered?.chatId)
       ?? latestBoundConversation(this.#state, 'direct:')?.id;
@@ -222,7 +226,7 @@ export class WecomRuntime {
       msgtype: 'markdown',
       markdown: { content: text },
     });
-    return { sent: true };
+    return { sent: true, mode: media ? 'text-fallback' : 'text' };
   }
 
   async #stopActive() {

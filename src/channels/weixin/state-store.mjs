@@ -11,7 +11,13 @@ const EMPTY_STATE = Object.freeze({
 
 function connectionTestTarget(value) {
   const toUserId = typeof value?.toUserId === 'string' ? value.toUserId.trim() : '';
-  return toUserId ? { toUserId } : null;
+  const contextToken = typeof value?.contextToken === 'string' ? value.contextToken.trim() : '';
+  const runId = typeof value?.runId === 'string' ? value.runId.trim() : '';
+  return toUserId ? {
+    toUserId,
+    ...(contextToken ? { contextToken } : {}),
+    ...(runId ? { runId } : {}),
+  } : null;
 }
 
 function normalizeState(value) {
