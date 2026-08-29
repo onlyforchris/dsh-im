@@ -123,6 +123,20 @@ test('connection test targets survive a new workspace scope for the same bot', a
   assert.deepEqual(connectionTestTarget(afterReconnect.state), { channelId: 'D123' });
 });
 
+test('connection test targets survive a process restart through the durable state store', async () => {
+  let persisted = { chatId: 'before-restart' };
+  const state = {
+    connectionTestTarget: () => persisted,
+    setConnectionTestTarget: async (target) => { persisted = structuredClone(target); },
+  };
+
+  assert.deepEqual(connectionTestTarget(state), { chatId: 'before-restart' });
+  assert.equal(rememberConnectionTestTarget(state, { chatId: 'after-message' }), true);
+  await Promise.resolve();
+  assert.deepEqual(persisted, { chatId: 'after-message' });
+  assert.deepEqual(connectionTestTarget(state), { chatId: 'after-message' });
+});
+
 test('workspace writes roll back updates while committed removals stay retired in memory', async (t) => {
   const { root, defaultWorkspace, alternateWorkspace } = await fixture(t);
   const storeDirectory = join(root, 'workspace-store');
