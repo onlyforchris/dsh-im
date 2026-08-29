@@ -4,7 +4,17 @@ import { CredentialActionIcon, CredentialBindingPanel } from '../../credential-b
 import { h } from '../../i18n.js';
 import { installDingtalkStyles } from '../dingtalk/styles.js';
 import { WorkspaceEditor } from '../../workspace-editor.js';
+import {
+  AgentPresetCatalogContext,
+  AgentPresetEditor,
+  EMPTY_AGENT_PRESET_CATALOG,
+} from '../../agent-preset.js';
 import { useWorkspaceSnapshotFence } from '../../workspace-snapshot-fence.js';
+import {
+  BotStatusMeta,
+  ChannelListHeading,
+  LastMessageErrorSummary,
+} from '../../channel-card-meta.js';
 
 const Button = React.forwardRef(function Button(
   { children, kind = 'secondary', className = '', ...props },
@@ -63,7 +73,7 @@ export function createTokenChannelSettings(definition) {
     accountSettingsEndpoint = null,
   } = definition;
 
-  function AccountCard({ account, busy, testNotice, removing, onReconnect, onWorkspaceSave, onAccountSettingsSave, onRequestRemove, onConfirmRemove, onCancelRemove }) {
+  function AccountCard({ account, busy, testNotice, removing, onReconnect, onWorkspaceSave, onAgentPresetSave, onAccountSettingsSave, onRequestRemove, onConfirmRemove, onCancelRemove }) {
     const state = busy === 'reconnect' ? 'connecting' : account.state;
     const tone = account.connected ? 'success' : state === 'error' ? 'error' : 'warning';
     const stateLabel = account.connected ? '运行正常' : state === 'connecting' ? '正在连接' : '连接未就绪';
@@ -77,18 +87,23 @@ export function createTokenChannelSettings(definition) {
               h(LogoGlyph, { size: 29 })),
             h('div', { className: 'dim-botName' },
               h('h3', null, account.bot.name), h('p', null, identity))),
-          h('div', { className: 'ddt-health dim-botHealth' },
-            h('span', { className: 'ddt-dot dim-healthDot', 'data-tone': tone }),
-            h('span', null, stateLabel))),
-        h('dl', { className: 'ddt-metrics dim-botMetrics' },
-          h('div', { className: 'ddt-metric dim-botMetric' },
-            h('dt', null, '消息通道'), h('dd', null, account.connected ? connectionLabel : '离线')),
-          h('div', { className: 'ddt-metric dim-botMetric' },
-            h('dt', null, '最近检查'), h('dd', null, checkedTime(account.health.lastCheckedAt)))),
+          h(BotStatusMeta, {
+            className: 'ddt-health',
+            dotClassName: 'ddt-dot',
+            tone,
+            stateLabel,
+            lastCheckedAt: account.health.lastCheckedAt,
+            formatCheckedTime: checkedTime,
+          })),
         h(WorkspaceEditor, {
           workspace: account.workspace,
           disabled: Boolean(busy),
           onSave: onWorkspaceSave,
+        }),
+        h(AgentPresetEditor, {
+          agentPreset: account.agentPreset,
+          disabled: Boolean(busy),
+          onSave: onAgentPresetSave,
         }),
         AccountSettings ? h(AccountSettings, {
           account,
@@ -96,20 +111,28 @@ export function createTokenChannelSettings(definition) {
           onSave: onAccountSettingsSave,
         }) : null,
         h('div', { className: 'ddt-accountFooter dim-cardFooter' },
-          summary ? h('div', { className: 'ddt-summary dim-cardSummary' }, summary) : null,
-          testNotice ? h('div', { className: 'ddt-summary dim-cardSummary', role: 'status' }, testNotice) : null,
-          h('div', { className: 'ddt-actions dim-cardActions' },
-            h(Button, {
-              className: 'dim-cardAction',
-              onClick: onReconnect,
-              disabled: Boolean(busy),
-            }, busy === 'reconnect' ? '检查中…' : account.connected ? '检查连接' : '重试连接'),
-            h(Button, {
-              className: 'dim-cardAction',
-              kind: 'danger',
-              onClick: onRequestRemove,
-              disabled: Boolean(busy),
-            }, '移除接入')))),
+          h('div', { className: 'dim-cardFooterLayout' },
+            h('div', { className: 'ddt-actions dim-cardActions' },
+              h(Button, {
+                className: 'dim-cardAction',
+                onClick: onReconnect,
+                disabled: Boolean(busy),
+              }, busy === 'reconnect' ? '检查中…' : account.connected ? '检查连接' : '重试连接'),
+              h(Button, {
+                className: 'dim-cardAction',
+                kind: 'danger',
+                onClick: onRequestRemove,
+                disabled: Boolean(busy),
+              }, '移除接入')),
+            summary ? h('div', { className: 'ddt-summary dim-cardSummary' }, summary) : null,
+            account.lastMessageError ? h(LastMessageErrorSummary, {
+              className: 'ddt-summary',
+              error: account.lastMessageError,
+            }) : null,
+            testNotice ? h('div', {
+              className: 'ddt-summary dim-cardFeedback',
+              role: 'status',
+            }, testNotice) : null))),
       removing ? h('div', { className: 'ddt-confirm dim-confirm', role: 'alertdialog' },
         h('strong', null, `从 DeepSeek Harness 移除“${account.bot.name}”？`),
         h('p', null, `这会停止消息连接，并删除本机保存的 ${credentialNoun}、机器人配置及会话映射。${platformLabel}中的机器人不会被自动删除。`),
@@ -122,6 +145,7 @@ export function createTokenChannelSettings(definition) {
   function SettingsTab({ rpcCall }) {
     const [model, setModel] = React.useState({
       phase: 'loading', bots: [], totals: { configured: 0, connected: 0 }, error: null,
+      agentPresetCatalog: EMPTY_AGENT_PRESET_CATALOG,
     });
     const [credentialOpen, setCredentialOpen] = React.useState(false);
     const [credentialError, setCredentialError] = React.useState(null);
@@ -156,7 +180,10 @@ export function createTokenChannelSettings(definition) {
         const snapshot = api.normalizeSnapshot(await invoke(endpoints.status, {}, signal));
         if (!mounted.current || signal?.aborted
           || !workspaceFence.canCommitStatus(workspaceVersion)) return;
-        setModel({ phase: 'ready', bots: snapshot.bots, totals: snapshot.totals, error: null });
+        setModel({
+          phase: 'ready', bots: snapshot.bots, totals: snapshot.totals, error: null,
+          agentPresetCatalog: snapshot.agentPresetCatalog ?? EMPTY_AGENT_PRESET_CATALOG,
+        });
       } catch (error) {
         if (error?.name !== 'AbortError' && mounted.current && !signal?.aborted
           && workspaceFence.canCommitStatus(workspaceVersion)) {
@@ -199,7 +226,10 @@ export function createTokenChannelSettings(definition) {
         ));
         if (!mounted.current) return;
         if (workspaceFence.canCommitMutation(snapshotVersion)) {
-          setModel({ phase: 'ready', bots: snapshot.bots, totals: snapshot.totals, error: null });
+          setModel({
+          phase: 'ready', bots: snapshot.bots, totals: snapshot.totals, error: null,
+          agentPresetCatalog: snapshot.agentPresetCatalog ?? EMPTY_AGENT_PRESET_CATALOG,
+        });
         }
         setCredentialOpen(false);
       } catch (error) {
@@ -218,7 +248,10 @@ export function createTokenChannelSettings(definition) {
         const value = await invoke(endpoint, payload);
         const snapshot = api.normalizeSnapshot(value);
         if (mounted.current && workspaceFence.canCommitMutation(snapshotVersion)) {
-          setModel({ phase: 'ready', bots: snapshot.bots, totals: snapshot.totals, error: null });
+          setModel({
+          phase: 'ready', bots: snapshot.bots, totals: snapshot.totals, error: null,
+          agentPresetCatalog: snapshot.agentPresetCatalog ?? EMPTY_AGENT_PRESET_CATALOG,
+        });
         }
         if (mounted.current && operation === 'reconnect') {
           setTestNoticeByBot((current) => ({
@@ -247,8 +280,11 @@ export function createTokenChannelSettings(definition) {
 
     const botList = model.bots.length > 0
       ? h('section', { className: 'dim-listSection' },
-          h('div', { className: 'ddt-listHeading dim-listHeading' },
-            h('h3', null, `已接入的 ${channel} 机器人`)),
+          h(ChannelListHeading, {
+            className: 'ddt-listHeading',
+            title: `已接入的 ${channel} 机器人`,
+            connectionLabel,
+          }),
           h('ul', { className: 'ddt-list dim-botList' }, model.bots.map((account) =>
             h('li', { key: account.botId }, h(AccountCard, {
               account,
@@ -266,6 +302,12 @@ export function createTokenChannelSettings(definition) {
                 'workspace',
                 endpoints.setWorkspace,
                 { botId: account.botId, workspace },
+              ),
+              onAgentPresetSave: (agentPreset) => botAction(
+                account,
+                'preset',
+                endpoints.setAgentPreset,
+                { botId: account.botId, agentPreset },
               ),
               onAccountSettingsSave: AccountSettings && accountSettingsEndpoint
                 ? (payload) => botAction(
@@ -287,7 +329,9 @@ export function createTokenChannelSettings(definition) {
             })))))
       : null;
 
-    return h('section', {
+    return h(AgentPresetCatalogContext.Provider, {
+      value: model.agentPresetCatalog ?? EMPTY_AGENT_PRESET_CATALOG,
+    }, h('section', {
       className: `ddt-page ${pageClass} dim-channelPage`,
       'aria-label': `${channel} 设置`,
     },
@@ -353,7 +397,7 @@ export function createTokenChannelSettings(definition) {
                       'aria-hidden': 'true',
                     }, h(LogoGlyph, { size: 64 }))))
               : null,
-            botList));
+            botList)));
   }
 
   return { SettingsTab, AccountCard };

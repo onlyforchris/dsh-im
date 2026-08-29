@@ -2,17 +2,19 @@ import { randomUUID } from 'node:crypto';
 import { FeishuHarnessBridge } from './bridge.mjs';
 import { cardActionProbeCard } from './feishu-cards.mjs';
 import { VerifiedFeishuChannel } from './feishu-channel.mjs';
+import { normalizeFeishuGroupResponseMode } from './group-response-mode.mjs';
 import {
-  connectionTestTarget,
   connectionTestTargetUnavailable,
-  latestBoundConversation,
+  sendRememberedConnectionTest,
 } from '../shared/connection-test.mjs';
+import { t } from '../shared/i18n.mjs';
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const CALLBACK_PROBE_SUCCESS_NOTICE = '✅ 修复完成：已实测收到 card.action.trigger，菜单按钮现在可用。';
 const CALLBACK_PROBE_TIMEOUT_NOTICE = '⚠️ 修复验证超时：未收到测试卡按钮的 card.action.trigger，不能确认按钮已修复。请不要重复授权；先检查飞书开放平台的卡片回调配置，确认后再发送 /repair。';
 const CALLBACK_PROBE_SEND_FAILURE_NOTICE = '⚠️ 修复验证失败：无法发送专用测试卡，不能确认 card.action.trigger 已恢复。请不要重复授权；先检查机器人消息权限和连接状态。';
 const CALLBACK_PROBE_ABORT_NOTICE = '⚠️ 修复验证中断：Runtime 已停止，未完成 card.action.trigger 实测，不能确认修复成功。请不要重复授权；先等待机器人恢复连接。';
+const REUSABLE_WS_STATES = new Set(['connected', 'connecting', 'reconnecting']);
 
 function nonEmptyString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
@@ -21,6 +23,15 @@ function nonEmptyString(value) {
 function strictCardOperatorOpenId(event) {
   return nonEmptyString(event?.operator?.open_id)
     ?? nonEmptyString(event?.operator?.operator_id?.open_id);
+}
+
+function websocketState(wsClient, fallback) {
+  try {
+    const state = wsClient?.getConnectionStatus?.()?.state;
+    return typeof state === 'string' && state ? state : fallback;
+  } catch {
+    return fallback;
+  }
 }
 
 function probeError(code, message) {
@@ -88,19 +99,22 @@ export class FeishuRuntime {
   #appId;
   #appSecret;
   #domain;
+  #botOpenId;
+  #groupResponseMode;
   #ownerOpenIds;
   #harness;
   #state;
   #replyTimeoutMs;
   #connectTimeoutMs;
   #requestTimeoutMs;
+  #wsAgent;
   #logger;
   #repair;
-  #sourceChannelLabel;
   #client = null;
   #bridge = null;
   #wsClient = null;
   #starting = null;
+  #stopping = null;
   #abortController = null;
   #pendingCardActionProbes = new Map();
   #status;
@@ -111,6 +125,8 @@ export class FeishuRuntime {
     appId,
     appSecret,
     domain = 'feishu',
+    botOpenId,
+    groupResponseMode,
     ownerOpenId,
     ownerOpenIds,
     harness,
@@ -119,7 +135,7 @@ export class FeishuRuntime {
     replyTimeoutMs = 600000,
     connectTimeoutMs = 15000,
     requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
-    sourceChannelLabel,
+    wsAgent,
     logger = console,
   }) {
     if (!lark) throw new Error('FeishuRuntime requires the Feishu SDK');
@@ -141,6 +157,8 @@ export class FeishuRuntime {
     this.#appId = appId;
     this.#appSecret = appSecret;
     this.#domain = domain;
+    this.#botOpenId = nonEmptyString(botOpenId);
+    this.#groupResponseMode = normalizeFeishuGroupResponseMode(groupResponseMode);
     this.#ownerOpenIds = normalizedOwners;
     this.#harness = harness;
     this.#state = state;
@@ -148,8 +166,8 @@ export class FeishuRuntime {
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#connectTimeoutMs = connectTimeoutMs;
     this.#requestTimeoutMs = requestTimeoutMs;
+    this.#wsAgent = wsAgent;
     this.#logger = logger;
-    this.#sourceChannelLabel = sourceChannelLabel;
     this.#status = createBridgeStatus({ allowedSenderCount: normalizedOwners.length });
   }
 
@@ -157,26 +175,65 @@ export class FeishuRuntime {
     return structuredClone(this.#status);
   }
 
-  async start() {
-    if (this.#wsClient && this.#status.ready) return this.status;
-    if (this.#starting) return this.#starting;
+  setGroupResponseMode(value) {
+    this.#groupResponseMode = normalizeFeishuGroupResponseMode(value);
+    this.#bridge?.setGroupResponseMode(this.#groupResponseMode);
+  }
 
-    this.#starting = this.#start().finally(() => {
-      this.#starting = null;
+  async start() {
+    while (true) {
+      while (this.#stopping) await this.#stopping;
+      if (this.#starting) return this.#starting;
+
+      const wsClient = this.#wsClient;
+      if (wsClient) {
+        const state = websocketState(wsClient, this.#status.feishuLongConnectionState);
+        if (REUSABLE_WS_STATES.has(state)) return this.status;
+
+        await this.stop({ preserveError: state === 'failed' });
+        continue;
+      }
+
+      // A partial/failed attempt may have created resources before its
+      // WSClient became observable. Drain them before assigning a new attempt.
+      if (this.#client || this.#bridge || this.#abortController) {
+        await this.stop({
+          preserveError: this.#status.feishuLongConnectionState === 'failed',
+        });
+        continue;
+      }
+
+      break;
+    }
+
+    let starting;
+    starting = this.#start().finally(() => {
+      if (this.#starting === starting) this.#starting = null;
     });
-    return this.#starting;
+    this.#starting = starting;
+    return starting;
   }
 
   async #start() {
     const abortController = new AbortController();
     this.#abortController = abortController;
     const { signal } = abortController;
+    const abortError = () => (
+      signal.reason ?? new DOMException('Feishu runtime stopped', 'AbortError')
+    );
+    const isCurrentStart = () => (
+      !signal.aborted && this.#abortController === abortController
+    );
+    const assertCurrentStart = () => {
+      if (!isCurrentStart()) throw abortError();
+    };
     this.#status.startedAt = new Date().toISOString();
     this.#status.feishuLongConnectionState = 'connecting';
     this.#status.lastError = null;
 
     try {
       await this.#harness.ensureRunning({ signal });
+      assertCurrentStart();
       this.#status.harnessReachable = true;
 
       const sdkDomain = this.#domain === 'lark'
@@ -192,13 +249,14 @@ export class FeishuRuntime {
         this.#requestTimeoutMs,
       );
       if (httpInstance) larkConfig.httpInstance = httpInstance;
-      this.#client = new this.#lark.Client(larkConfig);
+      const client = new this.#lark.Client(larkConfig);
+      this.#client = client;
       const channel = new VerifiedFeishuChannel({
-        client: this.#client,
-        initialText: '已连接 DeepSeek Harness，正在思考…',
+        client,
+        initialText: t('已连接 DeepSeek Harness，正在思考…'),
       });
-      this.#bridge = new FeishuHarnessBridge({
-        client: this.#client,
+      const bridge = new FeishuHarnessBridge({
+        client,
         channel,
         harness: this.#harness,
         state: this.#state,
@@ -206,29 +264,29 @@ export class FeishuRuntime {
         allowedSenderOpenIds: new Set(this.#ownerOpenIds),
         botId: this.#botId,
         appId: this.#appId,
+        botOpenId: this.#botOpenId,
+        groupResponseMode: this.#groupResponseMode,
         repair: this.#repair,
-        repairOwnerOpenIds: new Set(this.#ownerOpenIds.filter((value) => value !== '*')),
         replyTimeoutMs: this.#replyTimeoutMs,
-        sourceChannelLabel: this.#sourceChannelLabel,
         signal,
         logger: this.#logger,
       });
+      this.#bridge = bridge;
 
       const dispatcher = new this.#lark.EventDispatcher({}).register({
         'im.message.receive_v1': (event) => {
-          this.#bridge.accept(event);
-          return {};
+          if (isCurrentStart()) void bridge.accept(event);
         },
-        'im.message.reaction.created_v1': () => ({}),
-        'im.message.reaction.deleted_v1': () => ({}),
+        'im.message.reaction.created_v1': () => undefined,
+        'im.message.reaction.deleted_v1': () => undefined,
         // Interactive-card button callbacks (only delivered when the app
         // subscribes card.action.trigger; the number-reply fallback covers
         // apps that do not).
         'card.action.trigger': (event) => {
+          if (!isCurrentStart()) return;
           this.#status.cardActionsReceived += 1;
           this.#status.lastCardActionAt = new Date().toISOString();
-          if (!this.#consumeCardActionProbe(event)) this.#bridge.onCardAction(event);
-          return {};
+          if (!this.#consumeCardActionProbe(event)) void bridge.onCardAction(event);
         },
       });
 
@@ -236,36 +294,49 @@ export class FeishuRuntime {
       let settleError;
       const ready = new Promise((resolve, reject) => {
         let settled = false;
-        const timer = setTimeout(() => {
+        const onAbort = () => {
+          settleError(abortError());
+        };
+        const settle = (callback, value) => {
           if (settled) return;
           settled = true;
-          reject(new Error(`Feishu WebSocket handshake timed out after ${this.#connectTimeoutMs}ms`));
+          clearTimeout(timer);
+          signal.removeEventListener('abort', onAbort);
+          callback(value);
+        };
+        const timer = setTimeout(() => {
+          settle(
+            reject,
+            new Error(`Feishu WebSocket handshake timed out after ${this.#connectTimeoutMs}ms`),
+          );
         }, this.#connectTimeoutMs);
         settleReady = () => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          resolve();
+          settle(resolve);
         };
         settleError = (error) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          reject(error);
+          settle(reject, error);
         };
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (signal.aborted) onAbort();
       });
+      // The SDK constructor can throw before Promise.all attaches below.
+      // Keep the abort-driven rejection observed in that path as well.
+      void ready.catch(() => undefined);
 
-      this.#wsClient = new this.#lark.WSClient({
+      const wsClient = new this.#lark.WSClient({
         ...larkConfig,
+        ...(this.#wsAgent ? { agent: this.#wsAgent } : {}),
         loggerLevel: this.#lark.LoggerLevel.info,
-        handshakeTimeoutMs: 15000,
+        handshakeTimeoutMs: this.#connectTimeoutMs,
         onReady: () => {
+          if (!isCurrentStart()) return;
           this.#status.feishuLongConnectionState = 'connected';
           this.#status.ready = true;
           this.#status.lastError = null;
           settleReady();
         },
         onError: (error) => {
+          if (!isCurrentStart()) return;
           this.#status.feishuLongConnectionState = 'failed';
           this.#status.ready = false;
           this.#status.lastError = error?.message ?? String(error);
@@ -273,25 +344,35 @@ export class FeishuRuntime {
           settleError(error);
         },
         onReconnecting: () => {
+          if (!isCurrentStart()) return;
           this.#status.feishuLongConnectionState = 'reconnecting';
           this.#status.ready = false;
         },
         onReconnected: () => {
+          if (!isCurrentStart()) return;
           this.#status.feishuLongConnectionState = 'connected';
           this.#status.ready = true;
           this.#status.lastError = null;
         },
       });
-      await this.#wsClient.start({ eventDispatcher: dispatcher }).catch((error) => {
-        settleError(error);
-      });
-      await ready;
+      this.#wsClient = wsClient;
+      const wsStarted = Promise.resolve()
+        .then(() => wsClient.start({ eventDispatcher: dispatcher }))
+        .catch((error) => {
+          settleError(error);
+          throw error;
+        });
+      await Promise.all([wsStarted, ready]);
+      assertCurrentStart();
       return this.status;
     } catch (error) {
+      // stop() owns the terminal idle state for an explicitly aborted start.
+      // In particular, do not let the rejected handshake waiter overwrite it.
+      if (signal.aborted) throw error;
       this.#status.ready = false;
       this.#status.feishuLongConnectionState = 'failed';
       this.#status.lastError = error?.message ?? String(error);
-      await this.stop({ preserveError: true });
+      await this.#cleanup({ preserveError: true, abortController });
       throw error;
     }
   }
@@ -327,7 +408,7 @@ export class FeishuRuntime {
     } catch {
       void this.#sendCardActionProbeNotice(
         operatorOpenId,
-        CALLBACK_PROBE_SEND_FAILURE_NOTICE,
+        t(CALLBACK_PROBE_SEND_FAILURE_NOTICE),
         'failure',
       );
       throw probeError('card_action_probe_send_failed', '无法发送飞书卡片回调测试');
@@ -335,7 +416,7 @@ export class FeishuRuntime {
     if (response?.code && response.code !== 0) {
       void this.#sendCardActionProbeNotice(
         operatorOpenId,
-        CALLBACK_PROBE_SEND_FAILURE_NOTICE,
+        t(CALLBACK_PROBE_SEND_FAILURE_NOTICE),
         'failure',
       );
       throw probeError('card_action_probe_send_failed', '无法发送飞书卡片回调测试');
@@ -345,7 +426,7 @@ export class FeishuRuntime {
     if (!messageId) {
       void this.#sendCardActionProbeNotice(
         operatorOpenId,
-        CALLBACK_PROBE_SEND_FAILURE_NOTICE,
+        t(CALLBACK_PROBE_SEND_FAILURE_NOTICE),
         'failure',
       );
       throw probeError('card_action_probe_send_failed', '飞书未返回测试卡片的消息 ID');
@@ -358,7 +439,7 @@ export class FeishuRuntime {
         this.#pendingCardActionProbes.delete(messageId);
         void this.#sendCardActionProbeNotice(
           operatorOpenId,
-          CALLBACK_PROBE_TIMEOUT_NOTICE,
+          t(CALLBACK_PROBE_TIMEOUT_NOTICE),
           'timeout',
         );
         reject(probeError(
@@ -400,7 +481,7 @@ export class FeishuRuntime {
     // the callback proof itself.
     void this.#sendCardActionProbeNotice(
       operatorOpenId,
-      CALLBACK_PROBE_SUCCESS_NOTICE,
+      t(CALLBACK_PROBE_SUCCESS_NOTICE),
       'success',
     ).finally(() => {
       probe.resolve({
@@ -466,42 +547,60 @@ export class FeishuRuntime {
       return { sent: true };
     }
 
-    const chatId = nonEmptyString(connectionTestTarget(this.#state)?.chatId);
-    if (chatId) {
-      await send('chat_id', chatId, text);
-      return { sent: true };
-    }
-    const boundOpenId = nonEmptyString(connectionTestTarget(this.#state)?.openId)
-      ?? latestBoundConversation(this.#state, 'p2p:')?.id;
-    if (!boundOpenId) throw connectionTestTargetUnavailable('飞书机器人');
-    await send('open_id', boundOpenId, text);
-    return { sent: true };
+    return sendRememberedConnectionTest({
+      state: this.#state,
+      text,
+      channelLabel: t('飞书机器人'),
+      send: async (target, content) => {
+        const chatId = typeof target?.chatId === 'string' ? target.chatId.trim() : '';
+        if (!chatId) throw connectionTestTargetUnavailable(t('飞书机器人'));
+        await send('chat_id', chatId, content);
+      },
+    });
   }
 
-  async stop({ preserveError = false } = {}) {
-    const error = preserveError ? this.#status.lastError : null;
+  stop(options = {}) {
+    if (this.#stopping) return this.#stopping;
+
+    let stopping;
+    stopping = this.#stop(options).finally(() => {
+      if (this.#stopping === stopping) this.#stopping = null;
+    });
+    this.#stopping = stopping;
+    return stopping;
+  }
+
+  async #stop({ preserveError = false } = {}) {
     const abortController = this.#abortController;
-    this.#abortController = null;
+    if (this.#abortController === abortController) this.#abortController = null;
+    abortController?.abort(new DOMException('Feishu runtime stopped', 'AbortError'));
+
+    const starting = this.#starting;
+    if (starting) await starting.catch(() => undefined);
+    return this.#cleanup({ preserveError, abortController });
+  }
+
+  async #cleanup({ preserveError = false, abortController } = {}) {
+    const error = preserveError ? this.#status.lastError : null;
+    if (this.#abortController === abortController) this.#abortController = null;
     abortController?.abort(new DOMException('Feishu runtime stopped', 'AbortError'));
     for (const probe of this.#pendingCardActionProbes.values()) {
       clearTimeout(probe.timeout);
       void this.#sendCardActionProbeNotice(
         probe.expectedOperatorOpenId,
-        CALLBACK_PROBE_ABORT_NOTICE,
+        t(CALLBACK_PROBE_ABORT_NOTICE),
         'abort',
       );
       probe.reject(probeError('abort', '飞书运行时已停止'));
     }
     this.#pendingCardActionProbes.clear();
     this.#status.ready = false;
-    if (this.#wsClient) {
-      this.#wsClient.close({ force: true });
-      this.#wsClient = null;
-    }
-    if (this.#bridge) {
-      await this.#bridge.waitForIdle();
-      this.#bridge = null;
-    }
+    const wsClient = this.#wsClient;
+    this.#wsClient = null;
+    wsClient?.close({ force: true });
+    const bridge = this.#bridge;
+    this.#bridge = null;
+    if (bridge) await bridge.waitForIdle();
     this.#client = null;
     this.#status.feishuLongConnectionState = preserveError ? 'failed' : 'idle';
     this.#status.lastError = error;

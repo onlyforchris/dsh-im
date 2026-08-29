@@ -4,11 +4,20 @@ import { QqLogoGlyph } from '../../channel-logos.js';
 import { CredentialActionIcon, CredentialBindingPanel, QrActionIcon } from '../../credential-binding.js';
 import { h } from '../../i18n.js';
 import { WorkspaceEditor } from '../../workspace-editor.js';
+import {
+  AgentPresetCatalogContext,
+  AgentPresetEditor,
+  EMPTY_AGENT_PRESET_CATALOG,
+} from '../../agent-preset.js';
 import { useWorkspaceSnapshotFence } from '../../workspace-snapshot-fence.js';
+import {
+  BotStatusMeta,
+  ChannelListHeading,
+  LastMessageErrorSummary,
+} from '../../channel-card-meta.js';
 import { installDingtalkStyles } from '../dingtalk/styles.js';
 import {
   QQ_ENDPOINTS,
-  QQ_RPC_CHANNEL,
   connectionTestFeedback,
   formatRemaining,
   normalizeProvisioning,
@@ -156,6 +165,7 @@ export function AccountCard({
   removing,
   onReconnect,
   onWorkspaceSave,
+  onAgentPresetSave,
   onRequestRemove,
   onConfirmRemove,
   onCancelRemove,
@@ -170,33 +180,49 @@ export function AccountCard({
           h('div', { className: 'ddt-avatar dim-botAvatar dqq-avatar', 'aria-hidden': 'true' }, h(QqLogoGlyph, { size: 29 })),
           h('div', { className: 'dim-botName' },
             h('h3', null, account.bot.name), h('p', null, account.bot.appIdMasked))),
-        h('div', { className: 'ddt-health dim-botHealth' },
-          h('span', { className: 'ddt-dot dim-healthDot', 'data-tone': tone }), h('span', null, stateLabel))),
-      h('dl', { className: 'ddt-metrics dim-botMetrics' },
-        h('div', { className: 'ddt-metric dim-botMetric' }, h('dt', null, '消息通道'), h('dd', null, account.connected ? 'WebSocket 长连接' : '离线')),
-        h('div', { className: 'ddt-metric dim-botMetric' }, h('dt', null, '最近检查'), h('dd', null, checkedTime(account.health.lastCheckedAt)))),
+        h(BotStatusMeta, {
+          className: 'ddt-health',
+          dotClassName: 'ddt-dot',
+          tone,
+          stateLabel,
+          lastCheckedAt: account.health.lastCheckedAt,
+          formatCheckedTime: checkedTime,
+        })),
       h(WorkspaceEditor, {
         workspace: account.workspace,
         disabled: Boolean(busy),
         onSave: onWorkspaceSave,
       }),
+      h(AgentPresetEditor, {
+        agentPreset: account.agentPreset,
+        disabled: Boolean(busy),
+        onSave: onAgentPresetSave,
+      }),
       h('div', { className: 'ddt-accountFooter dim-cardFooter' },
-        summary ? h('div', { className: 'ddt-summary dim-cardSummary' }, summary) : null,
-        feedback ? h('div', {
-          className: 'ddt-summary dim-cardSummary',
-          role: 'status',
-          'aria-live': 'polite',
-        }, feedback) : null,
-        h('div', { className: 'ddt-actions dim-cardActions' },
-          h(Button, { className: 'dim-cardAction', onClick: onReconnect, disabled: Boolean(busy) }, busy === 'reconnect' ? '检查中…' : account.connected ? '检查连接' : '重试连接'),
-          h(Button, { className: 'dim-cardAction', kind: 'danger', onClick: onRequestRemove, disabled: Boolean(busy) }, '移除接入')))),
+        h('div', { className: 'dim-cardFooterLayout' },
+          h('div', { className: 'ddt-actions dim-cardActions' },
+            h(Button, { className: 'dim-cardAction', onClick: onReconnect, disabled: Boolean(busy) }, busy === 'reconnect' ? '检查中…' : account.connected ? '检查连接' : '重试连接'),
+            h(Button, { className: 'dim-cardAction', kind: 'danger', onClick: onRequestRemove, disabled: Boolean(busy) }, '移除接入')),
+          summary ? h('div', { className: 'ddt-summary dim-cardSummary' }, summary) : null,
+          account.lastMessageError ? h(LastMessageErrorSummary, {
+            className: 'ddt-summary',
+            error: account.lastMessageError,
+          }) : null,
+          feedback ? h('div', {
+            className: 'ddt-summary dim-cardFeedback',
+            role: 'status',
+            'aria-live': 'polite',
+          }, feedback) : null))),
     removing ? h(RemoveConfirmation, {
       account, busy: busy === 'delete', onConfirm: onConfirmRemove, onCancel: onCancelRemove,
     }) : null);
 }
 
 export function QqSettingsTab({ rpcCall }) {
-  const [model, setModel] = React.useState({ phase: 'loading', bots: [], totals: { configured: 0, connected: 0 }, error: null });
+  const [model, setModel] = React.useState({
+    phase: 'loading', bots: [], totals: { configured: 0, connected: 0 }, error: null,
+    agentPresetCatalog: EMPTY_AGENT_PRESET_CATALOG,
+  });
   const [provision, setProvision] = React.useState(null);
   const [busy, setBusy] = React.useState(false);
   const [busyByBot, setBusyByBot] = React.useState({});
@@ -233,7 +259,10 @@ export function QqSettingsTab({ rpcCall }) {
       const snapshot = normalizeSnapshot(await invoke(QQ_ENDPOINTS.status, {}, signal));
       if (!mounted.current || signal?.aborted
         || !workspaceFence.canCommitStatus(workspaceVersion)) return undefined;
-      setModel({ phase: 'ready', bots: snapshot.bots, totals: snapshot.totals, error: null });
+      setModel({
+        phase: 'ready', bots: snapshot.bots, totals: snapshot.totals, error: null,
+        agentPresetCatalog: snapshot.agentPresetCatalog ?? EMPTY_AGENT_PRESET_CATALOG,
+      });
       if (restore && snapshot.provisioning) setProvision({
         ...snapshot.provisioning,
         durationMs: Math.max(1, snapshot.provisioning.expiresAt - Date.now()),
@@ -297,7 +326,10 @@ export function QqSettingsTab({ rpcCall }) {
       ));
       if (!mounted.current) return;
       if (workspaceFence.canCommitMutation(snapshotVersion)) {
-        setModel({ phase: 'ready', bots: snapshot.bots, totals: snapshot.totals, error: null });
+        setModel({
+          phase: 'ready', bots: snapshot.bots, totals: snapshot.totals, error: null,
+          agentPresetCatalog: snapshot.agentPresetCatalog ?? EMPTY_AGENT_PRESET_CATALOG,
+        });
       }
       setCredentialOpen(false);
     } catch (error) {
@@ -357,7 +389,10 @@ export function QqSettingsTab({ rpcCall }) {
     try {
       const snapshot = normalizeSnapshot(await invoke(endpoint, payload));
       if (mounted.current && workspaceFence.canCommitMutation(snapshotVersion)) {
-        setModel({ phase: 'ready', bots: snapshot.bots, totals: snapshot.totals, error: null });
+        setModel({
+          phase: 'ready', bots: snapshot.bots, totals: snapshot.totals, error: null,
+          agentPresetCatalog: snapshot.agentPresetCatalog ?? EMPTY_AGENT_PRESET_CATALOG,
+        });
       }
       return snapshot;
     } finally {
@@ -409,8 +444,11 @@ export function QqSettingsTab({ rpcCall }) {
 
   const botList = model.bots.length > 0
     ? h('section', { className: 'dim-listSection' },
-        h('div', { className: 'ddt-listHeading dim-listHeading' },
-          h('h3', null, '已绑定的 QQ 机器人')),
+        h(ChannelListHeading, {
+          className: 'ddt-listHeading',
+          title: '已绑定的 QQ 机器人',
+          connectionLabel: 'WebSocket 长连接',
+        }),
         h('ul', { className: 'ddt-list dim-botList' }, model.bots.map((account) =>
           h('li', { key: account.botId }, h(AccountCard, {
             account,
@@ -423,6 +461,12 @@ export function QqSettingsTab({ rpcCall }) {
               'workspace',
               QQ_ENDPOINTS.setWorkspace,
               { botId: account.botId, workspace },
+            ),
+            onAgentPresetSave: (agentPreset) => botAction(
+              account,
+              'preset',
+              QQ_ENDPOINTS.setAgentPreset,
+              { botId: account.botId, agentPreset },
             ),
             onRequestRemove: () => setRemoveTarget(account.botId),
             onCancelRemove: () => setRemoveTarget(null),
@@ -447,7 +491,9 @@ export function QqSettingsTab({ rpcCall }) {
       })
     : null;
 
-  return h('section', { className: 'ddt-page dqq-page dim-channelPage', 'aria-label': 'QQ 设置' },
+  return h(AgentPresetCatalogContext.Provider, {
+    value: model.agentPresetCatalog ?? EMPTY_AGENT_PRESET_CATALOG,
+  }, h('section', { className: 'ddt-page dqq-page dim-channelPage', 'aria-label': 'QQ 设置' },
     h(Heading, {
       totals: model.totals,
       adding: Boolean(provision),
@@ -465,13 +511,5 @@ export function QqSettingsTab({ rpcCall }) {
             provisionView,
             model.bots.length === 0 && !provision && !credentialOpen
               ? h(EmptyView, { busy, onStart: () => void startProvisioning() }) : null,
-            botList));
-}
-
-export function apply(ctx) {
-  ctx.effect(() => installQqStyles(), 'qq-settings: install client styles');
-  const rpcCall = (endpoint, payload, signal) => ctx.connection.rpc.call(QQ_RPC_CHANNEL, endpoint, payload, signal);
-  ctx.slots.inject('settings.plugins.tab', () => ctx.slots.register({
-    name: 'settings.plugins.tab', id: 'qq', order: 50, label: 'QQ', inject: () => ({ rpcCall }),
-  }, QqSettingsTab));
+            botList)));
 }

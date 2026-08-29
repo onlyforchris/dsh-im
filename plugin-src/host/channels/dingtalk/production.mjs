@@ -14,18 +14,11 @@ import {
   createWorkspaceAwareController,
   observeBotWorkspaceRemovals,
 } from '../../../../src/channels/shared/bot-workspace-store.mjs';
+import { listAgentPresetCatalog } from '../../../../src/channels/shared/agent-preset.mjs';
 import { createConnectionSupervisor } from './connection-supervisor.mjs';
 import { createHarnessCommandExecutor } from '../../harness-command-executor.mjs';
+import { harnessConnection } from '../../harness-connection.mjs';
 import { createHarnessSessionExecutors } from '../../harness-session-coordinator.mjs';
-
-function harnessOrigin(webServer, configured) {
-  if (configured !== undefined) return new URL(configured);
-  const port = webServer?.port;
-  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
-    throw new Error('dsh-dingtalk requires an initialized DSH webServer port');
-  }
-  return new URL(`http://127.0.0.1:${port}`);
-}
 
 function pluginPaths(config) {
   const dshHome = resolve(config.dshHome ?? process.env.DSH_HOME ?? join(homedir(), '.dsh'));
@@ -40,7 +33,7 @@ function pluginPaths(config) {
 
 export async function createProductionController(ctx, config = {}, internals = {}) {
   if (!ctx?.credentials) throw new TypeError('dsh-dingtalk requires ctx.credentials');
-  if (!ctx?.webServer) throw new TypeError('dsh-dingtalk requires ctx.webServer');
+  const connection = harnessConnection(ctx, config);
 
   const ConfigStore = internals.ConfigStore ?? DingtalkConfigStore;
   const DeviceAuth = internals.DeviceAuth ?? DingtalkDeviceAuth;
@@ -52,6 +45,7 @@ export async function createProductionController(ctx, config = {}, internals = {
   const logger = typeof ctx.logger === 'function'
     ? ctx.logger('dsh-dingtalk')
     : (ctx.logger ?? console);
+  const agentPresetCatalog = () => listAgentPresetCatalog(ctx);
   const paths = pluginPaths(config);
   const configStore = await new ConfigStore(paths.config).load();
   const defaultWorkspace = resolve(config.workspace ?? process.cwd());
@@ -63,7 +57,9 @@ export async function createProductionController(ctx, config = {}, internals = {
   if (canListConfiguredBots) {
     await workspaces.reconcile(configuredBots.map((bot) => bot.botId));
   }
-  await Promise.all(configuredBots.map((bot) => workspaces.ensure(bot.botId)));
+  await Promise.all(configuredBots.map((bot) => workspaces.ensure(bot.botId, {
+    defaultAgentPreset: config.agentPreset,
+  })));
   const observedConfigStore = typeof configStore.remove === 'function'
     ? observeBotWorkspaceRemovals(configStore, { workspaces })
     : configStore;
@@ -82,19 +78,20 @@ export async function createProductionController(ctx, config = {}, internals = {
     return state;
   };
   const commandExecutor = createHarnessCommandExecutor(ctx, internals.commandExecutor);
-  const { controlExecutor, sessionMaintenanceExecutor } = createHarnessSessionExecutors(ctx, {
+  const { controlExecutor, sessionMaintenanceExecutor, fileIngressExecutor } = createHarnessSessionExecutors(ctx, {
     controlExecutor: internals.controlExecutor,
     sessionMaintenanceExecutor: internals.sessionMaintenanceExecutor,
+    fileIngressExecutor: internals.fileIngressExecutor,
   });
   const harness = new Harness({
-    baseUrl: harnessOrigin(ctx.webServer, config.harnessBaseUrl),
+    ...connection,
     workspace: defaultWorkspace,
-    ...(config.agentPreset == null ? {} : { agentPreset: config.agentPreset }),
     autostart: false,
     dshBin: config.dshBin ?? 'dsh',
     ...(commandExecutor ? { commandExecutor } : {}),
     ...(controlExecutor ? { controlExecutor } : {}),
     ...(sessionMaintenanceExecutor ? { sessionMaintenanceExecutor } : {}),
+    ...(fileIngressExecutor ? { fileIngressExecutor } : {}),
   });
   const coreController = new Controller({
     deviceAuth,
@@ -103,12 +100,13 @@ export async function createProductionController(ctx, config = {}, internals = {
     logger,
     createRuntime: async ({ botId, config: botConfig, clientSecret }) => {
       const state = await stateFor(botId);
-      await workspaces.ensure(botId);
-      const workspaceScope = createBotWorkspaceScope(harness, { botId, workspaces, state });
+      await workspaces.ensure(botId, { defaultAgentPreset: config.agentPreset });
+      const workspaceScope = createBotWorkspaceScope(harness, {
+        botId, workspaces, state, agentPresetCatalog,
+      });
       return new Runtime({
         config: botConfig,
         clientSecret,
-        sourceChannelLabel: '钉钉',
         harness: workspaceScope.harness,
         state: workspaceScope.state,
         replyTimeoutMs: config.replyTimeoutMs ?? 600_000,
@@ -136,7 +134,11 @@ export async function createProductionController(ctx, config = {}, internals = {
       }
     },
   });
-  const controller = createWorkspaceAwareController(coreController, { workspaces, stateFor });
+  const controller = createWorkspaceAwareController(coreController, {
+    workspaces,
+    stateFor,
+    agentPresetCatalog,
+  });
   const supervisor = createSupervisor({
     controller,
     harness,

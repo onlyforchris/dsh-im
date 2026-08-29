@@ -4,6 +4,7 @@ import {
   connectionTestTarget,
   connectionTestTargetUnavailable,
 } from '../shared/connection-test.mjs';
+import { t } from '../shared/i18n.mjs';
 import { createQqBridgeStatus, QqHarnessBridge } from './qq-bridge.mjs';
 
 function timeoutError() {
@@ -76,7 +77,7 @@ export class QqRuntime {
 
   async sendConnectionTest(text) {
     if (!this.#status.ready || !this.#bot) {
-      throw connectionTestTargetUnavailable('QQ机器人');
+      throw connectionTestTargetUnavailable(t('QQ机器人'));
     }
     const ownerUserOpenid = typeof this.#config.ownerUserOpenid === 'string'
       ? this.#config.ownerUserOpenid.trim()
@@ -91,7 +92,7 @@ export class QqRuntime {
       : (ownerUserOpenid && ownerUserOpenid !== '*'
         ? { scope: 'c2c', targetId: ownerUserOpenid }
         : null);
-    if (!target) throw connectionTestTargetUnavailable('QQ机器人');
+    if (!target) throw connectionTestTargetUnavailable(t('QQ机器人'));
     await this.#bot.sendText(target, text);
     return { sent: true };
   }
@@ -126,6 +127,9 @@ export class QqRuntime {
       logger: sdkLogger,
       transport: 'websocket',
       tokenPrefetch: 'sync',
+      // sendText is reserved for literal notices/connection tests. Markdown
+      // replies use the explicit msg_type=2 path in sendMarkdownReply().
+      markdownSupport: false,
     });
     if (!bot || typeof bot.start !== 'function' || typeof bot.stop !== 'function') {
       throw new TypeError('QQ bot factory returned an invalid client');

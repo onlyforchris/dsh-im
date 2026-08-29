@@ -8,25 +8,18 @@ import { WecomQrAuth } from '../../../../src/channels/wecom/qr-auth.mjs';
 import { WecomStateStore } from '../../../../src/channels/wecom/state-store.mjs';
 import { WecomController } from '../../../../src/channels/wecom/wecom-controller.mjs';
 import { WecomRuntime } from '../../../../src/channels/wecom/wecom-runtime.mjs';
-import { NotificationOutbox } from '../../../../src/channels/weixin/notification-outbox.mjs';
 import {
   BotWorkspaceStore,
   createBotWorkspaceScope,
   createWorkspaceAwareController,
   observeBotWorkspaceRemovals,
 } from '../../../../src/channels/shared/bot-workspace-store.mjs';
+import { listAgentPresetCatalog } from '../../../../src/channels/shared/agent-preset.mjs';
 import { createConnectionSupervisor } from './connection-supervisor.mjs';
+import { startNotificationOutbox } from './notification-outbox-wiring.mjs';
 import { createHarnessCommandExecutor } from '../../harness-command-executor.mjs';
+import { harnessConnection } from '../../harness-connection.mjs';
 import { createHarnessSessionExecutors } from '../../harness-session-coordinator.mjs';
-
-function harnessOrigin(webServer, configured) {
-  if (configured !== undefined) return new URL(configured);
-  const port = webServer?.port;
-  if (!Number.isInteger(port) || port < 1 || port > 65_535) {
-    throw new Error('dsh-im Enterprise WeChat requires an initialized DSH webServer port');
-  }
-  return new URL(`http://127.0.0.1:${port}`);
-}
 
 function pluginPaths(config) {
   const dshHome = resolve(config.dshHome ?? process.env.DSH_HOME ?? join(homedir(), '.dsh'));
@@ -40,7 +33,7 @@ function pluginPaths(config) {
 
 export async function createProductionController(ctx, config = {}, internals = {}) {
   if (!ctx?.credentials) throw new TypeError('dsh-im Enterprise WeChat requires ctx.credentials');
-  if (!ctx?.webServer) throw new TypeError('dsh-im Enterprise WeChat requires ctx.webServer');
+  const connection = harnessConnection(ctx, config);
 
   const ConfigStore = internals.ConfigStore ?? WecomConfigStore;
   const StateStore = internals.StateStore ?? WecomStateStore;
@@ -50,6 +43,7 @@ export async function createProductionController(ctx, config = {}, internals = {
   const QrAuth = internals.QrAuth ?? WecomQrAuth;
   const createSupervisor = internals.createConnectionSupervisor ?? createConnectionSupervisor;
   const logger = typeof ctx.logger === 'function' ? ctx.logger('dsh-im:wecom') : (ctx.logger ?? console);
+  const agentPresetCatalog = () => listAgentPresetCatalog(ctx);
   const paths = pluginPaths(config);
   const configStore = await new ConfigStore(paths.config).load();
   const defaultWorkspace = resolve(config.workspace ?? process.cwd());
@@ -58,7 +52,9 @@ export async function createProductionController(ctx, config = {}, internals = {
     ?? await new WorkspaceStore(paths.workspaces, { defaultWorkspace }).load();
   const configuredBots = configStore.list();
   await workspaces.reconcile(configuredBots.map((bot) => bot.botId));
-  await Promise.all(configuredBots.map((bot) => workspaces.ensure(bot.botId)));
+  await Promise.all(configuredBots.map((bot) => workspaces.ensure(bot.botId, {
+    defaultAgentPreset: config.agentPreset,
+  })));
   const observedConfigStore = typeof configStore.remove === 'function'
     ? observeBotWorkspaceRemovals(configStore, { workspaces })
     : configStore;
@@ -77,19 +73,20 @@ export async function createProductionController(ctx, config = {}, internals = {
     return state;
   };
   const commandExecutor = createHarnessCommandExecutor(ctx, internals.commandExecutor);
-  const { controlExecutor, sessionMaintenanceExecutor } = createHarnessSessionExecutors(ctx, {
+  const { controlExecutor, sessionMaintenanceExecutor, fileIngressExecutor } = createHarnessSessionExecutors(ctx, {
     controlExecutor: internals.controlExecutor,
     sessionMaintenanceExecutor: internals.sessionMaintenanceExecutor,
+    fileIngressExecutor: internals.fileIngressExecutor,
   });
   const harness = new Harness({
-    baseUrl: harnessOrigin(ctx.webServer, config.harnessBaseUrl),
+    ...connection,
     workspace: defaultWorkspace,
-    ...(config.agentPreset == null ? {} : { agentPreset: config.agentPreset }),
     autostart: false,
     dshBin: config.dshBin ?? 'dsh',
     ...(commandExecutor ? { commandExecutor } : {}),
     ...(controlExecutor ? { controlExecutor } : {}),
     ...(sessionMaintenanceExecutor ? { sessionMaintenanceExecutor } : {}),
+    ...(fileIngressExecutor ? { fileIngressExecutor } : {}),
   });
   const coreController = new Controller({
     qrAuth,
@@ -98,8 +95,10 @@ export async function createProductionController(ctx, config = {}, internals = {
     logger,
     createRuntime: async ({ botId, config: botConfig, secret }) => {
       const state = await stateFor(botId);
-      await workspaces.ensure(botId);
-      const workspaceScope = createBotWorkspaceScope(harness, { botId, workspaces, state });
+      await workspaces.ensure(botId, { defaultAgentPreset: config.agentPreset });
+      const workspaceScope = createBotWorkspaceScope(harness, {
+        botId, workspaces, state, agentPresetCatalog,
+      });
       return new Runtime({
         config: botConfig,
         secret,
@@ -131,21 +130,11 @@ export async function createProductionController(ctx, config = {}, internals = {
       }
     },
   });
-  const controller = createWorkspaceAwareController(coreController, { workspaces, stateFor });
-  const notificationOutbox = config.notificationOutboxDir
-    ? new NotificationOutbox({
-        dir: config.notificationOutboxDir,
-        pollIntervalMs: config.notificationPollIntervalMs ?? 5_000,
-        logger,
-        send: (text, media) => {
-          const bots = configStore.list();
-          const botId = config.notificationBotId
-            ?? (bots.length === 1 ? bots[0].botId : undefined);
-          if (!botId) throw new TypeError('dsh-wecom: notificationBotId is required when multiple bots exist');
-          return controller.sendNotification(botId, text, media);
-        },
-      })
-    : null;
+  const controller = createWorkspaceAwareController(coreController, {
+    workspaces,
+    stateFor,
+    agentPresetCatalog,
+  });
   const supervisor = createSupervisor({
     controller,
     harness,
@@ -153,10 +142,13 @@ export async function createProductionController(ctx, config = {}, internals = {
     retryDelaysMs: config.retryDelaysMs,
     healthyIntervalMs: config.healthyIntervalMs,
   }).start();
-  await notificationOutbox?.start();
+  // S5 通知 outbox：由当前 WeCom production 入口实例化并消费（04_13 P0-B）。
+  // 仅当 profile 配置了 notificationOutboxDir 时启用；未配置则保持原行为。
+  const notificationOutbox = await startNotificationOutbox({ config, controller, logger });
   return {
     controller,
     ready: supervisor.ready,
+    notificationOutbox,
     async close() {
       await notificationOutbox?.close();
       await supervisor.close();

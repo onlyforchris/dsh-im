@@ -18,7 +18,9 @@ oauth_config:
       - app_mentions:read
       - chat:write
       - files:read
+      - files:write
       - im:history
+      - reactions:write
 settings:
   event_subscriptions:
     bot_events:

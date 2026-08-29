@@ -1,8 +1,23 @@
-import { access, readFile, stat } from 'node:fs/promises';
+import { access, readFile, readdir, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const root = resolve(import.meta.dirname, '..');
+
+async function readSourceTree(directory) {
+  const entries = await readdir(directory, { withFileTypes: true });
+  const chunks = [];
+  for (const entry of entries) {
+    const path = resolve(directory, entry.name);
+    if (entry.isDirectory()) {
+      chunks.push(await readSourceTree(path));
+    } else if (entry.isFile() && /\.m?js$/u.test(entry.name)) {
+      chunks.push(await readFile(path, 'utf8'));
+    }
+  }
+  return chunks.join('\n');
+}
+
 const required = [
   'lib/index.js',
   'lib/client.js',
@@ -13,6 +28,10 @@ const required = [
   'plugin-src/client/channels/dingtalk/index.js',
   'plugin-src/client/channels/slack/index.js',
   'plugin-src/client/i18n.js',
+  'plugin-src/client/update-panel.js',
+  'plugin-src/host/update-service.mjs',
+  'plugin-src/host/update-runtime.mjs',
+  'plugin-src/host/update-rpc.mjs',
   'plugin-src/host/channels/feishu/index.mjs',
   'plugin-src/host/channels/weixin/index.mjs',
   'plugin-src/host/channels/dingtalk/index.mjs',
@@ -35,7 +54,17 @@ const required = [
 ];
 await Promise.all(required.map((path) => access(resolve(root, path))));
 
-const [client, host, patch, manifestText, lockText, hostSource, clientSource, executable] = await Promise.all([
+const [
+  client,
+  host,
+  patch,
+  manifestText,
+  lockText,
+  hostSource,
+  clientEntrySource,
+  clientSources,
+  executable,
+] = await Promise.all([
   readFile(resolve(root, 'lib/client.js'), 'utf8'),
   readFile(resolve(root, 'lib/index.js'), 'utf8'),
   readFile(resolve(root, 'cordis.patch.yml'), 'utf8'),
@@ -43,6 +72,7 @@ const [client, host, patch, manifestText, lockText, hostSource, clientSource, ex
   readFile(resolve(root, 'package-lock.json'), 'utf8'),
   readFile(resolve(root, 'plugin-src/host/index.mjs'), 'utf8'),
   readFile(resolve(root, 'plugin-src/client/index.js'), 'utf8'),
+  readSourceTree(resolve(root, 'plugin-src/client')),
   stat(resolve(root, 'bin/dsh-im.mjs')),
 ]);
 const manifest = JSON.parse(manifestText);
@@ -82,17 +112,28 @@ if (forbiddenDshLockPaths.length > 0) {
   );
 }
 
-if (!client.includes('id: "@onlyforchris/dsh-im"')) {
+if (!/\bid\s*:\s*["']@onlyforchris\/dsh-im["']/u.test(client)) {
   throw new Error('client bundle does not register the dsh-im loader id');
 }
-if (!client.includes('id: "im"')
-  || !client.includes('label: () => t("IM\\u673A\\u5668\\u4EBA")')
-  || !client.includes('locale: IM_LOCALE_NAMESPACE')
-  || !client.includes('IM_LOCALE_NAMESPACE = "dsh-im"')) {
-  throw new Error('client bundle does not register the localized IM settings tab');
+const sourceSectionMarkers = [
+  /ctx\.slots\.inject\(\s*["']settings\.section["']/u,
+  /name\s*:\s*["']settings\.section["']/u,
+  /id\s*:\s*["']onlyforchris-dsh-im["']/u,
+  /order\s*:\s*21\b/u,
+  /label\s*:\s*\(\)\s*=>\s*t\(\s*["']IM机器人["']\s*\)/u,
+  /locale\s*:\s*IM_LOCALE_NAMESPACE\b/u,
+];
+const bundleSectionPattern = /name\s*:\s*["']settings\.section["']\s*,\s*id\s*:\s*["']onlyforchris-dsh-im["']\s*,\s*order\s*:\s*21\s*,\s*label\s*:\s*\(\)\s*=>\s*[$A-Z_a-z][$\w]*\(\s*["']IM(?:机器人|\\u673A\\u5668\\u4EBA)["']\s*\)\s*,\s*locale\s*:\s*(?:[$A-Z_a-z][$\w]*|["']dsh-im["'])/u;
+if (sourceSectionMarkers.some((pattern) => !pattern.test(clientEntrySource))
+  || !/IM_LOCALE_NAMESPACE\s*=\s*["']dsh-im["']/u.test(clientSources)
+  || !bundleSectionPattern.test(client)) {
+  throw new Error('client bundle does not register the localized top-level IM settings section');
 }
-if ((client.match(/ctx\.slots\.inject\("settings\.section"/g) ?? []).length !== 1) {
-  throw new Error('client bundle must register exactly one settings section');
+if ((client.match(/\.slots\.inject\(\s*["']settings\.section["']/gu) ?? []).length !== 1) {
+  throw new Error('client bundle must register exactly one top-level settings section');
+}
+if (client.includes('settings.plugins.tab') || clientSources.includes('settings.plugins.tab')) {
+  throw new Error('client source or bundle still contains the legacy Plugins-tab settings entry');
 }
 if (/role:\s*["']switch|type:\s*["']checkbox/.test(client)) {
   throw new Error('client bundle contains a channel enable switch');
@@ -106,23 +147,31 @@ for (const marker of ['/feishu', '/weixin', '/dingtalk', '/wecom', '/qq', '/slac
     throw new Error(`host bundle does not contain the internal ${marker} RPC provider`);
   }
 }
+for (const marker of ['update.status', 'update.check', 'update.install']) {
+  if (!host.includes(marker) || !client.includes(marker)) {
+    throw new Error(`update RPC endpoint missing from Host or Client bundle: ${marker}`);
+  }
+}
+if (!host.includes('https://registry.npmjs.org/') || !host.includes('desktopPnpm')) {
+  throw new Error('host bundle is missing the npm updater or Desktop package-management adapter');
+}
 for (const marker of ['/session Session ID', 'bindWorkspaceSession', 'session-subagent-unsupported']) {
   if (!host.includes(marker)) {
     throw new Error(`host bundle does not contain the Session binding marker: ${marker}`);
   }
 }
-if (/@xmanrui\/dsh-(?:feishu|weixin|dingtalk)/.test(host)) {
+if (/@onlyforchris\/dsh-(?:feishu|weixin|dingtalk)/.test(host)) {
   throw new Error('host bundle still imports an external channel plugin');
 }
-if (/@xmanrui\/dsh-(?:feishu|weixin|dingtalk)/.test(
-  manifestText + lockText + hostSource + clientSource,
+if (/@onlyforchris\/dsh-(?:feishu|weixin|dingtalk)/.test(
+  manifestText + lockText + hostSource + clientSources,
 )) {
   throw new Error('source or package metadata still depends on an external channel plugin');
 }
 if (!patch.includes("name: '@onlyforchris/dsh-im'") || /dsh-(?:feishu|weixin|dingtalk)/.test(patch)) {
   throw new Error('bundle patch must activate only dsh-im');
 }
-for (const name of ['@xmanrui/dsh-feishu', '@xmanrui/dsh-weixin', '@xmanrui/dsh-dingtalk']) {
+for (const name of ['@onlyforchris/dsh-feishu', '@onlyforchris/dsh-weixin', '@onlyforchris/dsh-dingtalk']) {
   if (manifest.dependencies?.[name]) {
     throw new Error(`${name} must not remain an external dependency`);
   }
@@ -142,6 +191,7 @@ for (const [name, version] of Object.entries(directDependencies)) {
 const bundledBuildDependencies = {
   '@larksuiteoapi/node-sdk': '1.73.0',
   '@whiskeysockets/baileys': '7.0.0-rc14',
+  'https-proxy-agent': '5.0.1',
 };
 for (const [name, version] of Object.entries(bundledBuildDependencies)) {
   if (manifest.dependencies?.[name] !== undefined) {
@@ -157,12 +207,10 @@ if (lock.packages?.['node_modules/protobufjs']?.dev !== true) {
 if (manifest.bin?.['dsh-im'] !== 'bin/dsh-im.mjs') {
   throw new Error('package manifest must publish the dsh-im executable');
 }
-if (/(?:from\s*|import\s*\(|require\s*\()\s*["'](?:@larksuiteoapi\/node-sdk|@whiskeysockets\/baileys|protobufjs)(?:\/[^"']*)?["']/.test(host)) {
-  throw new Error('host bundle must not import a bundled SDK or protobufjs at runtime');
+if (/(?:from\s*|import\s*\(|require\s*\()\s*["'](?:@larksuiteoapi\/node-sdk|@whiskeysockets\/baileys|https-proxy-agent|protobufjs)(?:\/[^"']*)?["']/.test(host)) {
+  throw new Error('host bundle must not import a bundled SDK, proxy agent, or protobufjs at runtime');
 }
-if (process.platform !== 'win32' && (executable.mode & 0o111) === 0) {
-  throw new Error('dsh-im CLI is not executable');
-}
+if (process.platform !== 'win32' && (executable.mode & 0o111) === 0) throw new Error('dsh-im CLI is not executable');
 if (/private-bot-token|must-be-rolled-back|DEEPSEEK_API_KEY=/.test(client + host)) {
   throw new Error('built artifacts contain a test or environment secret marker');
 }

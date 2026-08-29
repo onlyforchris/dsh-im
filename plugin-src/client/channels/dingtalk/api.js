@@ -1,3 +1,6 @@
+import { normalizeAgentPresetCatalog, normalizeAgentPresetId, SET_AGENT_PRESET_ENDPOINT } from '../../agent-preset.js';
+import { normalizeLastMessageError } from '../../last-message-error.js';
+
 export const DINGTALK_RPC_CHANNEL = '/dingtalk';
 
 export const DINGTALK_ENDPOINTS = Object.freeze({
@@ -9,6 +12,7 @@ export const DINGTALK_ENDPOINTS = Object.freeze({
   reconnectBot: 'bot.reconnect',
   deleteBot: 'bot.delete',
   setWorkspace: 'bot.workspace.set',
+  setAgentPreset: SET_AGENT_PRESET_ENDPOINT,
 });
 
 const ACCOUNT_STATES = new Set(['connected', 'connecting', 'offline', 'error']);
@@ -157,6 +161,7 @@ function normalizeBot(value) {
     connected,
     configured: value.configured !== false,
     workspace: optionalString(value.workspace, 4_096) ?? '',
+    agentPreset: normalizeAgentPresetId(value.agentPreset),
     bot: {
       name: optionalString(bot.name, 100) ?? '钉钉机器人',
       clientIdMasked: optionalString(bot.clientIdMasked, 140) ?? '已安全保存',
@@ -174,6 +179,7 @@ function normalizeBot(value) {
       messagesReceived: nonNegativeInteger(stats.messagesReceived),
       messagesReplied: nonNegativeInteger(stats.messagesReplied),
     },
+    lastMessageError: normalizeLastMessageError(value.lastMessageError),
     error: normalizeError(value.error, 'DINGTALK_ACCOUNT_ERROR', '钉钉连接尚未就绪') ?? null,
   };
 }
@@ -200,6 +206,7 @@ export function normalizeSnapshot(value) {
     },
     provisioning: source.provisioning ? normalizeProvisioning(source.provisioning) : null,
     testMessage: normalizeTestMessage(source.testMessage),
+    agentPresetCatalog: normalizeAgentPresetCatalog(source.agentPresetCatalog),
   };
 }
 

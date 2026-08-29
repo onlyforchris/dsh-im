@@ -6,7 +6,7 @@ The DingTalk device-authorization request sequence and AI Card streaming protoco
 
 The WeCom QR-authorization request sequence is adapted from the official [`@wecom/wecom-openclaw-cli`](https://www.npmjs.com/package/@wecom/wecom-openclaw-cli) 1.1.0 package, whose npm metadata declares the ISC License. No CLI source or OpenClaw runtime is bundled in this package.
 
-The Host bundle includes [`@larksuiteoapi/node-sdk`](https://github.com/larksuite/node-sdk) 1.73.0, [`@whiskeysockets/baileys`](https://github.com/WhiskeySockets/Baileys) 7.0.0-rc14, and their [`protobufjs`](https://github.com/protobufjs/protobuf.js) 7.6.5 runtime. The Lark SDK and Baileys are licensed under the MIT License. protobufjs is licensed under the BSD 3-Clause License; both license texts are reproduced below.
+The Host bundle includes [`@larksuiteoapi/node-sdk`](https://github.com/larksuite/node-sdk) 1.73.0, [`@whiskeysockets/baileys`](https://github.com/WhiskeySockets/Baileys) 7.0.0-rc14, [`https-proxy-agent`](https://github.com/TooTallNate/proxy-agents) 5.0.1, and their [`protobufjs`](https://github.com/protobufjs/protobuf.js) 7.6.5 runtime. The Lark SDK, Baileys, and https-proxy-agent are licensed under the MIT License. protobufjs is licensed under the BSD 3-Clause License; both license texts are reproduced below.
 
 This package depends at runtime on [`dingtalk-stream`](https://github.com/open-dingtalk/dingtalk-stream-sdk-nodejs) 2.1.4, [`@wecom/aibot-node-sdk`](https://github.com/WecomTeam/aibot-node-sdk) 1.0.7, [`@tencent-connect/qqbot-nodejs`](https://github.com/tencent-connect/qqbot) 1.0.4, and [`qrcode`](https://github.com/soldair/node-qrcode) 1.5.4. These packages are licensed under the MIT License; `dingtalk-stream` is copyright 2023 钉钉开放平台团队.
 
@@ -17,6 +17,26 @@ The WhatsApp channel uses Baileys to implement WhatsApp Web linked-device QR log
 This project is an independent DeepSeek Harness integration. It does not bundle OpenClaw and is not endorsed by Tencent, WeCom, Feishu, DingTalk, QQ, Telegram, Discord, Meta, or WhatsApp.
 
 The WeChat, QQ, Telegram, Discord, and WhatsApp marks use path data published by Simple Icons under the CC0 1.0 Universal license. The Feishu, DingTalk, and WeCom marks are inline vectors used for channel identification. Product names and logos remain trademarks of their respective owners.
+
+The Host bundle also includes [semver](https://www.npmjs.com/package/semver) 7.8.5 for npm release comparison, licensed under the ISC License reproduced below.
+
+## semver license
+
+The ISC License
+
+Copyright (c) Isaac Z. Schlueter and Contributors
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR
+IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 ## Lark Node SDK license
 

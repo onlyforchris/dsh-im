@@ -5,15 +5,11 @@ import test from 'node:test';
 const CLIENT_URL = new URL('../../../plugin-src/client/channels/dingtalk/index.js', import.meta.url);
 const STYLES_URL = new URL('../../../plugin-src/client/channels/dingtalk/styles.js', import.meta.url);
 
-test('standalone client exports a reusable settings component and registration', async () => {
+test('channel client exports a reusable settings component without a standalone settings registration', async () => {
   const source = await readFile(CLIENT_URL, 'utf8');
-  assert.match(source, /export const name = 'dingtalk-settings'/);
-  assert.match(source, /export const inject = \['slots', 'connection'\]/);
   assert.match(source, /export function DingtalkSettingsTab\(\{ rpcCall \}\)/);
-  assert.match(source, /export function apply\(ctx\)/);
-  assert.match(source, /ctx\.connection\.rpc\.call\(DINGTALK_RPC_CHANNEL/);
-  assert.match(source, /id: 'dingtalk'/);
-  assert.match(source, /label: '钉钉'/);
+  assert.doesNotMatch(source, /export function apply\(ctx\)/);
+  assert.doesNotMatch(source, /settings\.plugins\.tab/);
 });
 
 test('QR guidance describes the complete official DingTalk authorization flow', async () => {
@@ -63,16 +59,9 @@ test('the QR card responds to its plugin panel width instead of the browser view
   assert.match(styles, /\.ddt-qrCopy \{ min-width: 0; overflow-wrap: anywhere; \}/);
 });
 
-test('bot metrics stay in one compact two-column row at narrow widths', async () => {
+test('bot cards do not reserve a row for repeated channel metrics', async () => {
   const styles = await readFile(STYLES_URL, 'utf8');
-  assert.match(
-    styles,
-    /\.ddt-metrics \{[^\n]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/,
-  );
-  assert.doesNotMatch(
-    styles,
-    /\.ddt-metrics \{ grid-template-columns: minmax\(0, 1fr\); \}/,
-  );
+  assert.doesNotMatch(styles, /\.ddt-metrics|\.ddt-metric/);
 });
 
 test('the narrow-panel toolbar keeps all three controls on one row', async () => {

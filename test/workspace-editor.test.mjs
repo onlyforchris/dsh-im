@@ -4,6 +4,10 @@ import * as React from 'react';
 import TestRenderer from 'react-test-renderer';
 
 import {
+  AgentPresetCatalogContext,
+  AgentPresetEditor,
+} from '../plugin-src/client/agent-preset.js';
+import {
   WorkspaceDirectoryPickerContext,
   WorkspaceEditor,
 } from '../plugin-src/client/workspace-editor.js';
@@ -178,6 +182,121 @@ test('WorkspaceEditor browses from the current path and saves the selected direc
   assert.equal(bodyNode.scrollTop, 0);
   assert.deepEqual(saved, ['/workspace/current/next project']);
   assert.equal(renderer.root.findByType('code').props.title, '/workspace/current/next project');
+});
+
+test('WorkspaceEditor navigates to arbitrary absolute paths across drives and UNC shares', async () => {
+  const start = 'C:\\Users\\alice\\project';
+  const targets = [
+    'D:\\projects\\bot',
+    '\\\\server\\share\\bot',
+    '/mnt/bot',
+  ];
+  const listed = [];
+  const saved = [];
+  const picker = {
+    async listDirectory(path) {
+      listed.push(path);
+      return {
+        path,
+        home: 'C:\\Users\\alice',
+        crumbs: [{ name: path, path, hidden: false }],
+        entries: [],
+        truncated: false,
+      };
+    },
+  };
+  let renderer;
+  await act(async () => {
+    renderer = create(React.createElement(WorkspaceEditor, {
+      workspace: start,
+      directoryPicker: picker,
+      async onSave(value) { saved.push(value); },
+    }));
+  });
+  await act(async () => {
+    renderer.root.findByProps({ className: 'dim-workspaceEdit' }).props.onClick();
+    await flushMicrotasks();
+  });
+
+  const pathForm = renderer.root.findByProps({ className: 'dim-directoryPathForm' });
+  assert.equal(renderer.root.findByProps({ className: 'dim-directoryPathInput' }).props.value, start);
+  for (const target of targets) {
+    await act(async () => {
+      renderer.root.findByProps({ className: 'dim-directoryPathInput' }).props.onChange({
+        target: { value: target },
+      });
+    });
+    assert.equal(
+      renderer.root.findByProps({ className: 'dim-directoryPickerPrimary' }).props.disabled,
+      true,
+    );
+    await act(async () => {
+      pathForm.props.onSubmit({ preventDefault() {} });
+      await flushMicrotasks();
+    });
+    assert.equal(renderer.root.findByProps({ className: 'dim-directoryPathInput' }).props.value, target);
+    assert.equal(
+      renderer.root.findByProps({ className: 'dim-directoryPickerPrimary' }).props.disabled,
+      false,
+    );
+  }
+
+  assert.deepEqual(listed, [start, ...targets]);
+  await act(async () => {
+    renderer.root.findByProps({ className: 'dim-directoryPickerPrimary' }).props.onClick();
+    await flushMicrotasks();
+  });
+  assert.deepEqual(saved, [targets.at(-1)]);
+});
+
+test('WorkspaceEditor keeps the prior folder unselectable when a typed path cannot be read', async () => {
+  const start = 'C:\\Users\\alice';
+  const missing = 'Z:\\missing';
+  const picker = {
+    async listDirectory(path) {
+      if (path === missing) {
+        const error = new Error('cannot read requested folder');
+        error.rpcError = { code: 'directory-unreadable', message: error.message, details: { path } };
+        throw error;
+      }
+      return {
+        path,
+        home: start,
+        crumbs: [{ name: 'Home', path, hidden: false }],
+        entries: [],
+        truncated: false,
+      };
+    },
+  };
+  let renderer;
+  await act(async () => {
+    renderer = create(React.createElement(WorkspaceEditor, {
+      workspace: start,
+      directoryPicker: picker,
+      async onSave() { throw new Error('must not save'); },
+    }));
+  });
+  await act(async () => {
+    renderer.root.findByProps({ className: 'dim-workspaceEdit' }).props.onClick();
+    await flushMicrotasks();
+  });
+  await act(async () => {
+    renderer.root.findByProps({ className: 'dim-directoryPathInput' }).props.onChange({
+      target: { value: missing },
+    });
+    await flushMicrotasks();
+  });
+  await act(async () => {
+    renderer.root.findByProps({ className: 'dim-directoryPathForm' }).props.onSubmit({ preventDefault() {} });
+    await flushMicrotasks();
+  });
+
+  assert.equal(textOf(renderer.root.findByProps({ role: 'alert' })), 'cannot read requested folder');
+  assert.equal(renderer.root.findByProps({ className: 'dim-directoryPathInput' }).props.value, missing);
+  assert.equal(
+    renderer.root.findByProps({ className: 'dim-directoryPickerPrimary' }).props.disabled,
+    true,
+  );
 });
 
 test('WorkspaceEditor keeps the picker open and presents a rejected workspace error', async () => {
@@ -382,6 +501,11 @@ test('WorkspaceEditor never translates Host filesystem names in the English UI',
   const directory = renderer.root.findByProps({ title: '/workspace/current/微信' });
   assert.equal(textOf(directory), '微信');
   assert.doesNotMatch(textOf(directory), /WeChat/);
+  assert.equal(
+    renderer.root.findByProps({ className: 'dim-directoryPathInput' }).props.placeholder,
+    'Enter a full absolute path on the Host',
+  );
+  assert.ok(buttonNamed(renderer.root, 'Go'));
   await act(async () => { renderer.unmount(); });
 });
 
@@ -661,5 +785,150 @@ test('an older reconnect snapshot cannot resurrect a bot deleted by a newer muta
   staleReconnect.resolve({ ok: true, value: initialSnapshot });
   await act(async () => { await flushMicrotasks(); });
   assert.equal(renderer.root.findAllByProps({ 'data-bot-id': 'discord_first' }).length, 0);
+  await act(async () => { renderer.unmount(); });
+});
+
+const PRESET_CATALOG = {
+  defaultId: 'default',
+  items: [
+    { id: 'coding', label: 'Coding' },
+    { id: 'default', label: 'Default' },
+  ],
+};
+
+function optionValues(select) {
+  return select.children.map((option) => option.props.value);
+}
+
+test('AgentPresetEditor lists Host presets and moves its session guidance into accessible help', () => {
+  const renderer = create(React.createElement(
+    AgentPresetCatalogContext.Provider,
+    { value: PRESET_CATALOG },
+    React.createElement(AgentPresetEditor, {
+      agentPreset: 'coding',
+      onSave() {},
+    }),
+  ));
+  const select = renderer.root.findByProps({ className: 'dim-presetSelect' });
+  assert.equal(select.props.value, 'coding');
+  assert.deepEqual(optionValues(select), ['', 'coding', 'default']);
+  assert.equal(textOf(select.children[0]), '跟随 Host 默认');
+  assert.equal(textOf(select.children[1]), 'Coding（coding）');
+  const helpButton = renderer.root.findByProps({
+    'aria-label': '查看 Agent Preset 说明',
+  });
+  const tooltip = renderer.root.findByProps({ role: 'tooltip' });
+  assert.equal(helpButton.props.type, 'button');
+  assert.ok(tooltip.props.id);
+  assert.equal(helpButton.props['aria-describedby'], tooltip.props.id);
+  assert.equal(
+    textOf(tooltip),
+    '只影响新建会话；若当前聊天已有会话，先发送 /new，再发送普通消息生效。',
+  );
+  assert.equal(renderer.root.findAllByType('small').length, 0);
+  renderer.unmount();
+});
+
+test('AgentPresetEditor marks a removed current preset and still allows clearing it', async () => {
+  const saved = [];
+  const renderer = create(React.createElement(
+    AgentPresetCatalogContext.Provider,
+    { value: PRESET_CATALOG },
+    React.createElement(AgentPresetEditor, {
+      agentPreset: 'removed-preset',
+      onSave(value) { saved.push(value); },
+    }),
+  ));
+  const select = renderer.root.findByProps({ className: 'dim-presetSelect' });
+  assert.equal(select.props.value, 'removed-preset');
+  assert.deepEqual(optionValues(select), ['', 'coding', 'default', 'removed-preset']);
+  assert.equal(textOf(select.children[3]), 'removed-preset（已不可用）');
+  assert.equal(
+    textOf(renderer.root.findByProps({ role: 'status' })),
+    '当前 Agent Preset 已不可用，请选择其他 Preset 或跟随 Host 默认。',
+  );
+
+  await act(async () => {
+    select.props.onChange({ target: { value: '' } });
+    await flushMicrotasks();
+  });
+  assert.deepEqual(saved, [null]);
+  renderer.unmount();
+});
+
+test('AgentPresetEditor saves a selected preset and can follow the Host default', async () => {
+  const saved = [];
+  function Harness() {
+    const [agentPreset, setAgentPreset] = React.useState('');
+    return React.createElement(AgentPresetEditor, {
+      agentPreset,
+      onSave(value) {
+        saved.push(value);
+        setAgentPreset(value ?? '');
+      },
+    });
+  }
+  const renderer = create(React.createElement(
+    AgentPresetCatalogContext.Provider,
+    { value: PRESET_CATALOG },
+    React.createElement(Harness),
+  ));
+  const select = renderer.root.findByProps({ className: 'dim-presetSelect' });
+  await act(async () => {
+    select.props.onChange({ target: { value: 'coding' } });
+    await flushMicrotasks();
+  });
+  await act(async () => {
+    renderer.root.findByProps({ className: 'dim-presetSelect' })
+      .props.onChange({ target: { value: '' } });
+    await flushMicrotasks();
+  });
+  assert.deepEqual(saved, ['coding', null]);
+  renderer.unmount();
+});
+
+test('Discord settings save an Agent Preset through bot.preset.set', async (t) => {
+  const previousWindow = globalThis.window;
+  globalThis.window = { setInterval() { return 1; }, clearInterval() {} };
+  t.after(() => {
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+  });
+  const snapshot = {
+    ...discordSnapshot('/workspace/current'),
+    agentPresetCatalog: PRESET_CATALOG,
+  };
+  const calls = [];
+  const rpcCall = async (endpoint, payload) => {
+    calls.push({ endpoint, payload });
+    if (endpoint === 'connection.status') return { ok: true, value: snapshot };
+    if (endpoint === 'bot.preset.set') {
+      return {
+        ok: true,
+        value: {
+          ...snapshot,
+          bots: [{ ...snapshot.bots[0], agentPreset: payload.agentPreset }],
+        },
+      };
+    }
+    throw new Error(`Unexpected endpoint: ${endpoint}`);
+  };
+
+  let renderer;
+  await act(async () => {
+    renderer = create(React.createElement(DiscordSettingsTab, { rpcCall }));
+    await flushMicrotasks();
+  });
+  const card = renderer.root.findByProps({ 'data-bot-id': 'discord_test' });
+  await act(async () => {
+    card.findByProps({ className: 'dim-presetSelect' })
+      .props.onChange({ target: { value: 'coding' } });
+    await flushMicrotasks();
+  });
+
+  assert.deepEqual(calls.find((call) => call.endpoint === 'bot.preset.set')?.payload, {
+    botId: 'discord_test',
+    agentPreset: 'coding',
+  });
   await act(async () => { renderer.unmount(); });
 });

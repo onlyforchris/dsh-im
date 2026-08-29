@@ -51,6 +51,7 @@ test('QQ runtime waits for gateway ready, installs typing, and stops its client'
   assert.equal(bot.middlewares[0].options.keepAlive, true);
   assert.equal(bot.middlewares[0].options.predicate({ message: { senderId: 'owner' } }), true);
   assert.equal(bot.middlewares[0].options.predicate({ message: { senderId: 'other' } }), false);
+  assert.equal(botOptions.markdownSupport, false);
   botOptions.logger.debug('raw gateway payload');
   botOptions.logger.info('gateway ready');
   assert.deepEqual(sdkLogs, [['info', 'gateway ready']]);
@@ -183,4 +184,47 @@ test('QQ runtime aborts an in-flight Harness interaction when stopped', async ()
   });
   await runtime.stop();
   assert.equal(askSignal.aborted, true);
+});
+
+test('QQ runtime enables result-file delivery without per-bot configuration', async () => {
+  const bot = new FakeBot();
+  const askObserved = deferred();
+  let onArtifact;
+  const runtime = new QqRuntime({
+    config: { botId: 'qq_bot', appId: 'app', ownerUserOpenid: 'owner' },
+    appSecret: 'secret',
+    harness: {
+      ensureRunning: async () => true,
+      sessionExists: async () => true,
+      ask: async (_sessionId, _text, options) => {
+        onArtifact = options.onArtifact;
+        askObserved.resolve();
+        return '完成';
+      },
+    },
+    state: {
+      hasSeen: () => false,
+      markSeen: async () => {},
+      sessionFor: () => 'session-existing',
+      setSession: async () => {},
+      clearSession: async () => {},
+    },
+    createBot: () => bot,
+    typingMiddleware: () => 'typing',
+    connectTimeoutMs: 100,
+  });
+
+  await runtime.start();
+  bot.emit('message', {}, {
+    kind: 'c2c',
+    rawEventType: 'C2C_MESSAGE_CREATE',
+    senderId: 'owner',
+    senderIsBot: false,
+    content: '生成文件',
+    messageId: 'qq-artifact-gate',
+    replyTarget: { scope: 'c2c', targetId: 'owner', msgId: 'qq-artifact-gate' },
+  });
+  await askObserved.promise;
+  assert.equal(typeof onArtifact, 'function');
+  await runtime.stop();
 });

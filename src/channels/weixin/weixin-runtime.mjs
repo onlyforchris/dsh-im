@@ -1,12 +1,25 @@
-import { WeixinApiError } from './weixin-api.mjs';
+import { DEFAULT_WEIXIN_MAX_MESSAGE_CHARS, WeixinApiError } from './weixin-api.mjs';
 import { createWeixinBridgeStatus, WeixinHarnessBridge } from './weixin-bridge.mjs';
 import {
   connectionTestTarget,
   connectionTestTargetUnavailable,
-  latestBoundConversation,
 } from '../shared/connection-test.mjs';
+import { t } from '../shared/i18n.mjs';
 
 const DEFAULT_START_RETRY_DELAYS_MS = Object.freeze([250, 1_000, 3_000]);
+const HARNESS_HEALTH_ERROR_CODES = new Set([
+  'harness-connect-failed',
+  'harness-timeout',
+  'harness-auth-required',
+  'harness-proxy-auth-required',
+  'harness-loopback-forbidden',
+  'harness-host-untrusted',
+  'harness-request-forbidden',
+  'harness-api-not-found',
+  'harness-http-failed',
+  'harness-response-invalid',
+  'harness-rpc-rejected',
+]);
 
 function startRetryDelays(value) {
   if (value === undefined) return [...DEFAULT_START_RETRY_DELAYS_MS];
@@ -33,6 +46,13 @@ function runtimeStartError(code, cause) {
   return error;
 }
 
+function harnessHealthError(cause) {
+  const code = HARNESS_HEALTH_ERROR_CODES.has(cause?.code)
+    ? cause.code
+    : 'harness-check-unknown-failed';
+  return runtimeStartError(code, cause);
+}
+
 function delay(ms, signal) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
@@ -51,6 +71,23 @@ function delay(ms, signal) {
     };
     signal?.addEventListener('abort', onAbort, { once: true });
   });
+}
+
+export function orderWeixinMessages(messages) {
+  if (!Array.isArray(messages) || messages.length < 2) return Array.isArray(messages) ? messages : [];
+  const orderField = ['seq', 'create_time_ms'].find((field) => messages.every((message) => (
+    (typeof message?.[field] === 'number' && Number.isFinite(message[field]))
+      || (typeof message?.[field] === 'string'
+        && message[field].trim()
+        && Number.isFinite(Number(message[field])))
+  )));
+  if (!orderField) return messages;
+  return messages
+    .map((message, index) => ({ message, index, order: Number(message[orderField]) }))
+    .sort((left, right) => (
+      left.order - right.order || left.index - right.index
+    ))
+    .map(({ message }) => message);
 }
 
 export function createWeixinRuntimeStatus() {
@@ -74,9 +111,8 @@ export class WeixinRuntime {
   #logger;
   #replyTimeoutMs;
   #maxMessageChars;
-  #startRetryDelaysMs;
   #sourceChannelLabel;
-  #workspaceSessionCommandsEnabled;
+  #startRetryDelaysMs;
   #status = createWeixinRuntimeStatus();
   #bridge = null;
   #abortController = null;
@@ -87,14 +123,13 @@ export class WeixinRuntime {
     api,
     config,
     token,
+    sourceChannelLabel,
     harness,
     state,
     logger = console,
     replyTimeoutMs = 600_000,
-    maxMessageChars = 4_000,
+    maxMessageChars = DEFAULT_WEIXIN_MAX_MESSAGE_CHARS,
     startRetryDelaysMs,
-    sourceChannelLabel,
-    workspaceSessionCommandsEnabled = true,
   }) {
     if (!api || !config || !token || !harness || !state) {
       throw new TypeError('WeixinRuntime requires API, account, token, Harness, and state');
@@ -107,9 +142,8 @@ export class WeixinRuntime {
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#maxMessageChars = maxMessageChars;
-    this.#startRetryDelaysMs = startRetryDelays(startRetryDelaysMs);
     this.#sourceChannelLabel = sourceChannelLabel;
-    this.#workspaceSessionCommandsEnabled = workspaceSessionCommandsEnabled !== false;
+    this.#startRetryDelaysMs = startRetryDelays(startRetryDelaysMs);
   }
 
   get status() {
@@ -134,7 +168,7 @@ export class WeixinRuntime {
       try {
         await this.#harness.ensureRunning();
       } catch (error) {
-        throw runtimeStartError('harness-unreachable', error);
+        throw harnessHealthError(error);
       }
       this.#status.harnessReachable = true;
       await this.#notifyStart();
@@ -152,7 +186,6 @@ export class WeixinRuntime {
         replyTimeoutMs: this.#replyTimeoutMs,
         maxMessageChars: this.#maxMessageChars,
         sourceChannelLabel: this.#sourceChannelLabel,
-        workspaceSessionCommandsEnabled: this.#workspaceSessionCommandsEnabled,
         signal,
       });
       this.#status.ready = true;
@@ -213,7 +246,7 @@ export class WeixinRuntime {
           const code = response.errcode ?? response.ret;
           throw new WeixinApiError(
             code === -14 ? 'stale-token' : 'updates-rejected',
-            code === -14 ? '微信登录凭据已失效，请移除账号后重新扫码。' : '微信消息同步请求被拒绝。',
+            code === -14 ? t('微信登录凭据已失效，请移除账号后重新扫码。') : t('微信消息同步请求被拒绝。'),
           );
         }
         consecutiveFailures = 0;
@@ -222,7 +255,7 @@ export class WeixinRuntime {
         this.#status.lastCheckedAt = Date.now();
         this.#status.lastError = null;
 
-        for (const message of response?.msgs ?? []) {
+        for (const message of orderWeixinMessages(response?.msgs)) {
           void this.#bridge.accept(message).catch((error) => {
             if (signal.aborted) return;
             this.#logger.error?.(
@@ -256,6 +289,7 @@ export class WeixinRuntime {
     this.#abortController?.abort();
     this.#abortController = null;
     this.#monitor = null;
+    await bridge?.close?.();
     await monitor?.catch(() => undefined);
     await bridge?.waitForIdle();
     this.#bridge = null;
@@ -275,27 +309,50 @@ export class WeixinRuntime {
     return this.status;
   }
 
+  async sendConnectionTest(text) {
+    const remembered = connectionTestTarget(this.#state);
+    const toUserId = typeof remembered?.toUserId === 'string' && remembered.toUserId.trim()
+      ? remembered.toUserId.trim()
+      : typeof this.#config.ownerUserId === 'string' && this.#config.ownerUserId.trim()
+        ? this.#config.ownerUserId.trim()
+        : null;
+    if (!toUserId) throw connectionTestTargetUnavailable(t('微信机器人'));
+    if (!this.#status.ready || !this.#abortController) {
+      throw new Error('Weixin runtime is not connected');
+    }
+    await this.#api.sendText({
+      baseUrl: this.#config.baseUrl,
+      token: this.#token,
+      toUserId,
+      text,
+      signal: this.#abortController.signal,
+    });
+    return { sent: true };
+  }
+
+  /**
+   * 发送主动通知（S5 outbox 消费路径，04_13 P0-B）。
+   * 目标：记住的私聊 toUserId ?? 账号 ownerUserId；微信图片链路不达，
+   * media 存在时按 fork 0.16.7 决策统一 text-fallback，通知事实不因表现层失败丢失。
+   */
   async sendNotification(text, media) {
     const remembered = connectionTestTarget(this.#state);
     const toUserId = typeof remembered?.toUserId === 'string' && remembered.toUserId.trim()
       ? remembered.toUserId.trim()
       : typeof this.#config.ownerUserId === 'string' && this.#config.ownerUserId.trim()
         ? this.#config.ownerUserId.trim()
-        : latestBoundConversation(this.#state, 'p2p:')?.id ?? null;
-    if (!toUserId) throw connectionTestTargetUnavailable('微信机器人');
+        : null;
+    if (!toUserId) throw connectionTestTargetUnavailable(t('微信机器人'));
+    if (!this.#status.ready || !this.#abortController) {
+      throw new Error('Weixin runtime is not connected');
+    }
     const contextToken = typeof remembered?.contextToken === 'string' && remembered.contextToken.trim()
       ? remembered.contextToken.trim()
       : undefined;
     const runId = typeof remembered?.runId === 'string' && remembered.runId.trim()
       ? remembered.runId.trim()
       : undefined;
-    if (!this.#status.ready || !this.#abortController) {
-      throw new Error('Weixin runtime is not connected');
-    }
-    // 纯文本发送（退回 0.16.5 已验证可送达的实现）。
-    // 早期 sendImage/CDN 上传链路有缺陷（CDN 500），
-    // 且图片链路不达；文本 8/26 前一直可送达。故通知统一走 sendText，忽略 media。
-    const receipt = await this.#api.sendText({
+    await this.#api.sendText({
       baseUrl: this.#config.baseUrl,
       token: this.#token,
       toUserId,
@@ -304,14 +361,6 @@ export class WeixinRuntime {
       runId,
       signal: this.#abortController.signal,
     });
-    return {
-      sent: true,
-      mode: media ? 'text-fallback' : 'text',
-      ...(receipt && typeof receipt === 'object' ? { provider: receipt } : {}),
-    };
-  }
-
-  async sendConnectionTest(text) {
-    return this.sendNotification(text);
+    return { sent: true, mode: media ? 'text-fallback' : 'text' };
   }
 }

@@ -110,6 +110,145 @@ test('Host exposes configured offline as a redacted capability fact', async () =
   assert.equal('credentials' in result.value, false);
 });
 
+test('Host exposes only browser-safe Agent Preset fields in status and update responses', async () => {
+  let selectedPreset = 'marketing-jeep';
+  const calls = [];
+  const current = () => status({
+    schemaVersion: 2,
+    revision: 3,
+    configured: true,
+    agentPresetCatalog: {
+      defaultId: 'standard',
+      root: 'private-preset-root',
+      failures: [{ message: 'private-catalog-failure' }],
+      items: [
+        {
+          id: 'standard',
+          name: 'Standard',
+          path: 'private-standard-path',
+          trust: 'private-trust-level',
+        },
+        {
+          id: 'marketing-jeep',
+          label: '营销吉普',
+          error: { message: 'private-preset-error' },
+        },
+        {
+          id: 'broken-preset',
+          label: 'Broken',
+          broken: { message: 'private-broken-reason' },
+        },
+        { id: 'INVALID', label: 'invalid-item-must-be-filtered' },
+        { id: 'standard', label: 'duplicate-item-must-be-filtered' },
+      ],
+    },
+    bots: [{
+      botId: 'bot_safe',
+      phase: 'connected',
+      connected: true,
+      configured: true,
+      agentPreset: selectedPreset,
+      bot: { name: '安全机器人', domain: 'feishu' },
+      connection: {
+        ready: true,
+        feishuLongConnectionState: 'connected',
+        harnessReachable: true,
+      },
+    }],
+  });
+  const controller = {
+    status: async () => current(),
+    startRegistration: async () => current(),
+    cancelRegistration: async () => current(),
+    disconnect: async () => status(),
+    updateAgentPreset: async (botId, agentPreset) => {
+      calls.push({ botId, agentPreset });
+      selectedPreset = agentPreset;
+      return current();
+    },
+  };
+  const fx = await rpcFixture(controller);
+
+  const listed = await fx.registration.handler(FEISHU_ENDPOINTS.status, {}, signal());
+  assert.equal(listed.ok, true);
+  assert.equal(listed.value.bots[0].agentPreset, 'marketing-jeep');
+  assert.deepEqual(listed.value.agentPresetCatalog, {
+    defaultId: 'standard',
+    items: [
+      { id: 'standard', label: 'Standard' },
+      { id: 'marketing-jeep', label: '营销吉普' },
+    ],
+  });
+  assert.doesNotMatch(
+    JSON.stringify(listed),
+    /private-preset-root|private-catalog-failure|private-standard-path|private-trust-level|private-preset-error|private-broken-reason|invalid-item|duplicate-item/,
+  );
+
+  const cleared = await fx.registration.handler(
+    FEISHU_ENDPOINTS.setAgentPreset,
+    { botId: 'bot_safe', agentPreset: null },
+    signal(),
+  );
+  assert.equal(cleared.ok, true);
+  assert.deepEqual(calls, [{ botId: 'bot_safe', agentPreset: null }]);
+  assert.equal(cleared.value.bots[0].agentPreset, null);
+  assert.deepEqual(cleared.value.agentPresetCatalog, listed.value.agentPresetCatalog);
+  assert.doesNotMatch(JSON.stringify(cleared), /private-|invalid-item|duplicate-item/);
+
+  await fx.dispose();
+});
+
+test('Host validates and updates the Feishu group response mode', async () => {
+  let mode = 'mention';
+  const current = () => status({
+    schemaVersion: 2,
+    revision: 4,
+    configured: true,
+    bots: [{
+      botId: 'bot_mode',
+      phase: 'connected',
+      connected: true,
+      configured: true,
+      groupResponseMode: mode,
+      bot: { name: '模式机器人', domain: 'feishu' },
+      connection: {
+        ready: true,
+        feishuLongConnectionState: 'connected',
+        harnessReachable: true,
+      },
+    }],
+  });
+  const controller = {
+    status: async () => current(),
+    startRegistration: async () => current(),
+    cancelRegistration: async () => current(),
+    disconnect: async () => status(),
+    updateGroupResponseMode: async (botId, value) => {
+      assert.equal(botId, 'bot_mode');
+      mode = value;
+      return current();
+    },
+  };
+  const fx = await rpcFixture(controller);
+
+  const updated = await fx.registration.handler(
+    FEISHU_ENDPOINTS.setGroupResponseMode,
+    { botId: 'bot_mode', groupResponseMode: 'all' },
+    signal(),
+  );
+  assert.equal(updated.ok, true);
+  assert.equal(updated.value.bots[0].groupResponseMode, 'all');
+
+  const invalid = await fx.registration.handler(
+    FEISHU_ENDPOINTS.setGroupResponseMode,
+    { botId: 'bot_mode', groupResponseMode: 'sometimes' },
+    signal(),
+  );
+  assert.equal(invalid.ok, false);
+  assert.equal(invalid.error.code, 'bad-request');
+  await fx.dispose();
+});
+
 test('RPC dispatch matches every endpoint in client/api.js', async () => {
   const calls = [];
   let current = status({
@@ -254,6 +393,78 @@ test('callback repair begins for exactly one bot and returns only a safe officia
   ]) {
     const invalid = await fx.registration.handler(
       FEISHU_ENDPOINTS.beginCallbackRepair,
+      payload,
+      signal(),
+    );
+    assert.equal(invalid.ok, false);
+    assert.equal(invalid.error.code, 'bad-request');
+    assert.doesNotMatch(JSON.stringify(invalid), /must-not-leak|\.\.\/target/);
+  }
+  await fx.dispose();
+});
+
+test('group-message permission begins for one existing bot and returns a safe official QR projection', async () => {
+  const calls = [];
+  const permission = status({
+    schemaVersion: 2,
+    phase: 'registering',
+    configured: true,
+    registration: {
+      state: 'qr_ready',
+      attempt: 'reg_group_permission',
+      operation: 'group_message_permission',
+      botId: 'bot_target',
+      qrCodeUrl: 'https://open.feishu.cn/page/launcher?tp=sdk&clientID=cli_target&addons=encoded&user_code=opaque',
+      expiresAt: Date.now() + 60_000,
+    },
+    bots: [{
+      botId: 'bot_target',
+      connected: true,
+      configured: true,
+      groupResponseMode: 'mention',
+      groupMessagePermissionGranted: false,
+      bot: { name: '目标机器人', appIdMasked: 'cli_tar••••rget', domain: 'feishu' },
+      connection: { ready: true, feishuLongConnectionState: 'connected', harnessReachable: true },
+    }],
+  });
+  const controller = {
+    status: async () => permission,
+    registrationStatus: async () => permission,
+    startRegistration: async () => status(),
+    startGroupMessagePermission: async (botId) => { calls.push(botId); return permission; },
+    cancelRegistration: async () => permission,
+    disconnect: async () => status(),
+  };
+  const fx = await rpcFixture(controller);
+  const result = await fx.registration.handler(
+    FEISHU_ENDPOINTS.beginGroupMessagePermission,
+    { botId: 'bot_target' },
+    signal(),
+  );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(calls, ['bot_target']);
+  assert.equal(result.value.operation, 'group_message_permission');
+  assert.equal(result.value.botId, 'bot_target');
+  assert.equal(
+    result.value.verificationUrl,
+    'https://open.feishu.cn/page/launcher?tp=sdk&clientID=cli_target&addons=encoded&user_code=opaque',
+  );
+  assert.match(result.value.qrCodeDataUrl, /^data:image\/png;base64,/);
+  assert.doesNotMatch(JSON.stringify(result), /client_secret|appSecret/);
+
+  const restored = await fx.registration.handler(FEISHU_ENDPOINTS.status, {}, signal());
+  assert.equal(restored.value.provisioning.operation, 'group_message_permission');
+  assert.equal(restored.value.provisioning.botId, 'bot_target');
+  assert.equal(restored.value.bots[0].groupMessagePermissionGranted, false);
+
+  for (const payload of [
+    {},
+    { botId: '../target' },
+    { botId: 'bot_target', appSecret: 'must-not-leak' },
+  ]) {
+    const invalid = await fx.registration.handler(
+      FEISHU_ENDPOINTS.beginGroupMessagePermission,
       payload,
       signal(),
     );
@@ -913,8 +1124,13 @@ test('DSH credential adapter stores refs off the browser plane and clears them',
   assert.equal(await store.configured(), false);
 });
 
-test('production assembly needs only ctx credentials and the active DSH webServer', async () => {
+test('production assembly uses ctx credentials and the active Host apiProxy without a webServer', async () => {
   const constructed = {};
+  const httpInstance = { request: async () => ({}) };
+  const wsAgent = {
+    addRequest() {},
+    destroy() { constructed.wsAgentDestroyed = true; },
+  };
   class FakeConfigStore {
     constructor(path) { constructed.configPath = path; }
     async load() { return this; }
@@ -941,21 +1157,31 @@ test('production assembly needs only ctx credentials and the active DSH webServe
     async close() { constructed.closed = true; }
   }
   const credentials = {};
+  const apiProxy = {};
   const production = await createProductionController({
     credentials,
-    webServer: { port: 43123, host: '127.0.0.1' },
+    apiProxy,
     logger: console,
   }, {
     dshHome: '/tmp/dsh-feishu-host-test',
     workspace: '/tmp/dsh-feishu-workspace',
   }, {
-    lark: { registerApp: async () => ({}) },
+    lark: { registerApp: async () => ({}), defaultHttpInstance: httpInstance },
     Controller: FakeController,
     ConfigStore: FakeConfigStore,
     StateStore: FakeStateStore,
     HarnessClient: FakeHarness,
     FeishuRuntime: FakeRuntime,
-    verifyFeishuApp: async () => ({}),
+    verifyFeishuApp: async (options) => {
+      constructed.verifyOptions = options;
+      return {};
+    },
+    proxyEnv: { HTTPS_PROXY: 'http://proxy.test:8080' },
+    createProxyAgent: (proxyUrl) => {
+      constructed.wsAgentCreated = (constructed.wsAgentCreated ?? 0) + 1;
+      constructed.wsProxyUrl = proxyUrl;
+      return wsAgent;
+    },
   });
 
   assert.equal(constructed.initialized, undefined);
@@ -963,7 +1189,12 @@ test('production assembly needs only ctx credentials and the active DSH webServe
   assert.equal(constructed.initialized, true);
   assert.equal(constructed.harnessReadyChecks, 1);
   assert.equal(constructed.controller.credentials, credentials);
-  assert.equal(String(constructed.harness.baseUrl), 'http://127.0.0.1:43123/');
+  await constructed.controller.verifyApp({ appId: 'cli_verify', appSecret: 'verify-secret' });
+  assert.equal(constructed.verifyOptions.httpInstance, httpInstance);
+  assert.equal(constructed.wsAgentCreated, 1);
+  assert.equal(constructed.wsProxyUrl, 'http://proxy.test:8080');
+  assert.equal(constructed.harness.apiProxy, apiProxy);
+  assert.equal(Object.hasOwn(constructed.harness, 'baseUrl'), false);
   assert.equal(constructed.harness.autostart, false);
   assert.match(constructed.configPath, /integrations\/dsh-feishu\/config\.json$/);
 
@@ -977,6 +1208,7 @@ test('production assembly needs only ctx credentials and the active DSH webServe
   });
   assert.match(constructed.statePath, /integrations\/dsh-feishu\/state\.json$/);
   assert.equal(constructed.runtime.appSecret, 'host-only');
+  assert.equal(constructed.runtime.wsAgent, wsAgent);
   const repair = { start() {}, status() {}, cancel() {} };
   await constructed.controller.createRuntime({
     botId: 'bot_alpha',
@@ -993,6 +1225,7 @@ test('production assembly needs only ctx credentials and the active DSH webServe
   const alphaState = constructed.runtime.state;
   assert.equal(constructed.runtime.botId, 'bot_alpha');
   assert.equal(constructed.runtime.repair, repair);
+  assert.equal(Object.hasOwn(constructed.runtime, 'outboundArtifactsEnabled'), false);
   await constructed.controller.createRuntime({
     botId: 'bot_beta',
     config: {
@@ -1005,12 +1238,14 @@ test('production assembly needs only ctx credentials and the active DSH webServe
     appSecret: 'beta-secret',
   });
   const betaState = constructed.runtime.state;
+  assert.equal(Object.hasOwn(constructed.runtime, 'outboundArtifactsEnabled'), false);
   assert.notEqual(alphaState, betaState);
   assert.ok(constructed.statePaths.some((path) => /bots\/bot_alpha\/state\.json$/.test(path)));
   assert.ok(constructed.statePaths.some((path) => /bots\/bot_beta\/state\.json$/.test(path)));
   await production.close();
   assert.equal(constructed.closed, true);
   assert.equal(constructed.harnessStopped, true);
+  assert.equal(constructed.wsAgentDestroyed, true);
 });
 
 test('a corrupt legacy state file cannot prevent a healthy v2 bot from starting', async () => {
@@ -1058,17 +1293,18 @@ test('a corrupt legacy state file cannot prevent a healthy v2 bot from starting'
       async set(ref, value) { secrets.set(ref, value); },
       async unset(ref) { secrets.delete(ref); },
     },
-    webServer: { port: 43124 },
+    apiProxy: {},
     logger: console,
   }, { dataDir, workspace: dataDir }, {
     lark: { registerApp: async () => ({}) },
     HarnessClient: FakeHarness,
     FeishuRuntime: FakeRuntime,
     verifyFeishuApp: async () => ({}),
+    proxyEnv: {},
   });
 
   await production.ready;
-  const statusValue = production.controller.status();
+  const statusValue = await production.controller.status();
   assert.equal(statusValue.bots.find((entry) => entry.botId === 'bot_legacy').phase, 'error');
   assert.equal(statusValue.bots.find((entry) => entry.botId === 'bot_healthy').connected, true);
   assert.equal(statusValue.totals.connected, 1);

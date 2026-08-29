@@ -1,0 +1,1013 @@
+commit f8645d9fe8791b89ad6e44cd4cfa8c66a2e504eb
+Author: Chris <zhangjim117@163.com>
+Date:   Fri Aug 21 16:46:30 2026 +0800
+
+    feat: source-channel prompt tags, channel status rail, and fork branding
+    
+    - Tag inbound prompts with channel labels so agents can attribute work across channels (e.g. unified work logs); wired opt-in via runtime/production options so existing tests keep default behavior
+    
+    - Settings page: connection status dot per channel in the rail plus connected/offline/unconfigured summary, polled from connection.status
+    
+    - Reorder channels by actual usage (feishu/dingtalk/wecom first) and default-select Feishu
+    
+    - Point the header GitHub link at the personal fork; keep the settings.section top-level registration
+
+diff --git a/plugin-src/client/i18n.js b/plugin-src/client/i18n.js
+index d23f3e8..7a8abec 100644
+--- a/plugin-src/client/i18n.js
++++ b/plugin-src/client/i18n.js
+@@ -55,6 +55,10 @@ const EN = Object.freeze({
+   '本机暂时无法访问 AI Office。': 'AI Office cannot currently be reached from this machine.',
+   'AI Office 连接已中断。': 'The AI Office connection was interrupted.',
+   '帮助与反馈 · 前往 GitHub': 'Help & feedback · Open GitHub',
++  '已连接': 'Connected',
++  '已配置，未连接': 'Configured, not connected',
++  '未配置': 'Not configured',
++  '已连接 ${statusCounts.connected} · 未连接 ${statusCounts.offline} · 未配置 ${unconfigured}': '${statusCounts.connected} connected · ${statusCounts.offline} offline · ${unconfigured} not configured',
+   '微信': 'WeChat',
+   '飞书': 'Feishu',
+   '钉钉': 'DingTalk',
+@@ -482,7 +486,9 @@ function channelName(value) {
+ }
+ 
+ function translateDynamic(text) {
+-  let match = /^(\d+) \/ (\d+) 在线$/.exec(text);
++  let match = /^已连接 (\d+) · 未连接 (\d+) · 未配置 (\d+)$/.exec(text);
++  if (match) return `${match[1]} connected · ${match[2]} offline · ${match[3]} not configured`;
++  match = /^(\d+) \/ (\d+) 在线$/.exec(text);
+   if (match) return `${match[1]}/${match[2]} online`;
+   match = /^已接入 (\d+) 个机器人，其中 (\d+) 个在线$/.exec(text);
+   if (match) return `${match[2]} of ${match[1]} bots online`;
+diff --git a/plugin-src/client/index.js b/plugin-src/client/index.js
+index 57c8ca7..578ed27 100644
+--- a/plugin-src/client/index.js
++++ b/plugin-src/client/index.js
+@@ -48,11 +48,12 @@ import { WorkspaceDirectoryPickerContext } from './workspace-editor.js';
+ export const name = 'im-settings';
+ export const inject = ['slots', 'connection', 'locale', 'workspaces'];
+ 
++// 个人 fork 调整：按实际使用频率排序（飞书/钉钉/企微为主力渠道）。
+ const CHANNELS = Object.freeze([
+-  { id: 'weixin', label: '微信' },
+   { id: 'feishu', label: '飞书' },
+   { id: 'dingtalk', label: '钉钉' },
+   { id: 'wecom', label: '企业微信' },
++  { id: 'weixin', label: '微信' },
+   { id: 'qq', label: 'QQ' },
+   { id: 'slack', label: 'Slack' },
+   { id: 'telegram', label: 'Telegram' },
+@@ -61,6 +62,67 @@ const CHANNELS = Object.freeze([
+   { id: 'office', label: 'AI Office', note: '（实验功能）' },
+ ]);
+ 
++const CHANNEL_STATUS_LABELS = Object.freeze({
++  connected: '已连接',
++  offline: '已配置，未连接',
++  unconfigured: '未配置',
++  unknown: '状态未知',
++});
++
++function unwrapStatusValue(result) {
++  if (result && typeof result === 'object' && result.ok === true) return result.value;
++  return result;
++}
++
++function channelStatusFromSnapshot(value) {
++  const bots = Array.isArray(value?.bots) ? value.bots : [];
++  if (bots.length > 0) {
++    return bots.some((bot) => bot?.connected === true) ? 'connected' : 'offline';
++  }
++  if (value?.configured === true) return value?.connected === true ? 'connected' : 'offline';
++  return 'unconfigured';
++}
++
++// 轮询全部渠道的 connection.status，驱动左栏状态点与头部汇总。
++function useChannelStatuses(rpcCalls) {
++  const [statuses, setStatuses] = React.useState({});
++  React.useEffect(() => {
++    let disposed = false;
++    const fetchAll = async () => {
++      const entries = await Promise.all(CHANNELS.map(async (channel) => {
++        const rpcCall = rpcCalls[channel.id];
++        if (typeof rpcCall !== 'function') return [channel.id, 'unknown'];
++        try {
++          const snapshot = unwrapStatusValue(await rpcCall('connection.status', {}));
++          return [channel.id, channelStatusFromSnapshot(snapshot)];
++        } catch {
++          return [channel.id, 'unknown'];
++        }
++      }));
++      if (!disposed) setStatuses(Object.fromEntries(entries));
++    };
++    void fetchAll();
++    const timer = setInterval(fetchAll, 15_000);
++    return () => {
++      disposed = true;
++      clearInterval(timer);
++    };
++    // rpcCalls 在 apply 中创建一次，引用稳定。
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, []);
++  return statuses;
++}
++
++function ChannelStatusDot({ state }) {
++  const tone = CHANNEL_STATUS_LABELS[state] ? state : 'unknown';
++  return h('span', {
++    className: `dim-channelStatus dim-channelStatus-${tone}`,
++    title: CHANNEL_STATUS_LABELS[tone],
++    'aria-label': CHANNEL_STATUS_LABELS[tone],
++    role: 'status',
++  });
++}
++
+ function WeixinLogo() {
+   return h('span', { className: 'dim-logo dim-logoWeixin', 'aria-hidden': 'true' },
+     h(WeixinLogoGlyph));
+@@ -135,19 +197,40 @@ export function IMSettingsTab({
+   officeRpcCall,
+   workspaceDirectoryPicker,
+ }) {
+-  const [selected, setSelected] = React.useState('weixin');
++  const [selected, setSelected] = React.useState('feishu');
+   const githubTooltipId = React.useId();
++  const statuses = useChannelStatuses({
++    dingtalk: dingtalkRpcCall,
++    discord: discordRpcCall,
++    feishu: feishuRpcCall,
++    qq: qqRpcCall,
++    slack: slackRpcCall,
++    telegram: telegramRpcCall,
++    wecom: wecomRpcCall,
++    weixin: weixinRpcCall,
++    whatsapp: whatsappRpcCall,
++    office: officeRpcCall,
++  });
++  const statusCounts = CHANNELS.reduce((counts, channel) => {
++    const state = statuses[channel.id];
++    if (state === 'connected') counts.connected += 1;
++    else if (state === 'offline') counts.offline += 1;
++    return counts;
++  }, { connected: 0, offline: 0 });
++  const unconfigured = CHANNELS.length - statusCounts.connected - statusCounts.offline;
+   const active = CHANNELS.find((channel) => channel.id === selected) ?? CHANNELS[0];
+   return h(WorkspaceDirectoryPickerContext.Provider, { value: workspaceDirectoryPicker },
+     h('section', { className: 'dim-page', 'aria-label': 'IM机器人设置' },
+     h('header', { className: 'dim-title' },
+       h('div', { className: 'dim-brand' },
+         h('strong', { className: 'dim-brandName' }, 'DSH-IM'),
+-        h('p', null, '让 DeepSeek Harness 触手可及')),
++        h('p', null, '让 DeepSeek Harness 触手可及'),
++        h('p', { className: 'dim-channelSummary', role: 'status' },
++          `已连接 ${statusCounts.connected} · 未连接 ${statusCounts.offline} · 未配置 ${unconfigured}`)),
+       h('span', { className: 'dim-githubAction' },
+         h('a', {
+           className: 'dim-githubLink',
+-          href: 'https://github.com/xmanrui/dsh-im',
++          href: 'https://github.com/onlyforchris/dsh-im',
+           target: '_blank',
+           rel: 'noopener noreferrer',
+           'aria-label': 'dsh-im GitHub',
+@@ -177,7 +260,8 @@ export function IMSettingsTab({
+         h('span', { className: 'dim-channelCopy' },
+           h('strong', null, channel.label),
+           channel.note ? h('small', { className: 'dim-channelNote' }, channel.note) : null,
+-        )))),
++        ),
++        h(ChannelStatusDot, { state: statuses[channel.id] })))),
+       h('div', { className: 'dim-divider', 'aria-hidden': 'true' }),
+       h('main', {
+         className: 'dim-panel',
+@@ -258,8 +342,9 @@ export function apply(ctx) {
+     pickDirectory: () => ctx.workspaces.pickDirectory(),
+   });
+ 
+-  ctx.slots.inject('settings.plugins.tab', () => ctx.slots.register({
+-    name: 'settings.plugins.tab',
++  // 个人 fork 调整：从「设置 → 插件」子标签提升为设置页一级菜单（顶部导航可见）。
++  ctx.slots.inject('settings.section', () => ctx.slots.register({
++    name: 'settings.section',
+     id: 'im',
+     order: 20,
+     label: () => t('IM机器人'),
+diff --git a/plugin-src/client/styles.js b/plugin-src/client/styles.js
+index 57c890b..c4770a4 100644
+--- a/plugin-src/client/styles.js
++++ b/plugin-src/client/styles.js
+@@ -26,7 +26,7 @@ const CSS = String.raw`
+ .dim-rail { max-height: 520px; display: grid; align-content: start; gap: 8px; overflow-y: auto; padding: 1px 4px 1px 1px; scrollbar-width: thin; scrollbar-color: var(--dsw-alias-border-l2, #dfe1e5) transparent; }
+ .dim-rail::-webkit-scrollbar { width: 4px; }
+ .dim-rail::-webkit-scrollbar-thumb { border-radius: 99px; background: var(--dsw-alias-border-l2, #dfe1e5); }
+-.dim-channel { width: 100%; min-height: 48px; display: grid; grid-template-columns: 30px minmax(0, 1fr); align-items: center; gap: 10px; padding: 8px 12px; border: 1px solid var(--dsw-alias-border-l2, #eef0f3); border-radius: 14px; color: inherit; background: var(--dsw-alias-bg-layer-3, #fff); box-shadow: 0 2px 8px rgb(31 35 41 / 3%); font: inherit; text-align: left; cursor: pointer; transition: border-color .16s ease, background .16s ease, box-shadow .16s ease; }
++.dim-channel { width: 100%; min-height: 48px; display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; align-items: center; gap: 10px; padding: 8px 12px; border: 1px solid var(--dsw-alias-border-l2, #eef0f3); border-radius: 14px; color: inherit; background: var(--dsw-alias-bg-layer-3, #fff); box-shadow: 0 2px 8px rgb(31 35 41 / 3%); font: inherit; text-align: left; cursor: pointer; transition: border-color .16s ease, background .16s ease, box-shadow .16s ease; }
+ .dim-channel:hover { border-color: color-mix(in srgb, var(--dim-blue) 25%, var(--dsw-alias-border-l2, #eef0f3)); background: color-mix(in srgb, var(--dim-blue) 2%, var(--dsw-alias-bg-layer-3, #fff)); box-shadow: 0 5px 16px rgb(31 35 41 / 5%); }
+ .dim-channel[aria-selected="true"] { border-color: color-mix(in srgb, var(--dim-blue) 43%, var(--dsw-alias-border-l2, #dfe1e5)); color: var(--dim-blue); background: color-mix(in srgb, var(--dim-blue) 12%, var(--dsw-alias-bg-layer-3, #fff)); box-shadow: 0 3px 12px rgb(51 112 255 / 7%); }
+ .dim-channel:focus-visible { outline: none; border-color: color-mix(in srgb, var(--dim-blue) 72%, var(--dsw-alias-border-l2, #dfe1e5)); box-shadow: 0 0 0 1px color-mix(in srgb, var(--dim-blue) 24%, transparent) inset, 0 3px 12px rgb(51 112 255 / 7%); }
+@@ -53,6 +53,12 @@ const CSS = String.raw`
+ .dim-logoWhatsapp { color: white; background: #25d366; }
+ .dim-logoWhatsapp svg { width: 21px; height: 21px; }
+ .dim-channelCopy { min-width: 0; display: grid; }
++.dim-channelStatus { width: 8px; height: 8px; border-radius: 999px; flex: none; background: var(--dsw-alias-border-l2, #dfe1e5); }
++.dim-channelStatus-connected { background: var(--dsw-alias-state-success-primary, #20a162); }
++.dim-channelStatus-offline { background: var(--dsw-alias-state-warn-primary, #d97706); }
++.dim-channelStatus-unconfigured { background: var(--dsw-alias-border-l2, #dfe1e5); }
++.dim-channelStatus-unknown { background: var(--dsw-alias-border-l2, #dfe1e5); }
++.dim-channelSummary { display: flex; gap: 4px; }
+ .dim-channelCopy strong { overflow: hidden; color: inherit; font-size: 14px; line-height: 20px; font-weight: 680; text-overflow: ellipsis; white-space: nowrap; }
+ .dim-channelNote { overflow: hidden; color: var(--dsw-alias-label-tertiary, #8f959e); font-size: 10px; line-height: 13px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+ .dim-divider { width: 1px; min-height: 520px; background: var(--dsw-alias-border-l1, #eef0f3); }
+diff --git a/plugin-src/host/channels/dingtalk/production.mjs b/plugin-src/host/channels/dingtalk/production.mjs
+index 485ce46..71f0dfc 100644
+--- a/plugin-src/host/channels/dingtalk/production.mjs
++++ b/plugin-src/host/channels/dingtalk/production.mjs
+@@ -108,6 +108,7 @@ export async function createProductionController(ctx, config = {}, internals = {
+       return new Runtime({
+         config: botConfig,
+         clientSecret,
++        sourceChannelLabel: '钉钉',
+         harness: workspaceScope.harness,
+         state: workspaceScope.state,
+         replyTimeoutMs: config.replyTimeoutMs ?? 600_000,
+diff --git a/plugin-src/host/channels/discord/production.mjs b/plugin-src/host/channels/discord/production.mjs
+index 537253c..3c0c931 100644
+--- a/plugin-src/host/channels/discord/production.mjs
++++ b/plugin-src/host/channels/discord/production.mjs
+@@ -13,5 +13,6 @@ export function createProductionController(ctx, config = {}, internals = {}) {
+     HarnessClient: DiscordHarnessClient,
+     Controller: DiscordController,
+     Runtime: DiscordRuntime,
++    runtimeOptions: () => ({ sourceChannelLabel: 'Discord' }),
+   });
+ }
+diff --git a/plugin-src/host/channels/feishu/production.mjs b/plugin-src/host/channels/feishu/production.mjs
+index 5a47c87..3749a7d 100644
+--- a/plugin-src/host/channels/feishu/production.mjs
++++ b/plugin-src/host/channels/feishu/production.mjs
+@@ -143,6 +143,7 @@ export async function createProductionController(ctx, config = {}, internals = {
+         appSecret,
+         domain: botConfig.domain,
+         ownerOpenIds: botConfig.ownerOpenIds ?? [botConfig.ownerOpenId],
++        sourceChannelLabel: '飞书',
+         harness: workspaceScope.harness,
+         state: workspaceScope.state,
+         replyTimeoutMs: config.replyTimeoutMs ?? 600_000,
+diff --git a/plugin-src/host/channels/qq/production.mjs b/plugin-src/host/channels/qq/production.mjs
+index 92474f2..6f0f86c 100644
+--- a/plugin-src/host/channels/qq/production.mjs
++++ b/plugin-src/host/channels/qq/production.mjs
+@@ -99,6 +99,7 @@ export async function createProductionController(ctx, config = {}, internals = {
+       return new Runtime({
+         config: botConfig,
+         appSecret,
++        sourceChannelLabel: 'QQ',
+         harness: workspaceScope.harness,
+         state: workspaceScope.state,
+         replyTimeoutMs: config.replyTimeoutMs ?? 600_000,
+diff --git a/plugin-src/host/channels/slack/production.mjs b/plugin-src/host/channels/slack/production.mjs
+index 5adeeb9..c5a925f 100644
+--- a/plugin-src/host/channels/slack/production.mjs
++++ b/plugin-src/host/channels/slack/production.mjs
+@@ -79,6 +79,7 @@ export async function createProductionController(ctx, config = {}, internals = {
+         config: botConfig,
+         botToken,
+         appToken,
++        sourceChannelLabel: 'Slack',
+         harness: workspaceScope.harness,
+         state: workspaceScope.state,
+         replyTimeoutMs: config.replyTimeoutMs ?? 600_000,
+diff --git a/plugin-src/host/channels/telegram/production.mjs b/plugin-src/host/channels/telegram/production.mjs
+index 154e4af..5d76bb7 100644
+--- a/plugin-src/host/channels/telegram/production.mjs
++++ b/plugin-src/host/channels/telegram/production.mjs
+@@ -15,5 +15,6 @@ export function createProductionController(ctx, config = {}, internals = {}) {
+     HarnessClient: TelegramHarnessClient,
+     Controller: TelegramController,
+     Runtime: TelegramRuntime,
++    runtimeOptions: () => ({ sourceChannelLabel: 'Telegram' }),
+   });
+ }
+diff --git a/plugin-src/host/channels/wecom/production.mjs b/plugin-src/host/channels/wecom/production.mjs
+index 690b349..275ffb8 100644
+--- a/plugin-src/host/channels/wecom/production.mjs
++++ b/plugin-src/host/channels/wecom/production.mjs
+@@ -102,6 +102,7 @@ export async function createProductionController(ctx, config = {}, internals = {
+       return new Runtime({
+         config: botConfig,
+         secret,
++        sourceChannelLabel: '企微',
+         harness: workspaceScope.harness,
+         state: workspaceScope.state,
+         replyTimeoutMs: config.replyTimeoutMs ?? 600_000,
+diff --git a/plugin-src/host/channels/weixin/production.mjs b/plugin-src/host/channels/weixin/production.mjs
+index 0ffbb9c..526df48 100644
+--- a/plugin-src/host/channels/weixin/production.mjs
++++ b/plugin-src/host/channels/weixin/production.mjs
+@@ -103,6 +103,7 @@ export async function createProductionController(ctx, config = {}, internals = {
+         api,
+         config: accountConfig,
+         token,
++        sourceChannelLabel: '微信',
+         harness: workspaceScope.harness,
+         state: workspaceScope.state,
+         replyTimeoutMs: config.replyTimeoutMs ?? 600_000,
+diff --git a/plugin-src/host/channels/whatsapp/production.mjs b/plugin-src/host/channels/whatsapp/production.mjs
+index f1cc6e2..8d4ee99 100644
+--- a/plugin-src/host/channels/whatsapp/production.mjs
++++ b/plugin-src/host/channels/whatsapp/production.mjs
+@@ -105,6 +105,7 @@ export async function createProductionController(ctx, config = {}, internals = {
+       return new Runtime({
+         config: botConfig,
+         authDir,
++        sourceChannelLabel: 'WhatsApp',
+         harness: workspaceScope.harness,
+         state: workspaceScope.state,
+         replyTimeoutMs: config.replyTimeoutMs ?? 600_000,
+diff --git a/src/channels/dingtalk/dingtalk-bridge.mjs b/src/channels/dingtalk/dingtalk-bridge.mjs
+index 1e71425..4a0b176 100644
+--- a/src/channels/dingtalk/dingtalk-bridge.mjs
++++ b/src/channels/dingtalk/dingtalk-bridge.mjs
+@@ -255,6 +255,7 @@ export class DingtalkHarnessBridge {
+   #replyTimeoutMs;
+   #maxMessageChars;
+   #signal;
++  #sourceChannelLabel;
+   #queues = new Map();
+   #pendingInteractions = new Map();
+   #interactionKeys = new Map();
+@@ -273,6 +274,7 @@ export class DingtalkHarnessBridge {
+     logger = console,
+     replyTimeoutMs = 600_000,
+     maxMessageChars = 4_000,
++    sourceChannelLabel,
+     signal,
+   }) {
+     if (!api || typeof api.sendText !== 'function') throw new TypeError('DingTalk API is required');
+@@ -291,6 +293,7 @@ export class DingtalkHarnessBridge {
+     this.#replyTimeoutMs = replyTimeoutMs;
+     this.#maxMessageChars = maxMessageChars;
+     this.#signal = signal;
++    this.#sourceChannelLabel = sourceChannelLabel;
+     ensureStats(this.#status);
+     this.#refreshPendingSenders();
+   }
+@@ -590,6 +593,7 @@ export class DingtalkHarnessBridge {
+         harness: this.#harness,
+         state: this.#state,
+         key,
++        channelLabel: this.#sourceChannelLabel,
+         ...(hasImages ? { content } : { text }),
+         createOptions: { signal: this.#signal },
+         existsOptions: { signal: this.#signal },
+diff --git a/src/channels/dingtalk/dingtalk-runtime.mjs b/src/channels/dingtalk/dingtalk-runtime.mjs
+index 23e4410..90865a5 100644
+--- a/src/channels/dingtalk/dingtalk-runtime.mjs
++++ b/src/channels/dingtalk/dingtalk-runtime.mjs
+@@ -134,6 +134,7 @@ export class DingtalkRuntime {
+   #connectPollIntervalMs;
+   #api;
+   #streamFactory;
++  #sourceChannelLabel;
+   #status;
+   #client = null;
+   #bridge = null;
+@@ -155,6 +156,7 @@ export class DingtalkRuntime {
+     connectPollIntervalMs = 25,
+     api = createDingtalkApi(),
+     streamFactory = defaultStreamFactory,
++    sourceChannelLabel,
+   }) {
+     if (!config || !nonEmptyString(config.clientId) || !nonEmptyString(clientSecret)) {
+       throw new TypeError('DingtalkRuntime requires app credentials');
+@@ -172,6 +174,7 @@ export class DingtalkRuntime {
+     this.#connectPollIntervalMs = connectPollIntervalMs;
+     this.#api = api;
+     this.#streamFactory = streamFactory;
++    this.#sourceChannelLabel = sourceChannelLabel;
+     this.#status = createDingtalkRuntimeStatus({
+       pendingSenders: this.#pendingSenders(),
+       approvedSenders: approvedSenderCount(config),
+@@ -236,6 +239,7 @@ export class DingtalkRuntime {
+         logger: this.#logger,
+         replyTimeoutMs: this.#replyTimeoutMs,
+         maxMessageChars: this.#maxMessageChars,
++        sourceChannelLabel: this.#sourceChannelLabel,
+         signal,
+       });
+ 
+diff --git a/src/channels/discord/discord-runtime.mjs b/src/channels/discord/discord-runtime.mjs
+index 1862b1f..997df18 100644
+--- a/src/channels/discord/discord-runtime.mjs
++++ b/src/channels/discord/discord-runtime.mjs
+@@ -191,6 +191,7 @@ export class DiscordRuntime {
+   #createApi;
+   #createWebSocket;
+   #random;
++  #sourceChannelLabel;
+   #status = createDiscordRuntimeStatus();
+   #api = null;
+   #bridge = null;
+@@ -219,6 +220,7 @@ export class DiscordRuntime {
+     createApi = (options) => new DiscordApi(options),
+     createWebSocket = (url) => new WebSocket(url),
+     random = Math.random,
++    sourceChannelLabel,
+   }) {
+     if (!config || !token || !harness || !state) {
+       throw new TypeError('DiscordRuntime requires config, token, Harness, and state');
+@@ -234,6 +236,7 @@ export class DiscordRuntime {
+     this.#createApi = createApi;
+     this.#createWebSocket = createWebSocket;
+     this.#random = random;
++    this.#sourceChannelLabel = sourceChannelLabel;
+   }
+ 
+   get status() {
+@@ -291,6 +294,7 @@ export class DiscordRuntime {
+         status: this.#status,
+         logger: this.#logger,
+         replyTimeoutMs: this.#replyTimeoutMs,
++        sourceChannelLabel: this.#sourceChannelLabel,
+         signal: controller.signal,
+       });
+       let timer;
+diff --git a/src/channels/feishu/bridge.mjs b/src/channels/feishu/bridge.mjs
+index 7587b9e..5f601f3 100644
+--- a/src/channels/feishu/bridge.mjs
++++ b/src/channels/feishu/bridge.mjs
+@@ -236,6 +236,7 @@ export class FeishuHarnessBridge {
+   #repairMonitorVersion = 0;
+   #repairPollIntervalMs;
+   #repairLinkWaitMs;
++  #sourceChannelLabel;
+   /** Number-tappable menus: conversation key → menu state. */
+   #menus = new Map();
+   /** Interactive-card message id → route context for button callbacks. */
+@@ -255,6 +256,7 @@ export class FeishuHarnessBridge {
+     repairPollIntervalMs = REPAIR_POLL_INTERVAL_MS,
+     repairLinkWaitMs = REPAIR_LINK_WAIT_MS,
+     replyTimeoutMs = 600_000,
++    sourceChannelLabel,
+     logger = console,
+     signal,
+   }) {
+@@ -294,6 +296,7 @@ export class FeishuHarnessBridge {
+     this.#logger = logger;
+     this.#approvals = new HarnessApprovalQueue({ label: 'Feishu', logger });
+     this.#signal = signal;
++    this.#sourceChannelLabel = sourceChannelLabel;
+     ensureStatus(this.#status);
+   }
+ 
+@@ -1200,6 +1203,7 @@ export class FeishuHarnessBridge {
+         key,
+         text,
+         content,
++        channelLabel: this.#sourceChannelLabel,
+         createOptions: { signal: this.#signal },
+         existsOptions: { signal: this.#signal },
+         askOptions: this.#interactionAskOptions(event, key),
+@@ -1228,6 +1232,7 @@ export class FeishuHarnessBridge {
+             key,
+             text,
+             content,
++            channelLabel: this.#sourceChannelLabel,
+             createOptions: { signal: this.#signal },
+             existsOptions: { signal: this.#signal },
+             askOptions,
+@@ -1256,6 +1261,7 @@ export class FeishuHarnessBridge {
+         key,
+         text,
+         content,
++        channelLabel: this.#sourceChannelLabel,
+         createOptions: { signal: this.#signal },
+         existsOptions: { signal: this.#signal },
+         askOptions: this.#interactionAskOptions(event, key),
+diff --git a/src/channels/feishu/feishu-runtime.mjs b/src/channels/feishu/feishu-runtime.mjs
+index 6aa2982..b2ca2ee 100644
+--- a/src/channels/feishu/feishu-runtime.mjs
++++ b/src/channels/feishu/feishu-runtime.mjs
+@@ -95,6 +95,7 @@ export class FeishuRuntime {
+   #requestTimeoutMs;
+   #logger;
+   #repair;
++  #sourceChannelLabel;
+   #client = null;
+   #bridge = null;
+   #wsClient = null;
+@@ -117,6 +118,7 @@ export class FeishuRuntime {
+     replyTimeoutMs = 600000,
+     connectTimeoutMs = 15000,
+     requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
++    sourceChannelLabel,
+     logger = console,
+   }) {
+     if (!lark) throw new Error('FeishuRuntime requires the Feishu SDK');
+@@ -146,6 +148,7 @@ export class FeishuRuntime {
+     this.#connectTimeoutMs = connectTimeoutMs;
+     this.#requestTimeoutMs = requestTimeoutMs;
+     this.#logger = logger;
++    this.#sourceChannelLabel = sourceChannelLabel;
+     this.#status = createBridgeStatus({ allowedSenderCount: normalizedOwners.length });
+   }
+ 
+@@ -205,6 +208,7 @@ export class FeishuRuntime {
+         repair: this.#repair,
+         repairOwnerOpenIds: new Set(this.#ownerOpenIds.filter((value) => value !== '*')),
+         replyTimeoutMs: this.#replyTimeoutMs,
++        sourceChannelLabel: this.#sourceChannelLabel,
+         signal,
+         logger: this.#logger,
+       });
+diff --git a/src/channels/qq/qq-bridge.mjs b/src/channels/qq/qq-bridge.mjs
+index 15871d3..f0d6c56 100644
+--- a/src/channels/qq/qq-bridge.mjs
++++ b/src/channels/qq/qq-bridge.mjs
+@@ -142,6 +142,7 @@ export class QqHarnessBridge {
+   #replyTimeoutMs;
+   #signal;
+   #fetchImpl;
++  #sourceChannelLabel;
+   #queues = new Map();
+   #pendingInteractions = new Map();
+   #interactionKeys = new Map();
+@@ -158,6 +159,7 @@ export class QqHarnessBridge {
+     status = createQqBridgeStatus(),
+     logger = console,
+     replyTimeoutMs = 600_000,
++    sourceChannelLabel,
+     signal,
+     fetchImpl = fetch,
+   }) {
+@@ -174,6 +176,7 @@ export class QqHarnessBridge {
+     this.#replyTimeoutMs = replyTimeoutMs;
+     this.#signal = signal;
+     this.#fetchImpl = fetchImpl;
++    this.#sourceChannelLabel = sourceChannelLabel;
+     this.#approvals = new HarnessApprovalQueue({ label: 'qq', logger });
+   }
+ 
+@@ -422,6 +425,7 @@ export class QqHarnessBridge {
+           harness: this.#harness,
+           state: this.#state,
+           key,
++          channelLabel: this.#sourceChannelLabel,
+           ...(hasImages ? { content } : { text }),
+           createOptions: { signal: this.#signal },
+           existsOptions: { signal: this.#signal },
+diff --git a/src/channels/qq/qq-runtime.mjs b/src/channels/qq/qq-runtime.mjs
+index bd51782..2787775 100644
+--- a/src/channels/qq/qq-runtime.mjs
++++ b/src/channels/qq/qq-runtime.mjs
+@@ -35,6 +35,7 @@ export class QqRuntime {
+   #connectTimeoutMs;
+   #createBot;
+   #typingMiddleware;
++  #sourceChannelLabel;
+   #status = createQqRuntimeStatus();
+   #bot = null;
+   #bridge = null;
+@@ -52,6 +53,7 @@ export class QqRuntime {
+     connectTimeoutMs = 20_000,
+     createBot = (options) => new QQBot(options),
+     typingMiddleware = typingIndicator,
++    sourceChannelLabel,
+   }) {
+     if (!config || !appSecret || !harness || !state) {
+       throw new TypeError('QqRuntime requires config, app secret, Harness, and state');
+@@ -63,6 +65,7 @@ export class QqRuntime {
+     this.#logger = logger;
+     this.#replyTimeoutMs = replyTimeoutMs;
+     this.#connectTimeoutMs = connectTimeoutMs;
++    this.#sourceChannelLabel = sourceChannelLabel;
+     this.#createBot = createBot;
+     this.#typingMiddleware = typingMiddleware;
+   }
+@@ -138,6 +141,7 @@ export class QqRuntime {
+       status: this.#status,
+       logger: this.#logger,
+       replyTimeoutMs: this.#replyTimeoutMs,
++      sourceChannelLabel: this.#sourceChannelLabel,
+       signal: controller.signal,
+     });
+     bot.use?.(this.#typingMiddleware({
+diff --git a/src/channels/shared/text-harness-bridge.mjs b/src/channels/shared/text-harness-bridge.mjs
+index c155a6c..784a679 100644
+--- a/src/channels/shared/text-harness-bridge.mjs
++++ b/src/channels/shared/text-harness-bridge.mjs
+@@ -59,6 +59,7 @@ export class TextHarnessBridge {
+   #logger;
+   #replyTimeoutMs;
+   #signal;
++  #sourceChannelLabel;
+   #queues = new Map();
+   #pendingInteractions = new Map();
+   #interactionKeys = new Map();
+@@ -75,6 +76,7 @@ export class TextHarnessBridge {
+     status = createTextBridgeStatus(),
+     logger = console,
+     replyTimeoutMs = 600_000,
++    sourceChannelLabel,
+     signal,
+   }) {
+     if (!descriptor?.key || !descriptor?.label) throw new TypeError('A channel descriptor is required');
+@@ -88,6 +90,7 @@ export class TextHarnessBridge {
+     this.#logger = logger;
+     this.#replyTimeoutMs = replyTimeoutMs;
+     this.#signal = signal;
++    this.#sourceChannelLabel = sourceChannelLabel;
+     this.#approvals = new HarnessApprovalQueue({
+       label: descriptor.key,
+       logger,
+@@ -382,6 +385,7 @@ export class TextHarnessBridge {
+         key: conversationKey,
+         text,
+         content,
++        channelLabel: this.#sourceChannelLabel,
+         createOptions: this.#signal ? { signal: this.#signal } : undefined,
+         existsOptions: this.#signal ? { signal: this.#signal } : undefined,
+         askOptions: {
+diff --git a/src/channels/shared/workspace-session.mjs b/src/channels/shared/workspace-session.mjs
+index 4b45d8b..a189148 100644
+--- a/src/channels/shared/workspace-session.mjs
++++ b/src/channels/shared/workspace-session.mjs
+@@ -31,6 +31,28 @@ async function createSession(harness, options) {
+     : harness.createSession(options);
+ }
+ 
++/**
++ * Tag an inbound prompt with its source channel so the agent can attribute
++ * work (e.g. cross-channel work logs) without guessing from context.
++ */
++export function tagPromptWithChannel(text, content, channelLabel) {
++  const label = typeof channelLabel === 'string' ? channelLabel.trim() : '';
++  if (!label) return { text, content };
++  const tag = `[来源渠道:${label}]`;
++  if (Array.isArray(content)) {
++    const tagged = content.slice();
++    const index = tagged.findIndex((item) => item?.type === 'text');
++    if (index === -1) {
++      tagged.unshift({ type: 'text', text: tag });
++    } else {
++      const body = typeof tagged[index].text === 'string' ? tagged[index].text : '';
++      tagged[index] = { ...tagged[index], text: body ? `${tag}\n${body}` : tag };
++    }
++    return { text, content: tagged };
++  }
++  return { text: text ? `${tag}\n${text}` : tag, content };
++}
++
+ /**
+  * Resolve, persist, and ask through a session that belongs to the bot's
+  * current workspace. A concurrent workspace switch invalidates the scoped
+@@ -42,10 +64,12 @@ export async function askInWorkspaceSession({
+   key,
+   text,
+   content,
++  channelLabel,
+   createOptions,
+   existsOptions,
+   askOptions,
+ }) {
++  const prompt = tagPromptWithChannel(text, content, channelLabel);
+   while (true) {
+     try {
+       const binding = await withSessionBindingLock(state, key, async () => {
+@@ -61,7 +85,7 @@ export async function askInWorkspaceSession({
+       if (!binding) continue;
+       return {
+         sessionId: binding.sessionId,
+-        answer: await binding.session.ask(content ?? text, askOptions),
++        answer: await binding.session.ask(prompt.content ?? prompt.text, askOptions),
+       };
+     } catch (error) {
+       if (error?.code !== WORKSPACE_SESSION_STALE) throw error;
+diff --git a/src/channels/slack/slack-runtime.mjs b/src/channels/slack/slack-runtime.mjs
+index 2a0fe30..562a3ed 100644
+--- a/src/channels/slack/slack-runtime.mjs
++++ b/src/channels/slack/slack-runtime.mjs
+@@ -250,6 +250,7 @@ export class SlackRuntime {
+   #connectTimeoutMs;
+   #createApi;
+   #createWebSocket;
++  #sourceChannelLabel;
+   #status = createSlackRuntimeStatus();
+   #api = null;
+   #bridge = null;
+@@ -273,6 +274,7 @@ export class SlackRuntime {
+     connectTimeoutMs = 20_000,
+     createApi = (options) => new SlackApi(options),
+     createWebSocket = (url) => new WebSocket(url),
++    sourceChannelLabel,
+   }) {
+     if (!config || !botToken || !appToken || !harness || !state) {
+       throw new TypeError('SlackRuntime requires config, both tokens, Harness, and state');
+@@ -288,6 +290,7 @@ export class SlackRuntime {
+     this.#connectTimeoutMs = connectTimeoutMs;
+     this.#createApi = createApi;
+     this.#createWebSocket = createWebSocket;
++    this.#sourceChannelLabel = sourceChannelLabel;
+   }
+ 
+   get status() {
+@@ -338,6 +341,7 @@ export class SlackRuntime {
+         status: this.#status,
+         logger: this.#logger,
+         replyTimeoutMs: this.#replyTimeoutMs,
++        sourceChannelLabel: this.#sourceChannelLabel,
+         signal: controller.signal,
+       });
+       let timer;
+diff --git a/src/channels/telegram/telegram-runtime.mjs b/src/channels/telegram/telegram-runtime.mjs
+index 043a3dd..690f4e0 100644
+--- a/src/channels/telegram/telegram-runtime.mjs
++++ b/src/channels/telegram/telegram-runtime.mjs
+@@ -214,6 +214,7 @@ export class TelegramRuntime {
+   #createApi;
+   #accessMode;
+   #allowedPrivateUserIds;
++  #sourceChannelLabel;
+   #status = createTelegramRuntimeStatus();
+   #api = null;
+   #bridge = null;
+@@ -229,6 +230,7 @@ export class TelegramRuntime {
+     logger = console,
+     replyTimeoutMs = 600_000,
+     createApi = (options) => new TelegramApi(options),
++    sourceChannelLabel,
+   }) {
+     if (!config || !token || !harness || !state) {
+       throw new TypeError('TelegramRuntime requires config, token, Harness, and state');
+@@ -243,6 +245,7 @@ export class TelegramRuntime {
+     const accessPolicy = normalizeTelegramAccessPolicy(config);
+     this.#accessMode = accessPolicy.accessMode;
+     this.#allowedPrivateUserIds = new Set(accessPolicy.allowedUsers);
++    this.#sourceChannelLabel = sourceChannelLabel;
+   }
+ 
+   get status() {
+@@ -298,6 +301,7 @@ export class TelegramRuntime {
+         status: this.#status,
+         logger: this.#logger,
+         replyTimeoutMs: this.#replyTimeoutMs,
++        sourceChannelLabel: this.#sourceChannelLabel,
+         signal: controller.signal,
+       });
+ 
+diff --git a/src/channels/wecom/wecom-bridge.mjs b/src/channels/wecom/wecom-bridge.mjs
+index 6d2b580..144c58c 100644
+--- a/src/channels/wecom/wecom-bridge.mjs
++++ b/src/channels/wecom/wecom-bridge.mjs
+@@ -231,6 +231,7 @@ export class WecomHarnessBridge {
+   #replyTimeoutMs;
+   #generateReqId;
+   #signal;
++  #sourceChannelLabel;
+   #queues = new Map();
+   #pendingInteractions = new Map();
+   #interactionKeys = new Map();
+@@ -248,6 +249,7 @@ export class WecomHarnessBridge {
+     logger = console,
+     replyTimeoutMs = 600_000,
+     generateStreamId = generateReqId,
++    sourceChannelLabel,
+     signal,
+   }) {
+     if (!client || typeof client.replyStream !== 'function' || typeof client.sendMessage !== 'function') {
+@@ -262,6 +264,7 @@ export class WecomHarnessBridge {
+     this.#replyTimeoutMs = replyTimeoutMs;
+     this.#generateReqId = generateStreamId;
+     this.#signal = signal;
++    this.#sourceChannelLabel = sourceChannelLabel;
+     this.#approvals = new HarnessApprovalQueue({ label: 'wecom', logger });
+   }
+ 
+@@ -552,6 +555,7 @@ export class WecomHarnessBridge {
+         key,
+         text,
+         content,
++        channelLabel: this.#sourceChannelLabel,
+         createOptions: { signal: this.#signal },
+         existsOptions: { signal: this.#signal },
+         askOptions: {
+diff --git a/src/channels/wecom/wecom-runtime.mjs b/src/channels/wecom/wecom-runtime.mjs
+index 99fa626..87a349b 100644
+--- a/src/channels/wecom/wecom-runtime.mjs
++++ b/src/channels/wecom/wecom-runtime.mjs
+@@ -32,6 +32,7 @@ export class WecomRuntime {
+   #connectTimeoutMs;
+   #maxReconnectAttempts;
+   #createClient;
++  #sourceChannelLabel;
+   #status = createWecomRuntimeStatus();
+   #client = null;
+   #bridge = null;
+@@ -48,6 +49,7 @@ export class WecomRuntime {
+     replyTimeoutMs = 600_000,
+     connectTimeoutMs = 20_000,
+     maxReconnectAttempts = 10,
++    sourceChannelLabel,
+     createClient = (options) => new WSClient(options),
+   }) {
+     if (!config || !secret || !harness || !state) {
+@@ -61,6 +63,7 @@ export class WecomRuntime {
+     this.#replyTimeoutMs = replyTimeoutMs;
+     this.#connectTimeoutMs = connectTimeoutMs;
+     this.#maxReconnectAttempts = maxReconnectAttempts;
++    this.#sourceChannelLabel = sourceChannelLabel;
+     this.#createClient = createClient;
+   }
+ 
+@@ -109,6 +112,7 @@ export class WecomRuntime {
+       status: this.#status,
+       logger: this.#logger,
+       replyTimeoutMs: this.#replyTimeoutMs,
++      sourceChannelLabel: this.#sourceChannelLabel,
+       signal,
+     });
+ 
+diff --git a/src/channels/weixin/weixin-bridge.mjs b/src/channels/weixin/weixin-bridge.mjs
+index f91762c..f2f12a9 100644
+--- a/src/channels/weixin/weixin-bridge.mjs
++++ b/src/channels/weixin/weixin-bridge.mjs
+@@ -93,6 +93,7 @@ export class WeixinHarnessBridge {
+   #replyTimeoutMs;
+   #maxMessageChars;
+   #signal;
++  #sourceChannelLabel;
+   #queues = new Map();
+   #pendingInteractions = new Map();
+   #interactionKeys = new Map();
+@@ -112,6 +113,7 @@ export class WeixinHarnessBridge {
+     logger = console,
+     replyTimeoutMs = 600_000,
+     maxMessageChars = 4_000,
++    sourceChannelLabel,
+     signal,
+   }) {
+     if (!api || typeof api.sendText !== 'function') throw new TypeError('Weixin API is required');
+@@ -128,6 +130,7 @@ export class WeixinHarnessBridge {
+     this.#replyTimeoutMs = replyTimeoutMs;
+     this.#maxMessageChars = maxMessageChars;
+     this.#signal = signal;
++    this.#sourceChannelLabel = sourceChannelLabel;
+     this.#approvals = new HarnessApprovalQueue({ label: 'weixin', logger });
+   }
+ 
+@@ -374,6 +377,7 @@ export class WeixinHarnessBridge {
+           harness: this.#harness,
+           state: this.#state,
+           key,
++          channelLabel: this.#sourceChannelLabel,
+           ...(hasImages ? { content } : { text }),
+           createOptions: { signal: this.#signal },
+           existsOptions: { signal: this.#signal },
+diff --git a/src/channels/weixin/weixin-runtime.mjs b/src/channels/weixin/weixin-runtime.mjs
+index c414d03..b6af61b 100644
+--- a/src/channels/weixin/weixin-runtime.mjs
++++ b/src/channels/weixin/weixin-runtime.mjs
+@@ -74,6 +74,7 @@ export class WeixinRuntime {
+   #replyTimeoutMs;
+   #maxMessageChars;
+   #startRetryDelaysMs;
++  #sourceChannelLabel;
+   #status = createWeixinRuntimeStatus();
+   #bridge = null;
+   #abortController = null;
+@@ -90,6 +91,7 @@ export class WeixinRuntime {
+     replyTimeoutMs = 600_000,
+     maxMessageChars = 4_000,
+     startRetryDelaysMs,
++    sourceChannelLabel,
+   }) {
+     if (!api || !config || !token || !harness || !state) {
+       throw new TypeError('WeixinRuntime requires API, account, token, Harness, and state');
+@@ -103,6 +105,7 @@ export class WeixinRuntime {
+     this.#replyTimeoutMs = replyTimeoutMs;
+     this.#maxMessageChars = maxMessageChars;
+     this.#startRetryDelaysMs = startRetryDelays(startRetryDelaysMs);
++    this.#sourceChannelLabel = sourceChannelLabel;
+   }
+ 
+   get status() {
+@@ -144,6 +147,7 @@ export class WeixinRuntime {
+         logger: this.#logger,
+         replyTimeoutMs: this.#replyTimeoutMs,
+         maxMessageChars: this.#maxMessageChars,
++        sourceChannelLabel: this.#sourceChannelLabel,
+         signal,
+       });
+       this.#status.ready = true;
+diff --git a/src/channels/whatsapp/whatsapp-runtime.mjs b/src/channels/whatsapp/whatsapp-runtime.mjs
+index 572b475..959e0e6 100644
+--- a/src/channels/whatsapp/whatsapp-runtime.mjs
++++ b/src/channels/whatsapp/whatsapp-runtime.mjs
+@@ -299,6 +299,7 @@ export class WhatsappRuntime {
+   #replyTimeoutMs;
+   #connectTimeoutMs;
+   #createSession;
++  #sourceChannelLabel;
+   #status = createWhatsappRuntimeStatus();
+   #abortController = null;
+   #session = null;
+@@ -315,6 +316,7 @@ export class WhatsappRuntime {
+     replyTimeoutMs = 600_000,
+     connectTimeoutMs = 30_000,
+     createSession = createWhatsappWebSession,
++    sourceChannelLabel,
+   }) {
+     if (!config || !authDir || !harness || !state || typeof createSession !== 'function') {
+       throw new TypeError('WhatsappRuntime requires config, auth directory, Harness, state, and session factory');
+@@ -327,6 +329,7 @@ export class WhatsappRuntime {
+     this.#replyTimeoutMs = replyTimeoutMs;
+     this.#connectTimeoutMs = connectTimeoutMs;
+     this.#createSession = createSession;
++    this.#sourceChannelLabel = sourceChannelLabel;
+   }
+ 
+   get status() {
+@@ -399,6 +402,7 @@ export class WhatsappRuntime {
+         status: this.#status,
+         logger: this.#logger,
+         replyTimeoutMs: this.#replyTimeoutMs,
++        sourceChannelLabel: this.#sourceChannelLabel,
+         signal: controller.signal,
+       });
+       const now = Date.now();
+diff --git a/test/channel-tag.test.mjs b/test/channel-tag.test.mjs
+new file mode 100644
+index 0000000..c19f143
+--- /dev/null
++++ b/test/channel-tag.test.mjs
+@@ -0,0 +1,41 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++
++import { tagPromptWithChannel } from '../src/channels/shared/workspace-session.mjs';
++
++test('tagPromptWithChannel prefixes plain text prompts with the source channel', () => {
++  const { text, content } = tagPromptWithChannel('查一下天气', undefined, '飞书');
++  assert.equal(text, '[来源渠道:飞书]\n查一下天气');
++  assert.equal(content, undefined);
++});
++
++test('tagPromptWithChannel produces a tag-only prompt when the text is empty', () => {
++  const { text } = tagPromptWithChannel('', undefined, '钉钉');
++  assert.equal(text, '[来源渠道:钉钉]');
++});
++
++test('tagPromptWithChannel prefixes the first text part of structured content', () => {
++  const image = { type: 'image', mediaType: 'image/png', data: 'Zm9v' };
++  const { content } = tagPromptWithChannel('请分析这张图片。', [
++    { type: 'text', text: '请分析这张图片。' },
++    image,
++  ], '企微');
++  assert.equal(content[0].text, '[来源渠道:企微]\n请分析这张图片。');
++  assert.equal(content[1], image);
++});
++
++test('tagPromptWithChannel inserts a text part when structured content has none', () => {
++  const image = { type: 'image', mediaType: 'image/png', data: 'Zm9v' };
++  const { content } = tagPromptWithChannel(undefined, [image], '微信');
++  assert.equal(content[0].type, 'text');
++  assert.equal(content[0].text, '[来源渠道:微信]');
++  assert.equal(content[1], image);
++});
++
++test('tagPromptWithChannel leaves the prompt untouched without a channel label', () => {
++  const content = [{ type: 'text', text: 'hello' }];
++  const tagged = tagPromptWithChannel('hello', content, undefined);
++  assert.equal(tagged.text, 'hello');
++  assert.equal(tagged.content, content);
++  assert.deepEqual(tagPromptWithChannel('hello', undefined, '  '), { text: 'hello', content: undefined });
++});
+diff --git a/test/client-ui.test.mjs b/test/client-ui.test.mjs
+index 1bd6f17..1ee06e4 100644
+--- a/test/client-ui.test.mjs
++++ b/test/client-ui.test.mjs
+@@ -116,7 +116,7 @@ test('IM settings renders nine IM channels plus the AI Office connector', async
+   assert.match(markup, /class="dim-brand"/);
+   assert.match(markup, /<strong class="dim-brandName">DSH-IM<\/strong>/);
+   assert.doesNotMatch(markup, /dim-brandLogo|<img/);
+-  assert.match(markup, /href="https:\/\/github\.com\/xmanrui\/dsh-im"/);
++  assert.match(markup, /href="https:\/\/github\.com\/onlyforchris\/dsh-im"/);
+   assert.match(markup, /target="_blank"/);
+   assert.match(markup, /rel="noopener noreferrer"/);
+   assert.match(markup, /aria-label="dsh-im GitHub"/);
+@@ -154,6 +154,8 @@ test('IM settings renders nine IM channels plus the AI Office connector', async
+   assert.match(styles, /\.dim-logoFeishu svg \{ width: 28px; height: 28px; \}/);
+   assert.equal((markup.match(/role="tab"/g) ?? []).length, 10);
+   assert.equal((markup.match(/aria-selected="true"/g) ?? []).length, 1);
++  assert.equal((markup.match(/dim-channelStatus dim-channelStatus-/g) ?? []).length, 10);
++  assert.match(markup, /已连接 0 · 未连接 0 · 未配置 10/);
+   assert.doesNotMatch(markup, /role="switch"|type="checkbox"/);
+   assert.doesNotMatch(markup, /dim-chevron|扫码绑定<\/small>|扫码接入<\/small>/);
+   assert.doesNotMatch(markup, />INSTANT MESSAGING<|>Channel<|>微信设置</);
+@@ -605,7 +607,7 @@ test('client registers a live bilingual locale seat and directory picker for the
+     },
+     slots: {
+       inject(name, install) {
+-        assert.equal(name, 'settings.plugins.tab');
++        assert.equal(name, 'settings.section');
+         install();
+       },
+       register(options, component) {

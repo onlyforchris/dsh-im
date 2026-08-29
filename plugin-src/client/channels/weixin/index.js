@@ -5,7 +5,6 @@ import { QrActionIcon } from '../../credential-binding.js';
 import { h } from '../../i18n.js';
 import {
   WEIXIN_ENDPOINTS,
-  WEIXIN_RPC_CHANNEL,
   formatRemaining,
   normalizeProvisioning,
   normalizeSnapshot,
@@ -16,12 +15,17 @@ import {
 } from './api.js';
 import { createPollScheduler, useAnimationFrameScheduler } from '../../lifecycle.js';
 import { WorkspaceEditor } from '../../workspace-editor.js';
+import {
+  AgentPresetCatalogContext,
+  AgentPresetEditor,
+  EMPTY_AGENT_PRESET_CATALOG,
+} from '../../agent-preset.js';
 import { useWorkspaceSnapshotFence } from '../../workspace-snapshot-fence.js';
-import { installWeixinStyles } from './styles.js';
-
-export const name = 'weixin-settings';
-export const inject = ['slots', 'connection'];
-
+import {
+  BotStatusMeta,
+  ChannelListHeading,
+  LastMessageErrorSummary,
+} from '../../channel-card-meta.js';
 const Button = React.forwardRef(function Button(
   { children, kind = 'secondary', className = '', ...props },
   ref,
@@ -202,6 +206,7 @@ export function AccountCard({
   removing,
   onReconnect,
   onWorkspaceSave,
+  onAgentPresetSave,
   onRequestRemove,
   onConfirmRemove,
   onCancelRemove,
@@ -215,30 +220,40 @@ export function AccountCard({
         h('div', { className: 'dxw-accountIdentity dim-botIdentity' },
           h('div', { className: 'dxw-avatar dim-botAvatar', 'aria-hidden': 'true' }, h(WeixinLogoGlyph, { size: 27 })),
           h('div', { className: 'dim-botName' }, h('h3', null, account.bot.name), h('p', null, account.bot.accountIdMasked))),
-        h('div', { className: 'dxw-health dim-botHealth' },
-          h('span', { className: 'dxw-dot dim-healthDot', 'data-tone': tone }),
-          h('span', null, account.connected ? '运行正常' : state === 'connecting' ? '正在连接' : '连接未就绪'))),
-      h('dl', { className: 'dxw-metrics dim-botMetrics' },
-        h('div', { className: 'dxw-metric dim-botMetric' }, h('dt', null, '消息通道'),
-          h('dd', null, account.connected ? 'iLink 长轮询' : '离线')),
-        h('div', { className: 'dxw-metric dim-botMetric' }, h('dt', null, '最近检查'),
-          h('dd', null, checkedTime(account.health.lastCheckedAt)))),
+        h(BotStatusMeta, {
+          className: 'dxw-health',
+          dotClassName: 'dxw-dot',
+          tone,
+          stateLabel: account.connected ? '运行正常' : state === 'connecting' ? '正在连接' : '连接未就绪',
+          lastCheckedAt: account.health.lastCheckedAt,
+          formatCheckedTime: checkedTime,
+        })),
       h(WorkspaceEditor, {
         workspace: account.workspace,
         disabled: Boolean(busy),
         onSave: onWorkspaceSave,
       }),
+      h(AgentPresetEditor, {
+        agentPreset: account.agentPreset,
+        disabled: Boolean(busy),
+        onSave: onAgentPresetSave,
+      }),
       h('div', { className: 'dxw-accountFooter dim-cardFooter' },
-        summary ? h('div', { className: 'dxw-summary dim-cardSummary' }, summary) : null,
-        feedback ? h('div', {
-          className: 'dxw-summary dim-cardSummary',
-          role: 'status',
-          'aria-live': 'polite',
-        }, feedback) : null,
-        h('div', { className: 'dxw-actions dim-cardActions' },
-          h(Button, { className: 'dim-cardAction', onClick: onReconnect, disabled: Boolean(busy) },
-            busy === 'reconnect' ? '检查中…' : account.connected ? '检查连接' : '重试连接'),
-          h(Button, { className: 'dim-cardAction', kind: 'danger', onClick: onRequestRemove, disabled: Boolean(busy) }, '移除接入')))),
+        h('div', { className: 'dim-cardFooterLayout' },
+          h('div', { className: 'dxw-actions dim-cardActions' },
+            h(Button, { className: 'dim-cardAction', onClick: onReconnect, disabled: Boolean(busy) },
+              busy === 'reconnect' ? '检查中…' : account.connected ? '检查连接' : '重试连接'),
+            h(Button, { className: 'dim-cardAction', kind: 'danger', onClick: onRequestRemove, disabled: Boolean(busy) }, '移除接入')),
+          summary ? h('div', { className: 'dxw-summary dim-cardSummary' }, summary) : null,
+          account.lastMessageError ? h(LastMessageErrorSummary, {
+            className: 'dxw-summary',
+            error: account.lastMessageError,
+          }) : null,
+          feedback ? h('div', {
+            className: 'dxw-summary dim-cardFeedback',
+            role: 'status',
+            'aria-live': 'polite',
+          }, feedback) : null))),
     removing ? h('div', { className: 'dxw-confirm dim-confirm', role: 'alertdialog' },
       h('strong', null, '从此 Harness 移除这个微信账号？'),
       h('p', null, '这会停止消息连接，并删除本机保存的 bot_token、账号配置和会话映射。其他微信账号不受影响。'),
@@ -251,7 +266,11 @@ export function AccountCard({
 
 function AccountList(props) {
   return h('section', { className: 'dim-listSection' },
-    h('div', { className: 'dxw-listHeading dim-listHeading' }, h('h3', null, '已接入的微信账号')),
+    h(ChannelListHeading, {
+      className: 'dxw-listHeading',
+      title: '已接入的微信账号',
+      connectionLabel: 'iLink 长轮询',
+    }),
     h('ul', { className: 'dxw-list dim-botList' }, props.bots.map((account) => h('li', { key: account.botId },
       h(AccountCard, {
         account,
@@ -260,6 +279,7 @@ function AccountList(props) {
         removing: props.removeTarget === account.botId,
         onReconnect: () => props.onReconnect(account),
         onWorkspaceSave: (workspace) => props.onWorkspaceSave(account, workspace),
+        onAgentPresetSave: (agentPreset) => props.onAgentPresetSave(account, agentPreset),
         onRequestRemove: () => props.onRequestRemove(account),
         onConfirmRemove: () => props.onConfirmRemove(account),
         onCancelRemove: props.onCancelRemove,
@@ -285,6 +305,7 @@ export function mergeWeixinProvisioningSnapshot(
 export function WeixinSettingsTab({ rpcCall }) {
   const [model, setModel] = React.useState({
     phase: 'loading', bots: [], totals: EMPTY_TOTALS, revision: 0, error: null,
+    agentPresetCatalog: EMPTY_AGENT_PRESET_CATALOG,
   });
   const [provision, setProvision] = React.useState(null);
   const [busy, setBusy] = React.useState(false);
@@ -327,6 +348,7 @@ export function WeixinSettingsTab({ rpcCall }) {
       setModel({
         phase: 'ready', bots: snapshot.bots, totals: snapshot.totals,
         revision: snapshot.revision, error: null,
+        agentPresetCatalog: snapshot.agentPresetCatalog ?? EMPTY_AGENT_PRESET_CATALOG,
       });
       if (snapshot.provisioning) {
         setProvision((current) => mergeWeixinProvisioningSnapshot(
@@ -515,7 +537,10 @@ export function WeixinSettingsTab({ rpcCall }) {
         { botId: account.botId, sendTest: true },
       ));
       if (mountedRef.current && workspaceFence.canCommitMutation(snapshotVersion)) {
-        setModel((current) => ({ ...current, bots: snapshot.bots, totals: snapshot.totals, revision: snapshot.revision }));
+        setModel((current) => ({
+          ...current, bots: snapshot.bots, totals: snapshot.totals, revision: snapshot.revision,
+          agentPresetCatalog: snapshot.agentPresetCatalog ?? current.agentPresetCatalog,
+        }));
       }
       const refreshed = snapshot.bots.find((bot) => bot.botId === account.botId);
       let feedback;
@@ -559,6 +584,29 @@ export function WeixinSettingsTab({ rpcCall }) {
         setModel({
           phase: 'ready', bots: snapshot.bots, totals: snapshot.totals,
           revision: snapshot.revision, error: null,
+          agentPresetCatalog: snapshot.agentPresetCatalog ?? EMPTY_AGENT_PRESET_CATALOG,
+        });
+      }
+    } finally {
+      const shouldRefresh = workspaceFence.endMutation();
+      if (shouldRefresh && mountedRef.current) void loadStatus({ silent: true });
+      if (mountedRef.current) setBotBusy(account.botId, null);
+    }
+  }, [invoke, loadStatus, setBotBusy, workspaceFence]);
+
+  const saveAgentPreset = React.useCallback(async (account, agentPreset) => {
+    const snapshotVersion = workspaceFence.beginMutation();
+    setBotBusy(account.botId, 'preset');
+    try {
+      const snapshot = normalizeSnapshot(await invoke(
+        WEIXIN_ENDPOINTS.setAgentPreset,
+        { botId: account.botId, agentPreset },
+      ));
+      if (mountedRef.current && workspaceFence.canCommitMutation(snapshotVersion)) {
+        setModel({
+          phase: 'ready', bots: snapshot.bots, totals: snapshot.totals,
+          revision: snapshot.revision, error: null,
+          agentPresetCatalog: snapshot.agentPresetCatalog ?? EMPTY_AGENT_PRESET_CATALOG,
         });
       }
     } finally {
@@ -577,7 +625,10 @@ export function WeixinSettingsTab({ rpcCall }) {
         confirm: true,
       }));
       if (mountedRef.current && workspaceFence.canCommitMutation(snapshotVersion)) {
-        setModel((current) => ({ ...current, bots: snapshot.bots, totals: snapshot.totals, revision: snapshot.revision }));
+        setModel((current) => ({
+          ...current, bots: snapshot.bots, totals: snapshot.totals, revision: snapshot.revision,
+          agentPresetCatalog: snapshot.agentPresetCatalog ?? current.agentPresetCatalog,
+        }));
       }
       setRemoveTarget(null);
       announce('微信账号及本机凭据已移除。');
@@ -617,7 +668,9 @@ export function WeixinSettingsTab({ rpcCall }) {
     });
   }
 
-  return h('section', { className: 'dxw-page dim-channelPage', 'aria-label': '微信设置' },
+  return h(AgentPresetCatalogContext.Provider, {
+    value: model.agentPresetCatalog ?? EMPTY_AGENT_PRESET_CATALOG,
+  }, h('section', { className: 'dxw-page dim-channelPage', 'aria-label': '微信设置' },
     h(Heading, {
       totals: model.totals,
       adding: Boolean(provision),
@@ -650,23 +703,11 @@ export function WeixinSettingsTab({ rpcCall }) {
                   removeTarget,
                   onReconnect: (account) => void reconnect(account),
                   onWorkspaceSave: saveWorkspace,
+                  onAgentPresetSave: saveAgentPreset,
                   onRequestRemove: (account) => setRemoveTarget(account.botId),
                   onConfirmRemove: (account) => void remove(account),
                   onCancelRemove: () => setRemoveTarget(null),
                 })
               : null),
-  );
-}
-
-export function apply(ctx) {
-  ctx.effect(() => installWeixinStyles(), 'weixin-settings: install client styles');
-  const rpcCall = (endpoint, payload, signal) =>
-    ctx.connection.rpc.call(WEIXIN_RPC_CHANNEL, endpoint, payload, signal);
-  ctx.slots.inject('settings.plugins.tab', () => ctx.slots.register({
-    name: 'settings.plugins.tab',
-    id: 'weixin',
-    order: 30,
-    label: '微信',
-    inject: () => ({ rpcCall }),
-  }, WeixinSettingsTab));
+  ));
 }

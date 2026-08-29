@@ -11,14 +11,10 @@ test('StateStore persists sessions and dedupe ids', async () => {
   const first = await new StateStore(path).load();
   await first.setSession('group:one', 'session-one');
   await first.markSeen('message-one');
-  await first.setConnectionTestTarget({ chatId: 'oc_private' });
 
   const second = await new StateStore(path).load();
   assert.equal(second.sessionFor('group:one'), 'session-one');
   assert.equal(second.hasSeen('message-one'), true);
-  assert.deepEqual(second.connectionTestTarget(), { chatId: 'oc_private' });
-  await second.clearSessions();
-  assert.deepEqual(second.connectionTestTarget(), { chatId: 'oc_private' });
   assert.equal(JSON.parse(await readFile(path, 'utf8')).version, 1);
 });
 

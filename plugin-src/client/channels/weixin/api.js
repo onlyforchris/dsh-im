@@ -1,3 +1,6 @@
+import { normalizeAgentPresetCatalog, normalizeAgentPresetId, SET_AGENT_PRESET_ENDPOINT } from '../../agent-preset.js';
+import { normalizeLastMessageError } from '../../last-message-error.js';
+
 export const WEIXIN_RPC_CHANNEL = '/weixin';
 export const WEIXIN_ENDPOINTS = Object.freeze({
   status: 'connection.status',
@@ -8,6 +11,7 @@ export const WEIXIN_ENDPOINTS = Object.freeze({
   reconnectBot: 'bot.reconnect',
   deleteBot: 'bot.delete',
   setWorkspace: 'bot.workspace.set',
+  setAgentPreset: SET_AGENT_PRESET_ENDPOINT,
 });
 
 const ACCOUNT_STATES = new Set(['connected', 'connecting', 'offline', 'error']);
@@ -70,7 +74,8 @@ export function safeVerificationUrl(value) {
     const url = new URL(value);
     const host = url.hostname.toLowerCase();
     return url.protocol === 'https:'
-      && (host === 'weixin.qq.com' || host.endsWith('.weixin.qq.com'))
+      && (host === 'weixin.qq.com' || host.endsWith('.weixin.qq.com')
+        || host === 'wechat.com' || host.endsWith('.wechat.com'))
       ? url.toString()
       : undefined;
   } catch {
@@ -115,6 +120,7 @@ function normalizeBot(value) {
     connected,
     configured: value.configured === true,
     workspace: string(value.workspace).slice(0, 4_096),
+    agentPreset: normalizeAgentPresetId(value.agentPreset),
     bot: {
       name: string(value.bot.name, '微信机器人'),
       accountIdMasked: string(value.bot.accountIdMasked, '已安全保存'),
@@ -128,6 +134,7 @@ function normalizeBot(value) {
       messagesReceived: Math.max(0, Number(value.stats?.messagesReceived) || 0),
       messagesReplied: Math.max(0, Number(value.stats?.messagesReplied) || 0),
     },
+    lastMessageError: normalizeLastMessageError(value.lastMessageError),
     error: isRecord(value.error)
       ? {
           code: string(value.error.code, 'WEIXIN_ACCOUNT_ERROR'),
@@ -153,6 +160,7 @@ export function normalizeSnapshot(value) {
     },
     provisioning: value.provisioning ? normalizeProvisioning(value.provisioning) : null,
     testMessage: normalizeTestMessage(value.testMessage),
+    agentPresetCatalog: normalizeAgentPresetCatalog(value.agentPresetCatalog),
   };
 }
 

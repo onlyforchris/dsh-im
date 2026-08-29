@@ -3,14 +3,83 @@ import { randomUUID } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 
 import { adoptRegisteredWorkspaceSession } from './harness-session-binding.mjs';
+import {
+  appendInboundFilesToPrompt,
+  InboundFileError,
+} from './inbound-file.mjs';
+import { outboundArtifactRegistry } from './semantic/artifact.mjs';
+import { t } from './i18n.mjs';
+import { watchHarnessMux } from './harness-mux.mjs';
 
 // Every channel plugin runs in the same Host process. Sharing ownership by
-// Harness origin prevents two channel-specific clients bound to one Session
+// Host identity (or an explicitly configured HTTP origin) prevents clients
+// bound to one Session
 // from claiming or cancelling each other's interactions.
 const interactionRegistries = new Map();
+const hostInteractionRegistries = new WeakMap();
+const MAX_ERROR_CLASSIFICATION_BYTES = 64;
 
-function interactionRegistry(origin) {
-  let registry = interactionRegistries.get(origin);
+async function smallResponseText(response) {
+  const stream = response?.body;
+  if (!stream || typeof stream.getReader !== 'function') return null;
+
+  const reader = stream.getReader();
+  const chunks = [];
+  let length = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!(value instanceof Uint8Array)
+        || length + value.byteLength > MAX_ERROR_CLASSIFICATION_BYTES) return null;
+      chunks.push(value);
+      length += value.byteLength;
+    }
+  } catch {
+    return null;
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      // The response body is diagnostic-only; cancellation failures do not
+      // replace the HTTP status that caused the transport error.
+    }
+  }
+
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+function isLoopbackHarnessHostname(hostname) {
+  if (hostname === 'localhost' || hostname === '[::1]') return true;
+  const parts = hostname.split('.');
+  return parts.length === 4
+    && parts[0] === '127'
+    && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+}
+
+async function harnessHttpErrorCode(response, hostname) {
+  if (response.status === 401) return 'harness-auth-required';
+  if (response.status === 407) return 'harness-proxy-auth-required';
+  if (response.status === 403) {
+    const body = await smallResponseText(response);
+    if (body?.trim() !== 'forbidden') return 'harness-request-forbidden';
+    return isLoopbackHarnessHostname(hostname)
+      ? 'harness-loopback-forbidden'
+      : 'harness-host-untrusted';
+  }
+  if (response.status === 404) return 'harness-api-not-found';
+  return 'harness-http-failed';
+}
+
+function interactionRegistry(scope) {
+  const registries = typeof scope === 'string' ? interactionRegistries : hostInteractionRegistries;
+  let registry = registries.get(scope);
   if (!registry) {
     registry = {
       ownerships: new Map(),
@@ -18,9 +87,36 @@ function interactionRegistry(origin) {
       controls: new WeakMap(),
       nextOrder: 0,
     };
-    interactionRegistries.set(origin, registry);
+    registries.set(scope, registry);
   }
   return registry;
+}
+
+// A Host RPC may not accept cancellation itself. Bound the caller's wait
+// without retrying an operation that the Host may already have accepted.
+function callWithSignal(call, signal) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener('abort', handleAbort);
+    const handleAbort = () => {
+      cleanup();
+      reject(signal.reason);
+    };
+    if (signal.aborted) {
+      handleAbort();
+      return;
+    }
+    signal.addEventListener('abort', handleAbort, { once: true });
+    Promise.resolve().then(() => {
+      signal.throwIfAborted();
+      return call();
+    }).then((value) => {
+      cleanup();
+      resolve(value);
+    }, (error) => {
+      cleanup();
+      reject(error);
+    });
+  });
 }
 
 function normalizeControl(control) {
@@ -39,7 +135,26 @@ function validModelSelection(value) {
     && Boolean(value.provider)
     && typeof value.model === 'string'
     && Boolean(value.model)
-    && (value.reasoningEffort === undefined || typeof value.reasoningEffort === 'string');
+    && (value.reasoningEffort === undefined
+      || (typeof value.reasoningEffort === 'string' && Boolean(value.reasoningEffort)));
+}
+
+function validModelReasoning(value) {
+  return value !== null
+    && typeof value === 'object'
+    && Array.isArray(value.efforts)
+    && value.efforts.length > 0
+    && value.efforts.every((effort) => (
+      effort !== null
+      && typeof effort === 'object'
+      && typeof effort.id === 'string'
+      && Boolean(effort.id)
+      && typeof effort.name === 'string'
+      && Boolean(effort.name)
+      && (effort.description === undefined || typeof effort.description === 'string')
+    ))
+    && (value.defaultEffort === undefined
+      || (typeof value.defaultEffort === 'string' && Boolean(value.defaultEffort)));
 }
 
 function validateModelCatalog(value, method, { session = false } = {}) {
@@ -58,7 +173,9 @@ function validateModelCatalog(value, method, { session = false } = {}) {
     for (const model of group.models) {
       if (!model || typeof model !== 'object'
         || typeof model.id !== 'string' || !model.id
-        || typeof model.name !== 'string' || !model.name) {
+        || typeof model.name !== 'string' || !model.name
+        || (model.description !== undefined && typeof model.description !== 'string')
+        || (model.reasoning !== undefined && !validModelReasoning(model.reasoning))) {
         throw new Error(`Harness returned an invalid response for ${method}`);
       }
     }
@@ -158,6 +275,11 @@ function workspaceSessions(workspace, archivedSessionIds, sessionList) {
         origin: summary?.origin === 'subagent' ? 'subagent' : null,
         summaryAvailable: summary !== undefined,
       };
+      const lastSeq = summary?.projections?.asOfSeq;
+      // This is the projection's durable lower bound, not necessarily the live
+      // log tail for a cold session. Harness uses -1 as the legitimate bound
+      // for a session with no projected events yet.
+      if (Number.isSafeInteger(lastSeq) && lastSeq >= -1) session.lastSeq = lastSeq;
       const time = sessionTimeMs(summary);
       if (time !== null) session.time = time;
       return session;
@@ -189,6 +311,21 @@ function assistantMessageText(event) {
     .map((part) => part.text)
     .join('\n')
     .trim();
+}
+
+function nonEmptyText(value) {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+/** Flatten a tool/result error payload into a displayable one-line reason. */
+function toolResultErrorText(error) {
+  if (!error || typeof error !== 'object') return null;
+  const message = nonEmptyText(error.message);
+  if (message) return message;
+  const name = nonEmptyText(error.name);
+  const code = nonEmptyText(error.code);
+  if (name || code) return [name ?? 'Error', code].filter(Boolean).join(': ');
+  return null;
 }
 
 function consumeInteractionOwnership(ownership, entries) {
@@ -261,6 +398,8 @@ export class HarnessReplyTracker {
   #latestText = '';
   #finished = false;
   #reason = null;
+  #toolNames = new Map();
+  #lastToolName = null;
 
   constructor({ promptRpcId, afterSeq = -1 }) {
     this.#promptRpcId = promptRpcId;
@@ -287,8 +426,20 @@ export class HarnessReplyTracker {
     return this.#targetTurn;
   }
 
-  consume(entries) {
-    let update = null;
+  consumeAll(entries) {
+    const updates = [];
+    // 同一批轮询内的 text 帧只保留最新累积，其余事件逐帧透出，
+    // 让消费方能按顺序看到每个工具调用与结果。
+    const pushUpdate = (update) => {
+      if (update.type === 'text' && updates.length > 0) {
+        const last = updates[updates.length - 1];
+        if (last.type === 'text') {
+          updates[updates.length - 1] = update;
+          return;
+        }
+      }
+      updates.push(update);
+    };
     const ordered = [...entries]
       .map((entry) => entry?.event ?? entry)
       .filter(Boolean)
@@ -330,7 +481,7 @@ export class HarnessReplyTracker {
           .trim();
         if (text && text !== this.#latestText) {
           this.#latestText = text;
-          update = { type: 'text', text };
+          pushUpdate({ type: 'text', text });
         }
         continue;
       }
@@ -339,18 +490,38 @@ export class HarnessReplyTracker {
         const text = assistantMessageText(event);
         if (text && text !== this.#latestText) {
           this.#latestText = text;
-          update = { type: 'text', text };
+          pushUpdate({ type: 'text', text });
         }
         continue;
       }
 
       if (event.type === 'tool/call') {
-        update = { type: 'tool', name: event.data?.name ?? '工具' };
+        const name = nonEmptyText(event.data?.name) ?? t('工具');
+        const callId = nonEmptyText(event.data?.callId)
+          ?? nonEmptyText(event.data?.subCallId);
+        if (callId) this.#toolNames.set(callId, name);
+        this.#lastToolName = name;
+        pushUpdate({ type: 'tool', name, ...(callId ? { callId } : {}) });
       } else if (event.type === 'tool/result') {
-        update = { type: 'status', text: '正在整理结果…' };
+        const callId = nonEmptyText(event.data?.message?.source?.callId)
+          ?? nonEmptyText(event.data?.callId)
+          ?? nonEmptyText(event.data?.subCallId);
+        const toolName = (callId ? this.#toolNames.get(callId) : null)
+          ?? this.#lastToolName;
+        const error = toolResultErrorText(event.data?.error);
+        pushUpdate({
+          type: 'status',
+          text: t('正在整理结果…'),
+          ...(toolName ? { toolName } : {}),
+          ...(error ? { error } : {}),
+        });
       }
     }
-    return update;
+    return updates;
+  }
+
+  consume(entries) {
+    return this.consumeAll(entries).at(-1) ?? null;
   }
 }
 
@@ -364,6 +535,26 @@ export class HarnessRpcError extends Error {
   }
 }
 
+export class HarnessTransportError extends Error {
+  constructor(code, method, { cause, status } = {}) {
+    const statusDetail = Number.isInteger(status) ? `, HTTP ${status}` : '';
+    super(`Harness ${method} transport failed (${code}${statusDetail})`, { cause });
+    this.name = 'HarnessTransportError';
+    this.code = code;
+    this.method = method;
+    if (Number.isInteger(status)) this.status = status;
+  }
+}
+
+export class HarnessHealthError extends Error {
+  constructor(cause) {
+    super('Harness health RPC was rejected', { cause });
+    this.name = 'HarnessHealthError';
+    this.code = 'harness-rpc-rejected';
+    this.method = 'host.describe';
+  }
+}
+
 export class HarnessInteractionError extends Error {
   constructor(code, message) {
     super(message);
@@ -372,8 +563,44 @@ export class HarnessInteractionError extends Error {
   }
 }
 
+export class HarnessTurnError extends Error {
+  constructor(code, { reason, providerCode } = {}) {
+    super(`Harness turn failed (${code})`);
+    this.name = 'HarnessTurnError';
+    this.code = code;
+    this.promptAccepted = true;
+    if (reason && typeof reason === 'object') this.reason = reason;
+    if (typeof providerCode === 'string' && providerCode) this.providerCode = providerCode;
+  }
+}
+
+function harnessTurnError(reason) {
+  const kind = nonEmptyText(reason?.kind) ?? nonEmptyText(reason);
+  if (kind === 'error') {
+    const failure = reason?.error ?? reason?.failure;
+    return new HarnessTurnError('harness-turn-failed', {
+      reason,
+      providerCode: nonEmptyText(failure?.code) ?? undefined,
+    });
+  }
+  if (kind === 'max-tokens') return new HarnessTurnError('model-max-tokens', { reason });
+  if (kind === 'blocked') return new HarnessTurnError('turn-blocked', { reason });
+  if (['interrupted', 'stopped', 'cancelled', 'canceled'].includes(kind)) {
+    return new HarnessTurnError('turn-interrupted', { reason });
+  }
+  if (kind === 'aborted') return new HarnessTurnError('turn-aborted', { reason });
+  if (kind === 'completed') return new HarnessTurnError('model-empty-response', { reason });
+  return new HarnessTurnError('harness-turn-failed', { reason });
+}
+
+function harnessTurnSucceeded(reason) {
+  if (reason === null || reason === undefined) return true;
+  return (nonEmptyText(reason?.kind) ?? nonEmptyText(reason)) === 'completed';
+}
+
 export class HarnessClient {
   #baseUrl;
+  #apiProxy;
   #workspace;
   #agentPreset;
   #autostart;
@@ -386,6 +613,7 @@ export class HarnessClient {
   #commandExecutor;
   #controlExecutor;
   #sessionMaintenanceExecutor;
+  #fileIngressExecutor;
   #managedProcess = null;
   #interactionRegistry;
   #interactionOwnerships;
@@ -394,6 +622,8 @@ export class HarnessClient {
 
   constructor({
     baseUrl,
+    apiProxy,
+    interactionScope = apiProxy,
     workspace,
     agentPreset,
     autostart = false,
@@ -406,6 +636,7 @@ export class HarnessClient {
     commandExecutor,
     controlExecutor,
     sessionMaintenanceExecutor,
+    fileIngressExecutor,
   }) {
     if (typeof createWebSocket !== 'function') {
       throw new TypeError('createWebSocket must be a function');
@@ -429,11 +660,22 @@ export class HarnessClient {
       && typeof sessionMaintenanceExecutor !== 'function') {
       throw new TypeError('sessionMaintenanceExecutor must be a function');
     }
-    this.#baseUrl = new URL(baseUrl);
+    if (fileIngressExecutor !== undefined && typeof fileIngressExecutor !== 'function') {
+      throw new TypeError('fileIngressExecutor must be a function');
+    }
+    this.#baseUrl = baseUrl === undefined ? null : new URL(baseUrl);
+    this.#apiProxy = this.#baseUrl ? null : apiProxy;
+    if (!this.#baseUrl && (!this.#apiProxy || typeof this.#apiProxy !== 'object')) {
+      throw new TypeError('HarnessClient requires the current Host apiProxy or an explicit baseUrl');
+    }
+    if (this.#apiProxy && (!interactionScope
+      || !['object', 'function'].includes(typeof interactionScope))) {
+      throw new TypeError('interactionScope must identify the current Host');
+    }
     this.#workspace = workspace;
     // Keep an omitted preset absent so session.create resolves the Host's current default.
     this.#agentPreset = agentPreset ?? undefined;
-    this.#autostart = autostart;
+    this.#autostart = Boolean(this.#baseUrl && autostart);
     this.#dshBin = dshBin;
     this.#fetch = fetchImpl;
     this.#createWebSocket = createWebSocket;
@@ -443,7 +685,8 @@ export class HarnessClient {
     this.#commandExecutor = commandExecutor;
     this.#controlExecutor = controlExecutor;
     this.#sessionMaintenanceExecutor = sessionMaintenanceExecutor;
-    this.#interactionRegistry = interactionRegistry(this.#baseUrl.origin);
+    this.#fileIngressExecutor = fileIngressExecutor;
+    this.#interactionRegistry = interactionRegistry(this.#baseUrl?.origin ?? interactionScope);
     this.#interactionOwnerships = this.#interactionRegistry.ownerships;
     this.#interactionClaims = this.#interactionRegistry.claims;
     this.#controlOwnerships = this.#interactionRegistry.controls;
@@ -460,24 +703,68 @@ export class HarnessClient {
     const signal = options.signal
       ? AbortSignal.any([options.signal, timeoutSignal])
       : timeoutSignal;
-    const response = await this.#fetch(new URL(`/api/${method}`, this.#baseUrl), {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ type: 'client-request', rpcId, method, payload }),
-      signal,
-    });
-    if (!response.ok) throw new Error(`Harness transport ${method} failed: HTTP ${response.status}`);
-    const body = await response.json();
+    let body;
+    try {
+      if (this.#apiProxy) {
+        const [domain, action, extra] = method.split('.');
+        const namespace = { host: 'host', workspace: 'workspace', session: 'sessions', llm: 'llm' }[domain];
+        const api = namespace && this.#apiProxy[namespace];
+        if (extra !== undefined || !Object.hasOwn(api ?? {}, action)
+          || typeof api[action] !== 'function') {
+          throw new HarnessTransportError('harness-api-not-found', method);
+        }
+        const response = await callWithSignal(() => api[action]({ rpcId, payload }, signal), signal);
+        body = { type: 'server-response', ...response };
+      } else {
+        const response = await this.#fetch(new URL(`/api/${method}`, this.#baseUrl), {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ type: 'client-request', rpcId, method, payload }),
+          signal,
+        });
+        if (!response.ok) {
+          const code = await harnessHttpErrorCode(response, this.#baseUrl.hostname);
+          throw new HarnessTransportError(code, method, { status: response.status });
+        }
+        try {
+          body = await response.json();
+        } catch (error) {
+          throw new HarnessTransportError('harness-response-invalid', method, { cause: error });
+        }
+      }
+    } catch (error) {
+      // Preserve an explicit caller cancellation; it is control flow, not a
+      // Harness availability diagnosis.
+      if (options.signal?.aborted) throw error;
+      if (error instanceof HarnessTransportError) throw error;
+      throw new HarnessTransportError(
+        timeoutSignal.aborted ? 'harness-timeout' : 'harness-connect-failed',
+        method,
+        { cause: error },
+      );
+    }
     if (body?.type !== 'server-response' || body?.rpcId !== rpcId) {
-      throw new Error(`Harness returned an invalid response for ${method}`);
+      throw new HarnessTransportError('harness-response-invalid', method, {
+        cause: new Error(`Harness returned an invalid response for ${method}`),
+      });
+    }
+    if (!body.result || typeof body.result !== 'object' || typeof body.result.ok !== 'boolean') {
+      throw new HarnessTransportError('harness-response-invalid', method, {
+        cause: new Error(`Harness returned an invalid result for ${method}`),
+      });
     }
     if (!body.result?.ok) throw new HarnessRpcError(method, body.result?.error);
     return body.result.value;
   }
 
   async health(options = {}) {
-    await this.rpc('host.describe', {}, 5_000, options);
-    return true;
+    try {
+      await this.rpc('host.describe', {}, 5_000, options);
+      return true;
+    } catch (error) {
+      if (error instanceof HarnessRpcError) throw new HarnessHealthError(error);
+      throw error;
+    }
   }
 
   async ensureRunning(options = {}) {
@@ -511,7 +798,8 @@ export class HarnessClient {
         lastError = error;
       }
     }
-    throw new Error(`Harness did not become ready: ${lastError?.message ?? 'timeout'}`);
+    if (lastError) throw lastError;
+    throw new HarnessTransportError('harness-timeout', 'host.describe');
   }
 
   async listWorkspaces(options = {}) {
@@ -555,6 +843,9 @@ export class HarnessClient {
         sessionId,
         provider: selection.provider,
         model: selection.model,
+        ...(selection.reasoningEffort === undefined
+          ? {}
+          : { reasoningEffort: selection.reasoningEffort }),
       }, 30_000, signal ? { ...options, signal } : options);
     };
     const value = this.#sessionMaintenanceExecutor
@@ -597,11 +888,13 @@ export class HarnessClient {
   }
 
   async createSession(options = {}) {
-    await this.ensureRunning(options);
-    const workspaceId = await this.workspaceId(options);
+    const { agentPreset: requestedPreset, ...rpcOptions } = options;
+    await this.ensureRunning(rpcOptions);
+    const workspaceId = await this.workspaceId(rpcOptions);
     const payload = { workspaceId };
-    if (this.#agentPreset !== undefined) payload.agentPreset = this.#agentPreset;
-    const created = await this.rpc('session.create', payload, 30_000, options);
+    const agentPreset = requestedPreset !== undefined ? requestedPreset : this.#agentPreset;
+    if (agentPreset != null) payload.agentPreset = agentPreset;
+    const created = await this.rpc('session.create', payload, 30_000, rpcOptions);
     return created.sessionId;
   }
 
@@ -623,6 +916,19 @@ export class HarnessClient {
     }
   }
 
+  async readSessionHistory(sessionId, { maxMessages = 50, beforeSeq, timeoutMs = 10_000, ...options } = {}) {
+    if (typeof sessionId !== 'string' || !sessionId) throw new TypeError('sessionId is required');
+    if (!Number.isSafeInteger(maxMessages) || maxMessages < 1
+      || (beforeSeq !== undefined && (!Number.isSafeInteger(beforeSeq) || beforeSeq < 0))) {
+      throw new TypeError('Invalid history pagination');
+    }
+    return this.rpc('session.history', {
+      sessionId,
+      maxMessages,
+      ...(beforeSeq === undefined ? {} : { beforeSeq }),
+    }, timeoutMs, options);
+  }
+
   async sessionExists(sessionId, options = {}) {
     try {
       await this.rpc('session.history', { sessionId, maxMessages: 1 }, 30_000, options);
@@ -642,16 +948,22 @@ export class HarnessClient {
     const signal = options.signal
       ? AbortSignal.any([options.signal, timeoutSignal])
       : timeoutSignal;
-    const response = await this.#fetch(new URL('/api/respond', this.#baseUrl), {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ type: 'client-response', rpcId, result }),
-      signal,
-    });
-    if (!response.ok) {
-      throw new Error(`Harness transport respond failed: HTTP ${response.status}`);
+    const envelope = { type: 'client-response', rpcId, result };
+    let receipt;
+    if (this.#apiProxy) {
+      receipt = await callWithSignal(() => this.#apiProxy.respond(envelope), signal);
+    } else {
+      const response = await this.#fetch(new URL('/api/respond', this.#baseUrl), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(envelope),
+        signal,
+      });
+      if (!response.ok) {
+        throw new Error(`Harness transport respond failed: HTTP ${response.status}`);
+      }
+      receipt = await response.json();
     }
-    const receipt = await response.json();
     if (receipt?.accepted === true) return receipt;
     if (receipt?.accepted !== false
       || (receipt.reason !== 'bad-response' && receipt.reason !== 'not-pending')) {
@@ -687,7 +999,7 @@ export class HarnessClient {
 
     while (!signal.aborted) {
       try {
-        await this.#watchInteractionSocket(sessionId, {
+        await this.#watchInteractionStream(sessionId, {
           signal,
           onInteraction,
           onResolved,
@@ -916,6 +1228,8 @@ export class HarnessClient {
     const timeoutMs = options.timeoutMs ?? 600_000;
     const signal = options.signal;
     const onUpdate = typeof options.onUpdate === 'function' ? options.onUpdate : null;
+    const progressMode = options.progressMode === 'all' ? 'all' : 'latest';
+    const onArtifact = typeof options.onArtifact === 'function' ? options.onArtifact : null;
     const onInteraction = typeof options.onInteraction === 'function'
       ? options.onInteraction
       : undefined;
@@ -923,6 +1237,7 @@ export class HarnessClient {
       ? options.onInteractionResolved
       : undefined;
     const control = normalizeControl(options.control);
+    const inboundFiles = Array.isArray(options.files) ? options.files.filter(Boolean) : [];
     await this.ensureRunning({ signal });
     const before = await this.rpc(
       'session.history',
@@ -962,13 +1277,63 @@ export class HarnessClient {
         }
       : null;
     let interactionTask = null;
+    let artifactsDelivered = false;
+    let deliveredArtifactCount = 0;
+    let stagedInboundFiles = null;
+    let promptAccepted = false;
+    let turnFinished = false;
+
+    const deliverArtifacts = async () => {
+      if (!onArtifact || artifactsDelivered || tracker.turn === null) {
+        return deliveredArtifactCount;
+      }
+      artifactsDelivered = true;
+      const artifacts = outboundArtifactRegistry.take(sessionId, tracker.turn, { signal });
+      for (const artifact of artifacts) {
+        try {
+          await onArtifact(artifact);
+          deliveredArtifactCount += 1;
+        } catch (error) {
+          outboundArtifactRegistry.release(artifact);
+          console.warn(`[${this.#logPrefix}] ignored an artifact handoff failure:`, error.message);
+        }
+      }
+      return deliveredArtifactCount;
+    };
 
     if (ownership) {
       this.#registerInteractionOwnership(sessionId, ownership);
       this.#registerControlOwnership(ownership);
     }
+    // This is resource ownership, not a feature Gate: it lets the Host retain
+    // this Turn's snapshots until the channel has polled and claimed them.
+    const closeArtifactConsumer = outboundArtifactRegistry.openConsumer(sessionId, promptRpcId);
 
     try {
+      if (inboundFiles.length > 0) {
+        if (!this.#fileIngressExecutor) {
+          throw new InboundFileError(
+            'inbound-file-ingress-unavailable',
+            'Harness file ingress is unavailable in this Host process.',
+          );
+        }
+        const sessionList = await this.rpc(
+          'session.list',
+          {},
+          30_000,
+          { signal },
+        );
+        const sessionWorkspace = sessionList?.items?.find(
+          (item) => item?.sessionId === sessionId,
+        )?.cwd;
+        stagedInboundFiles = await this.#fileIngressExecutor({
+          sessionId,
+          workspace: sessionWorkspace,
+          files: inboundFiles,
+          signal,
+        });
+        prompt = appendInboundFilesToPrompt(prompt, stagedInboundFiles);
+      }
       if (interactionSignal) {
         let markOpen;
         const opened = new Promise((resolve) => { markOpen = resolve; });
@@ -1000,6 +1365,7 @@ export class HarnessClient {
         content,
         clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       }, 30_000, { rpcId: promptRpcId, signal });
+      promptAccepted = true;
 
       try {
         const deadline = Date.now() + timeoutMs;
@@ -1016,215 +1382,254 @@ export class HarnessClient {
             this.#consumeInteractionOwnerships(sessionId, history.events ?? []);
             if (!wasActive && ownership.active) ownership.reconnect?.();
           }
-          const update = tracker.consume(history.events ?? []);
-          if (update && onUpdate) {
-            try {
-              await onUpdate(update);
-            } catch (error) {
-              console.warn(`[${this.#logPrefix}] ignored a progress update failure:`, error.message);
+          const updates = tracker.consumeAll(history.events ?? []);
+          if (onUpdate) {
+            const visibleUpdates = progressMode === 'all' ? updates : updates.slice(-1);
+            for (const update of visibleUpdates) {
+              try {
+                await onUpdate(update);
+              } catch (error) {
+                console.warn(`[${this.#logPrefix}] ignored a progress update failure:`, error.message);
+              }
             }
           }
           if (!tracker.finished) continue;
-          if (tracker.answer) return tracker.answer;
+          turnFinished = true;
+          if (!ownership?.stopRequested && !harnessTurnSucceeded(tracker.reason)) {
+            throw harnessTurnError(tracker.reason);
+          }
+          // An accepted /stop revokes attachment delivery even when Harness
+          // preserved a useful partial text answer for the existing UX.
+          const artifactCount = ownership?.stopRequested
+            ? 0
+            : await deliverArtifacts();
+          if (tracker.answer) {
+            return tracker.answer;
+          }
+          if (artifactCount > 0) return '';
           if (ownership?.stopRequested) throw turnStoppedError();
-          throw new Error(
-            `Harness turn ended without a text reply${tracker.reason ? ` (${JSON.stringify(tracker.reason)})` : ''}`,
-          );
+          throw harnessTurnError(tracker.reason);
         }
-        throw new Error(`Harness reply timed out after ${Math.round(timeoutMs / 1_000)} seconds`);
+        throw new HarnessTurnError('harness-reply-timeout');
       } catch (error) {
         // Once cancellation was accepted, transport/poll failures and timeouts
         // describe the convergence of that stop, not an unrelated ask failure.
         if (!ownership?.stopRequested) throw error;
-        if (tracker.answer) return tracker.answer;
+        if (tracker.answer) {
+          return tracker.answer;
+        }
         if (error?.code === 'turn-stopped') throw error;
         throw turnStoppedError();
       }
     } finally {
+      if (stagedInboundFiles && (!promptAccepted || turnFinished)) {
+        await stagedInboundFiles.cleanup().catch((error) => {
+          console.warn(`[${this.#logPrefix}] unable to clean inbound files:`, error.message);
+        });
+      }
+      closeArtifactConsumer();
       if (ownership) {
         this.#unregisterControlOwnership(ownership);
         this.#unregisterInteractionOwnership(sessionId, ownership);
       }
+      if (tracker.turn !== null) outboundArtifactRegistry.discard(sessionId, tracker.turn);
       interactionController?.abort(new DOMException('Harness turn finished', 'AbortError'));
       if (interactionTask) await interactionTask.catch(() => undefined);
     }
   }
 
-  #watchInteractionSocket(sessionId, {
+  async #watchInteractionStream(sessionId, {
     signal,
     onInteraction,
     onResolved,
     onOpen,
     ownership,
   }) {
-    const url = new URL('/api/events.mux', this.#baseUrl);
-    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-
-    return new Promise((resolve, reject) => {
-      let socket;
+    let settled = false;
+    let callbackFailure = null;
+    let callbackTail = Promise.resolve();
+    let ownershipReady = ownership === undefined || ownership === null;
+    const bufferedEnvelopes = [];
+    let close = () => {};
+    const handleOpen = (closeStream) => {
+      close = closeStream;
+      if (ownership) ownership.reconnect = close;
       try {
-        socket = this.#createWebSocket(url.toString());
+        onOpen?.();
       } catch (error) {
-        reject(error);
+        console.warn(`[${this.#logPrefix}] ignored an interaction open callback failure:`, error.message);
+      }
+      if (ownership) {
+        void this.#refreshInteractionOwnerships(sessionId, signal).then(() => {
+          if (settled) return;
+          ownershipReady = true;
+          for (const envelope of bufferedEnvelopes.splice(0)) processEnvelope(envelope);
+        }).catch((error) => {
+          callbackFailure ??= error;
+          close();
+        });
+      }
+    };
+    const dispatch = (callback, value) => {
+      if (!callback) return;
+      callbackTail = callbackTail
+        .then(() => callback(value))
+        .catch((error) => {
+          callbackFailure ??= error;
+          close();
+        });
+    };
+    const processEnvelope = (envelope) => {
+      const payload = envelope.payload;
+      if (ownership && payload.type === 'session/event') {
+        this.#consumeInteractionOwnerships(sessionId, [payload.event]);
         return;
       }
-      let opened = false;
-      let settled = false;
-      let callbackFailure = null;
-      let callbackTail = Promise.resolve();
-      let ownershipReady = ownership === undefined || ownership === null;
-      const bufferedEnvelopes = [];
-      const finish = (error) => {
-        if (settled) return;
-        settled = true;
-        socket.removeEventListener('open', handleOpen);
-        socket.removeEventListener('message', handleMessage);
-        socket.removeEventListener('close', handleClose);
-        socket.removeEventListener('error', handleError);
-        signal.removeEventListener('abort', handleAbort);
-        if (ownership?.reconnect === close) ownership.reconnect = null;
-        if (signal.aborted) {
-          resolve();
-          return;
-        }
-        void callbackTail.then(() => {
-          const failure = error ?? callbackFailure;
-          if (failure) reject(failure);
-          else resolve();
-        }, reject);
-      };
-      const close = () => {
-        try {
-          if (socket.readyState === 0 || socket.readyState === 1) socket.close();
-        } catch {
-          // Cleanup must still settle the watcher if a WebSocket rejects close while connecting.
-        }
-      };
-      const handleOpen = () => {
-        opened = true;
-        if (ownership) ownership.reconnect = close;
-        try {
-          onOpen?.();
-        } catch (error) {
-          console.warn(`[${this.#logPrefix}] ignored an interaction open callback failure:`, error.message);
-        }
+      if (payload.type === 'question/requested' || payload.type === 'approval/requested') {
+        const kind = payload.type === 'question/requested' ? 'question' : 'approval';
+        const interactionId = kind === 'question' ? envelope.rpcId : payload.approvalId;
+        const claimKey = `${kind}:${interactionId}`;
         if (ownership) {
-          void this.#refreshInteractionOwnerships(sessionId, signal).then(() => {
-            if (settled) return;
-            ownershipReady = true;
-            for (const envelope of bufferedEnvelopes.splice(0)) processEnvelope(envelope);
-          }).catch((error) => {
-            callbackFailure ??= error;
-            close();
-            finish(error);
-          });
+          const claim = this.#interactionOwner(sessionId, claimKey, kind);
+          if (claim?.ownership !== ownership) return;
+          this.#interactionClaims.set(claimKey, claim);
         }
-      };
-      const dispatch = (callback, value) => {
-        if (!callback) return;
-        callbackTail = callbackTail
-          .then(() => callback(value))
-          .catch((error) => {
-            callbackFailure ??= error;
-            close();
-            finish(callbackFailure);
-          });
-      };
-      const processEnvelope = (envelope) => {
-        const payload = envelope.payload;
-        if (ownership && payload.type === 'session/event') {
-          this.#consumeInteractionOwnerships(sessionId, [payload.event]);
-          return;
+        const toolCall = kind === 'approval' && ownership && typeof payload.callId === 'string'
+          ? this.#interactionClaims.get(claimKey)?.ownership.toolCalls.get(payload.callId)
+          : undefined;
+        dispatch(onInteraction, Object.freeze({
+          kind,
+          interactionId,
+          rpcId: envelope.rpcId,
+          sessionId,
+          payload,
+          recovered: ownership
+            ? this.#interactionClaims.get(claimKey)?.recovered === true
+            : false,
+          ...(toolCall ? { toolCall } : {}),
+          reconnect: close,
+          respond: (result, options = {}) => this.respondInteraction(
+            envelope.rpcId,
+            result,
+            { ...options, signal: options.signal ?? signal },
+          ),
+        }));
+        return;
+      }
+      if (payload.type === 'question/resolved' || payload.type === 'approval/resolved') {
+        const kind = payload.type === 'question/resolved' ? 'question' : 'approval';
+        const interactionId = kind === 'question'
+          ? payload.questionRpcId
+          : payload.approvalId;
+        const claimKey = `${kind}:${interactionId}`;
+        if (ownership) {
+          const claim = this.#interactionClaims.get(claimKey);
+          if (claim?.ownership !== ownership) return;
+          this.#interactionClaims.delete(claimKey);
         }
-        if (payload.type === 'question/requested' || payload.type === 'approval/requested') {
-          const kind = payload.type === 'question/requested' ? 'question' : 'approval';
-          const interactionId = kind === 'question' ? envelope.rpcId : payload.approvalId;
-          const claimKey = `${kind}:${interactionId}`;
-          if (ownership) {
-            const claim = this.#interactionOwner(sessionId, claimKey, kind);
-            if (claim?.ownership !== ownership) return;
-            this.#interactionClaims.set(claimKey, claim);
-          }
-          const toolCall = kind === 'approval' && ownership && typeof payload.callId === 'string'
-            ? this.#interactionClaims.get(claimKey)?.ownership.toolCalls.get(payload.callId)
-            : undefined;
-          dispatch(onInteraction, Object.freeze({
-            kind,
-            interactionId,
-            rpcId: envelope.rpcId,
-            sessionId,
-            payload,
-            recovered: ownership
-              ? this.#interactionClaims.get(claimKey)?.recovered === true
-              : false,
-            ...(toolCall ? { toolCall } : {}),
-            reconnect: close,
-            respond: (result, options = {}) => this.respondInteraction(
-              envelope.rpcId,
-              result,
-              { ...options, signal: options.signal ?? signal },
-            ),
-          }));
-          return;
+        dispatch(onResolved, Object.freeze({
+          kind,
+          interactionId,
+          sessionId,
+          outcome: payload.outcome,
+          payload,
+        }));
+      }
+    };
+    const handleEnvelope = (envelope) => {
+      try {
+        const payload = envelope?.payload;
+        if (envelope?.type !== 'server-request'
+          || typeof envelope.rpcId !== 'string'
+          || !payload || typeof payload !== 'object'
+          || envelope.method !== payload.type) {
+          throw new Error('invalid server-request envelope');
         }
-        if (payload.type === 'question/resolved' || payload.type === 'approval/resolved') {
-          const kind = payload.type === 'question/resolved' ? 'question' : 'approval';
-          const interactionId = kind === 'question'
-            ? payload.questionRpcId
-            : payload.approvalId;
-          const claimKey = `${kind}:${interactionId}`;
-          if (ownership) {
-            const claim = this.#interactionClaims.get(claimKey);
-            if (claim?.ownership !== ownership) return;
-            this.#interactionClaims.delete(claimKey);
-          }
-          dispatch(onResolved, Object.freeze({
-            kind,
-            interactionId,
-            sessionId,
-            outcome: payload.outcome,
-            payload,
-          }));
-        }
-      };
-      const handleMessage = (event) => {
-        try {
-          if (typeof event.data !== 'string') throw new Error('binary WebSocket frame');
-          const envelope = JSON.parse(event.data);
-          const payload = envelope?.payload;
-          if (envelope?.type !== 'server-request'
-            || typeof envelope.rpcId !== 'string'
-            || !payload || typeof payload !== 'object'
-            || envelope.method !== payload.type) {
-            throw new Error('invalid server-request envelope');
-          }
-          if (payload.sessionId !== sessionId) return;
-          if (!ownershipReady) bufferedEnvelopes.push(envelope);
-          else processEnvelope(envelope);
-        } catch (error) {
-          console.warn(`[${this.#logPrefix}] ignored a malformed Harness interaction frame:`, error.message);
-        }
-      };
-      const handleClose = () => finish(opened ? null : new Error(
-        'Harness interaction WebSocket closed before opening',
-      ));
-      const handleError = () => {
-        finish(new Error(opened
-          ? 'Harness interaction WebSocket failed'
-          : 'Harness interaction WebSocket failed before opening'));
-        close();
-      };
-      const handleAbort = () => {
-        close();
-        finish();
-      };
+        if (payload.sessionId !== sessionId) return;
+        if (!ownershipReady) bufferedEnvelopes.push(envelope);
+        else processEnvelope(envelope);
+      } catch (error) {
+        console.warn(`[${this.#logPrefix}] ignored a malformed Harness interaction frame:`, error.message);
+      }
+    };
+    try {
+      await this.#watchMux({ signal, onOpen: handleOpen, onEnvelope: handleEnvelope });
+    } finally {
+      settled = true;
+      if (ownership?.reconnect === close) ownership.reconnect = null;
+      if (!signal.aborted) await callbackTail;
+    }
+    if (!signal.aborted && callbackFailure) throw callbackFailure;
+  }
 
-      socket.addEventListener('open', handleOpen);
-      socket.addEventListener('message', handleMessage);
-      socket.addEventListener('close', handleClose, { once: true });
-      socket.addEventListener('error', handleError, { once: true });
-      signal.addEventListener('abort', handleAbort, { once: true });
-      if (signal.aborted) handleAbort();
+  /**
+   * Watch the global Harness event mux (all sessions) until `signal`
+   * aborts, reconnecting on drop. Both transports deliver the same envelopes;
+   * only session/event payloads are forwarded. onReconnect fires after every
+   * (re)connection so callers can compensate for events missed while offline.
+   */
+  async watchHarnessEvents({ signal, onSessionEvent, onReconnect } = {}) {
+    if (typeof onSessionEvent !== 'function') {
+      throw new TypeError('watchHarnessEvents requires onSessionEvent');
+    }
+    if (!signal || typeof signal.addEventListener !== 'function') {
+      throw new TypeError('watchHarnessEvents requires an AbortSignal');
+    }
+    if (onReconnect !== undefined && typeof onReconnect !== 'function') {
+      throw new TypeError('onReconnect must be a function');
+    }
+    while (!signal.aborted) {
+      try {
+        await this.#watchMux({
+          signal,
+          onOpen: () => {
+            try {
+              onReconnect?.();
+            } catch (error) {
+              console.warn(`[${this.#logPrefix}] mux reconnect hook failed:`, error.message);
+            }
+          },
+          onEnvelope: (envelope) => {
+            try {
+              const payload = envelope?.payload;
+              if (envelope?.type !== 'server-request'
+                || !payload
+                || typeof payload !== 'object'
+                || envelope.method !== payload.type
+                || payload.type !== 'session/event'
+                || typeof payload.sessionId !== 'string'
+                || !payload.event
+                || typeof payload.event !== 'object') return;
+              onSessionEvent({ sessionId: payload.sessionId, event: payload.event });
+            } catch (error) {
+              console.warn(`[${this.#logPrefix}] ignored a malformed global mux frame:`, error.message);
+            }
+          },
+        });
+      } catch (error) {
+        if (signal.aborted) return;
+        console.warn(`[${this.#logPrefix}] Harness event mux disconnected:`, error.message);
+      }
+      if (signal.aborted) return;
+      try {
+        await sleep(this.#interactionReconnectDelayMs, signal);
+      } catch {
+        if (signal.aborted) return;
+        throw new Error('Harness event mux reconnect wait failed');
+      }
+    }
+  }
+
+  #watchMux(options) {
+    return watchHarnessMux({
+      apiProxy: this.#apiProxy,
+      baseUrl: this.#baseUrl,
+      createWebSocket: this.#createWebSocket,
+      rpcId: `${this.#rpcIdPrefix}-${randomUUID()}`,
+      ...options,
+      onMalformed: (error) => {
+        console.warn(`[${this.#logPrefix}] ignored a malformed Harness mux frame:`, error.message);
+      },
     });
   }
 

@@ -16,9 +16,12 @@ import {
   validSlackBotToken,
 } from '../../../src/channels/slack/slack-api.mjs';
 import {
+  SlackBotClient,
   SlackRuntime,
+  isSlackToolProgress,
   normalizeSlackEvent,
 } from '../../../src/channels/slack/slack-runtime.mjs';
+import { setImHostLanguage } from '../../../src/channels/shared/i18n.mjs';
 import { SLACK_APP_MANIFEST_YAML } from '../../../src/channels/slack/manifest.mjs';
 import {
   SLACK_ENDPOINTS,
@@ -56,6 +59,20 @@ function deferred() {
   });
   return { promise, resolve, reject };
 }
+
+test('Slack recognizes localized tool progress without hiding ordinary text', () => {
+  assert.equal(isSlackToolProgress('正在使用搜索…'), true);
+  assert.equal(isSlackToolProgress('正在使用…'), false);
+  assert.equal(isSlackToolProgress('普通回复'), false);
+  setImHostLanguage('en');
+  try {
+    assert.equal(isSlackToolProgress('Using search…'), true);
+    assert.equal(isSlackToolProgress('Using …'), false);
+    assert.equal(isSlackToolProgress('Ordinary reply'), false);
+  } finally {
+    setImHostLanguage('zh');
+  }
+});
 
 async function eventually(predicate, timeoutMs = 1_000) {
   const deadline = Date.now() + timeoutMs;
@@ -134,6 +151,387 @@ test('Slack API uses native streaming methods and suppresses generated mass ment
   assert.equal(calls[3].body.text, '请通知 @channel 和 @U99999999');
 });
 
+test('Slack API and bot client add and remove reactions on the source message', async () => {
+  const calls = [];
+  const requestAbort = new AbortController();
+  const api = new SlackApi({
+    botToken: BOT_TOKEN,
+    fetchImpl: async (url, options) => {
+      calls.push({
+        method: url.pathname.split('/').pop(),
+        body: JSON.parse(options.body),
+        signal: options.signal,
+      });
+      return jsonResponse({ ok: true });
+    },
+  });
+  await api.addReaction({
+    channelId: 'C12345678',
+    messageTs: '1700000000.123',
+    emojiName: 'eyes',
+    signal: requestAbort.signal,
+    timeoutMs: 5_000,
+  });
+  await api.removeReaction({
+    channelId: 'C12345678',
+    messageTs: '1700000000.123',
+    emojiName: 'eyes',
+    signal: requestAbort.signal,
+    timeoutMs: 5_000,
+  });
+  assert.deepEqual(calls.map(({ method, body }) => ({ method, body })), [{
+    method: 'reactions.add',
+    body: { channel: 'C12345678', timestamp: '1700000000.123', name: 'eyes' },
+  }, {
+    method: 'reactions.remove',
+    body: { channel: 'C12345678', timestamp: '1700000000.123', name: 'eyes' },
+  }]);
+  requestAbort.abort();
+  assert.equal(calls.every(({ signal }) => signal.aborted), true);
+
+  const adapterCalls = [];
+  const runtimeAbort = new AbortController();
+  const sidecarAbort = new AbortController();
+  const client = new SlackBotClient({
+    api: {
+      addReaction: async (payload) => adapterCalls.push({ action: 'add', ...payload }),
+      removeReaction: async (payload) => adapterCalls.push({ action: 'remove', ...payload }),
+    },
+    signal: runtimeAbort.signal,
+  });
+  const target = { channelId: 'C12345678', messageTs: '1700000000.456' };
+  assert.equal(await client.addReaction(target, 'white_check_mark', {
+    signal: sidecarAbort.signal,
+  }), 'white_check_mark');
+  await client.removeReaction(target, 'white_check_mark', { signal: sidecarAbort.signal });
+  assert.deepEqual(adapterCalls.map(({ action, channelId, messageTs, emojiName }) => ({
+    action, channelId, messageTs, emojiName,
+  })), [{
+    action: 'add',
+    channelId: 'C12345678',
+    messageTs: '1700000000.456',
+    emojiName: 'white_check_mark',
+  }, {
+    action: 'remove',
+    channelId: 'C12345678',
+    messageTs: '1700000000.456',
+    emojiName: 'white_check_mark',
+  }]);
+  runtimeAbort.abort();
+  assert.equal(adapterCalls.every(({ signal }) => signal.aborted), false);
+  sidecarAbort.abort();
+  assert.equal(adapterCalls.every(({ signal }) => signal.aborted), true);
+  assert.match(SLACK_APP_MANIFEST_YAML, /\n\s+- reactions:write\n/);
+});
+
+test('Slack API completes the native external-upload flow in the original thread', async () => {
+  const calls = [];
+  const api = new SlackApi({
+    botToken: BOT_TOKEN,
+    appToken: APP_TOKEN,
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      if (url.pathname.endsWith('/files.getUploadURLExternal')) {
+        return jsonResponse({
+          ok: true,
+          upload_url: 'https://files.slack.com/upload/v1/TICKET',
+          file_id: 'F12345678',
+        });
+      }
+      if (url.pathname.startsWith('/upload/')) return new Response('OK', { status: 200 });
+      return jsonResponse({ ok: true, files: [{ id: 'F12345678', title: 'result.txt' }] });
+    },
+  });
+  const result = await api.uploadFile({
+    channelId: 'C12345678',
+    threadTs: '1700000000.001',
+    file: {
+      fileName: 'result.txt',
+      mediaType: 'text/plain',
+      bytes: Buffer.from('slack-result'),
+    },
+  });
+
+  assert.equal(result.files[0].id, 'F12345678');
+  assert.deepEqual(calls.map(({ url }) => url.pathname), [
+    '/api/files.getUploadURLExternal',
+    '/upload/v1/TICKET',
+    '/api/files.completeUploadExternal',
+  ]);
+  assert.equal(
+    calls[0].options.headers['content-type'],
+    'application/x-www-form-urlencoded;charset=utf-8',
+  );
+  assert.equal(calls[0].options.body, 'filename=result.txt&length=12');
+  assert.equal(calls[1].options.headers.authorization, undefined);
+  assert.equal(Buffer.from(calls[1].options.body).toString(), 'slack-result');
+  assert.equal(calls[2].options.headers['content-type'], 'application/json;charset=utf-8');
+  assert.deepEqual(JSON.parse(calls[2].options.body), {
+    files: [{ id: 'F12345678', title: 'result.txt' }],
+    channel_id: 'C12345678',
+    thread_ts: '1700000000.001',
+  });
+  assert.match(SLACK_APP_MANIFEST_YAML, /\n\s+- files:write\n/);
+});
+
+test('Slack sends PNG and JPEG artifacts through one native image-preview upload flow each', async () => {
+  const calls = [];
+  const api = new SlackApi({
+    botToken: BOT_TOKEN,
+    appToken: APP_TOKEN,
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      if (url.pathname.endsWith('/files.getUploadURLExternal')) {
+        return jsonResponse({
+          ok: true,
+          upload_url: 'https://files.slack.com/upload/v1/IMAGE',
+          file_id: `FIMAGE${calls.length}`,
+        });
+      }
+      if (url.pathname.startsWith('/upload/')) return new Response('OK', { status: 200 });
+      const completed = JSON.parse(options.body);
+      return jsonResponse({ ok: true, files: completed.files });
+    },
+  });
+
+  for (const image of [{
+    fileName: 'result.png',
+    mediaType: 'image/png',
+    bytes: Buffer.from([0x89, 0x50, 0x4e, 0x47]),
+  }, {
+    fileName: 'result.jpg',
+    mediaType: 'image/jpeg',
+    bytes: Buffer.from([0xff, 0xd8, 0xff]),
+  }]) {
+    const offset = calls.length;
+    await api.uploadFile({ channelId: 'C12345678', file: image });
+
+    assert.equal(calls.length, offset + 3);
+    assert.equal(
+      calls[offset].options.body,
+      `filename=${image.fileName}&length=${image.bytes.length}`,
+    );
+    assert.equal(calls[offset + 1].options.headers['content-type'], image.mediaType);
+    assert.deepEqual(JSON.parse(calls[offset + 2].options.body).files, [{
+      id: `FIMAGE${offset + 1}`,
+      title: image.fileName,
+    }]);
+  }
+});
+
+test('Slack file preparation maps missing scope and pre-delivery failures without claiming uncertainty', async () => {
+  const missingScopeApi = new SlackApi({
+    botToken: BOT_TOKEN,
+    fetchImpl: async () => jsonResponse({ ok: false, error: 'missing_scope' }),
+  });
+  await assert.rejects(() => missingScopeApi.uploadFile({
+    channelId: 'C12345678',
+    file: { fileName: 'result.txt', bytes: Buffer.from('result') },
+  }), (error) => error.code === 'artifact-permission-required'
+    && error.providerCode === 'missing_scope');
+
+  const invalidArgumentsApi = new SlackApi({
+    botToken: BOT_TOKEN,
+    fetchImpl: async () => jsonResponse({ ok: false, error: 'invalid_arguments' }),
+  });
+  await assert.rejects(() => invalidArgumentsApi.uploadFile({
+    channelId: 'C12345678',
+    file: { fileName: 'result.txt', bytes: Buffer.from('result') },
+  }), (error) => error.code === 'artifact-provider-rejected'
+    && error.providerCode === 'invalid_arguments'
+    && error.status === 200);
+
+  const sizeRestrictedApi = new SlackApi({
+    botToken: BOT_TOKEN,
+    fetchImpl: async () => jsonResponse({
+      ok: false,
+      error: 'file_upload_size_restricted',
+    }),
+  });
+  await assert.rejects(() => sizeRestrictedApi.uploadFile({
+    channelId: 'C12345678',
+    file: { fileName: 'result.txt', bytes: Buffer.from('result') },
+  }), (error) => error.code === 'artifact-too-large'
+    && error.providerCode === 'file_upload_size_restricted'
+    && error.status === 200);
+
+  for (const ticketResponse of [
+    new Response('not-json', { status: 200 }),
+    jsonResponse({
+      ok: true,
+      upload_url: 'https://example.com/untrusted',
+      file_id: 'F12345678',
+    }),
+  ]) {
+    const api = new SlackApi({
+      botToken: BOT_TOKEN,
+      fetchImpl: async () => ticketResponse,
+    });
+    await assert.rejects(() => api.uploadFile({
+      channelId: 'C12345678',
+      file: { fileName: 'result.txt', bytes: Buffer.from('result') },
+    }), (error) => error.code === 'artifact-provider-failed');
+  }
+
+  const rawUploadTimeoutApi = new SlackApi({
+    botToken: BOT_TOKEN,
+    fileUploadTimeoutMs: 10,
+    fetchImpl: async (url, options) => {
+      if (url.pathname.endsWith('/files.getUploadURLExternal')) {
+        return jsonResponse({
+          ok: true,
+          upload_url: 'https://files.slack.com/upload/v1/TICKET',
+          file_id: 'F12345678',
+        });
+      }
+      return new Promise((resolve, reject) => {
+        if (options.signal.aborted) reject(options.signal.reason);
+        else options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+      });
+    },
+  });
+  await assert.rejects(() => rawUploadTimeoutApi.uploadFile({
+    channelId: 'C12345678',
+    file: { fileName: 'result.txt', bytes: Buffer.from('result') },
+  }), (error) => error.code === 'artifact-provider-failed'
+    && error.cause?.name === 'TimeoutError');
+
+  for (const status of [401, 403]) {
+    const expiredTicketApi = new SlackApi({
+      botToken: BOT_TOKEN,
+      fetchImpl: async (url) => {
+        if (url.pathname.endsWith('/files.getUploadURLExternal')) {
+          return jsonResponse({
+            ok: true,
+            upload_url: 'https://files.slack.com/upload/v1/TICKET',
+            file_id: 'F12345678',
+          });
+        }
+        return new Response('', { status });
+      },
+    });
+    await assert.rejects(() => expiredTicketApi.uploadFile({
+      channelId: 'C12345678',
+      file: { fileName: 'result.txt', bytes: Buffer.from('result') },
+    }), (error) => error.code === 'artifact-provider-rejected'
+      && error.status === status);
+  }
+});
+
+test('Slack completion is never retried and all non-permission failures are uncertain', async () => {
+  const completionCases = [{
+    complete: async () => jsonResponse({ ok: false, error: 'ratelimited' }, 429, {
+      'retry-after': '0.001',
+    }),
+    providerCode: 'ratelimited',
+  }, {
+    complete: async () => new Response('not-json', { status: 200 }),
+  }, {
+    complete: async () => { throw new TypeError('socket reset'); },
+  }, {
+    complete: async () => jsonResponse({ ok: true, files: [] }),
+  }, {
+    complete: async () => jsonResponse({
+      ok: true,
+      files: [{ id: 'F87654321', title: 'result.txt' }],
+    }),
+  }];
+
+  for (const entry of completionCases) {
+    let completionCalls = 0;
+    const api = new SlackApi({
+      botToken: BOT_TOKEN,
+      fetchImpl: async (url) => {
+        if (url.pathname.endsWith('/files.getUploadURLExternal')) {
+          return jsonResponse({
+            ok: true,
+            upload_url: 'https://files.slack.com/upload/v1/TICKET',
+            file_id: 'F12345678',
+          });
+        }
+        if (url.pathname.startsWith('/upload/')) return new Response('OK', { status: 200 });
+        completionCalls += 1;
+        return entry.complete();
+      },
+    });
+    await assert.rejects(() => api.uploadFile({
+      channelId: 'C12345678',
+      file: { fileName: 'result.txt', bytes: Buffer.from('result') },
+    }), (error) => error.code === 'artifact-delivery-uncertain'
+      && error.providerCode === entry.providerCode);
+    assert.equal(completionCalls, 1);
+  }
+});
+
+test('Slack completion timeout is uncertain while a caller abort remains an abort', async () => {
+  const createApi = ({ complete, fileUploadTimeoutMs = 120_000 }) => new SlackApi({
+    botToken: BOT_TOKEN,
+    fileUploadTimeoutMs,
+    fetchImpl: async (url, options) => {
+      if (url.pathname.endsWith('/files.getUploadURLExternal')) {
+        return jsonResponse({
+          ok: true,
+          upload_url: 'https://files.slack.com/upload/v1/TICKET',
+          file_id: 'F12345678',
+        });
+      }
+      if (url.pathname.startsWith('/upload/')) return new Response('OK', { status: 200 });
+      return complete(options.signal);
+    },
+  });
+  const timeoutApi = createApi({
+    fileUploadTimeoutMs: 10,
+    complete: async (signal) => new Promise((resolve, reject) => {
+      if (signal.aborted) reject(signal.reason);
+      else signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    }),
+  });
+  await assert.rejects(() => timeoutApi.uploadFile({
+    channelId: 'C12345678',
+    file: { fileName: 'result.txt', bytes: Buffer.from('result') },
+  }), (error) => error.code === 'artifact-delivery-uncertain'
+    && error.cause?.name === 'TimeoutError');
+
+  const caller = new AbortController();
+  const reason = new DOMException('caller stopped', 'AbortError');
+  const cancelledApi = createApi({
+    complete: async () => {
+      caller.abort(reason);
+      throw reason;
+    },
+  });
+  await assert.rejects(() => cancelledApi.uploadFile({
+    channelId: 'C12345678',
+    file: { fileName: 'result.txt', bytes: Buffer.from('result') },
+    signal: caller.signal,
+  }), (error) => error === reason && error.code !== 'artifact-delivery-uncertain');
+});
+
+test('Slack completion missing_scope remains a permission error', async () => {
+  let completionCalls = 0;
+  const api = new SlackApi({
+    botToken: BOT_TOKEN,
+    fetchImpl: async (url) => {
+      if (url.pathname.endsWith('/files.getUploadURLExternal')) {
+        return jsonResponse({
+          ok: true,
+          upload_url: 'https://files.slack.com/upload/v1/TICKET',
+          file_id: 'F12345678',
+        });
+      }
+      if (url.pathname.startsWith('/upload/')) return new Response('OK', { status: 200 });
+      completionCalls += 1;
+      return jsonResponse({ ok: false, error: 'missing_scope' });
+    },
+  });
+  await assert.rejects(() => api.uploadFile({
+    channelId: 'C12345678',
+    file: { fileName: 'result.txt', bytes: Buffer.from('result') },
+  }), (error) => error.code === 'artifact-permission-required'
+    && error.providerCode === 'missing_scope');
+  assert.equal(completionCalls, 1);
+});
+
 test('Slack downloads private files with the bot token from Slack hosts only', async () => {
   const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
   const calls = [];
@@ -156,10 +554,17 @@ test('Slack downloads private files with the bot token from Slack hosts only', a
   }), png);
   assert.equal(calls[1].options.headers.authorization, `Bearer ${BOT_TOKEN}`);
   assert.equal(calls[1].url.hostname, 'files.slack.com');
+  const streamed = await api.downloadFileStream({
+    url: 'https://files.slack.com/files-pri/T123-F126/download/notes.txt',
+  });
+  const streamedChunks = [];
+  for await (const chunk of streamed.stream) streamedChunks.push(Buffer.from(chunk));
+  assert.deepEqual(Buffer.concat(streamedChunks), png);
+  assert.equal(calls[2].options.signal, undefined);
   await assert.rejects(() => api.downloadFile({
     url: 'https://example.com/internal.png', maxBytes: 100,
   }), /messaging platform/);
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3);
 
   const redirectCalls = [];
   const redirectingApi = new SlackApi({
@@ -183,6 +588,29 @@ test('Slack downloads private files with the bot token from Slack hosts only', a
   assert.equal(redirectCalls[0].url.hostname, 'files.slack.com');
   assert.equal(redirectCalls[0].options.headers.authorization, `Bearer ${BOT_TOKEN}`);
   assert.match(SLACK_APP_MANIFEST_YAML, /\n\s+- files:read\n/);
+});
+
+test('Slack resolves file_access metadata through files.info', async () => {
+  const calls = [];
+  const api = new SlackApi({
+    botToken: BOT_TOKEN,
+    fetchImpl: async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse({
+        ok: true,
+        file: {
+          id: 'F12345678',
+          name: 'connect.txt',
+          mimetype: 'text/plain',
+          url_private: 'https://files.slack.com/files-pri/T123-F123/connect.txt',
+        },
+      });
+    },
+  });
+  assert.equal((await api.fileInfo({ fileId: 'F12345678' })).name, 'connect.txt');
+  assert.equal(calls[0].url.pathname.endsWith('/files.info'), true);
+  assert.equal(calls[0].options.body, 'file=F12345678');
+  assert.equal(calls[0].options.headers.authorization, `Bearer ${BOT_TOKEN}`);
 });
 
 test('Slack refuses unsafe file redirects and explains stale files:read authorization', async () => {
@@ -438,6 +866,24 @@ test('Slack normalizes direct messages and addressed channel events', () => {
   assert.equal(group.conversationId, 'C12345678:1700000000.002');
   assert.equal(group.replyTarget.threadTs, '1700000000.002');
 
+  const threaded = normalizeSlackEvent({
+    event_id: 'Ev002-threaded',
+    team_id: 'T12345678',
+    event: {
+      type: 'app_mention',
+      channel: 'C12345678',
+      user: 'U87654321',
+      ts: '1700000000.003',
+      thread_ts: '1700000000.002',
+      text: '<@U12345678> continue',
+    },
+  }, 'U12345678');
+  assert.equal(threaded.replyTarget.threadTs, '1700000000.002');
+  assert.deepEqual(threaded.reactionTarget, {
+    channelId: 'C12345678',
+    messageTs: '1700000000.003',
+  });
+
   const botMessage = normalizeSlackEvent({
     event_id: 'Ev003',
     event: {
@@ -448,7 +894,7 @@ test('Slack normalizes direct messages and addressed channel events', () => {
   assert.equal(botMessage, null);
 });
 
-test('Slack accepts image file shares and keeps other files out of image prompts', async () => {
+test('Slack keeps image shares in image prompts and exposes ordinary files lazily', async () => {
   const loads = [];
   const direct = normalizeSlackEvent({
     event_id: 'Ev010',
@@ -471,14 +917,32 @@ test('Slack accepts image file shares and keeps other files out of image prompts
     },
   }, 'U12345678', {
     loadFile: async (url, options) => {
-      loads.push({ url, options });
+      loads.push({ kind: 'image', url, options });
       return Buffer.from('image');
+    },
+    loadFileStream: async (url, options) => {
+      loads.push({ kind: 'file', url, options });
+      return { stream: (async function* content() { yield Buffer.from('file'); }()) };
     },
   });
   assert.equal(direct.images.length, 1);
   assert.equal(direct.images[0].name, 'screen.png');
   await direct.images[0].load({ maxBytes: 5_000 });
   assert.match(loads[0].url, /screen\.png$/);
+  assert.equal(direct.files.length, 1);
+  assert.deepEqual({
+    name: direct.files[0].name,
+    mediaType: direct.files[0].mediaType,
+    size: direct.files[0].size,
+  }, { name: 'notes.txt', mediaType: 'text/plain', size: 20 });
+  const controller = new AbortController();
+  const loadedFile = await direct.files[0].load({ signal: controller.signal });
+  const chunks = [];
+  for await (const chunk of loadedFile.stream) chunks.push(Buffer.from(chunk));
+  assert.equal(Buffer.concat(chunks).toString(), 'file');
+  assert.match(loads[1].url, /notes\.txt$/);
+  assert.equal(loads[1].kind, 'file');
+  assert.deepEqual(loads[1].options, { signal: controller.signal });
 
   const group = normalizeSlackEvent({
     event_id: 'Ev011',
@@ -494,6 +958,7 @@ test('Slack accepts image file shares and keeps other files out of image prompts
   }, 'U12345678');
   assert.equal(group.addressed, true);
   assert.equal(group.images.length, 1);
+  assert.deepEqual(group.files, []);
 
   assert.equal(normalizeSlackEvent({
     event_id: 'Ev012',
@@ -502,6 +967,54 @@ test('Slack accepts image file shares and keeps other files out of image prompts
       user: 'U87654321', ts: '1700000000.012', text: '', files: [],
     },
   }, 'U12345678'), null);
+});
+
+test('Slack Connect file placeholders load metadata before streaming the file', async () => {
+  const calls = [];
+  const message = normalizeSlackEvent({
+    event_id: 'Ev013',
+    event: {
+      type: 'message',
+      subtype: 'file_share',
+      channel_type: 'im',
+      channel: 'D12345678',
+      user: 'U87654321',
+      ts: '1700000000.013',
+      text: '',
+      files: [{
+        id: 'F12345681',
+        mode: 'file_access',
+        file_access: 'check_file_info',
+      }],
+    },
+  }, 'U12345678', {
+    loadFileInfo: async (fileId, options) => {
+      calls.push({ kind: 'info', fileId, options });
+      return {
+        id: fileId,
+        name: 'connect-report.pdf',
+        mimetype: 'application/pdf',
+        url_private_download: 'https://files.slack.com/files-pri/T123-F123/connect-report.pdf',
+      };
+    },
+    loadFileStream: async (url, options) => {
+      calls.push({ kind: 'stream', url, options });
+      return { stream: (async function* content() { yield Buffer.from('connect'); }()) };
+    },
+  });
+  assert.equal(message.files.length, 1);
+  const controller = new AbortController();
+  const loaded = await message.files[0].load({ signal: controller.signal });
+  assert.equal(loaded.name, 'connect-report.pdf');
+  assert.equal(loaded.mediaType, 'application/pdf');
+  const chunks = [];
+  for await (const chunk of loaded.stream) chunks.push(Buffer.from(chunk));
+  assert.equal(Buffer.concat(chunks).toString(), 'connect');
+  assert.deepEqual(calls[0], {
+    kind: 'info', fileId: 'F12345681', options: { signal: controller.signal },
+  });
+  assert.equal(calls[1].kind, 'stream');
+  assert.match(calls[1].url, /connect-report\.pdf$/);
 });
 
 class FakeSocket {

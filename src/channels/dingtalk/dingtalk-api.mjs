@@ -1,13 +1,21 @@
 import { randomUUID } from 'node:crypto';
+import { extname } from 'node:path';
 
 import { fetchImageBuffer, ImagePromptError } from '../shared/image-prompt.mjs';
+import { t } from '../shared/i18n.mjs';
 
 export const DINGTALK_REGISTRATION_BASE_URL = 'https://oapi.dingtalk.com/';
 export const DINGTALK_API_BASE_URL = 'https://api.dingtalk.com/';
 export const DINGTALK_REGISTRATION_SOURCE = 'DING_DWS_CLAW';
 export const DINGTALK_AI_CARD_TEMPLATE_ID = '02fcf2f4-5e02-4a85-b672-46d1f715543e.schema';
+export const DINGTALK_THINKING_REACTION_NAME = '🤔思考中';
+export const DINGTALK_DONE_REACTION_NAME = '✅已完成';
+export const DINGTALK_ERROR_REACTION_NAME = '❌处理失败';
 
 const DEFAULT_TIMEOUT_MS = 15_000;
+const REACTION_TIMEOUT_MS = 5_000;
+const TEXT_REACTION_ID = '2659900';
+const TEXT_REACTION_BACKGROUND_ID = 'im_bg_1';
 const REGISTRATION_STATUSES = new Set(['WAITING', 'SUCCESS', 'FAIL', 'EXPIRED']);
 
 export class DingtalkApiError extends Error {
@@ -25,8 +33,67 @@ function nonEmptyString(value) {
 }
 
 function safeProviderCode(value) {
-  const code = nonEmptyString(value);
-  return code && /^[A-Za-z0-9_.:-]{1,160}$/.test(code) ? code : undefined;
+  const code = value === undefined || value === null ? null : String(value).trim();
+  return code && /^-?[A-Za-z0-9_.:-]{1,160}$/.test(code) ? code : undefined;
+}
+
+function preserveArtifactMetadata(target, source) {
+  if (Number.isInteger(source?.status)) target.status = source.status;
+  if (source?.providerCode !== undefined) target.providerCode = source.providerCode;
+  return target;
+}
+
+function dingtalkArtifactError(cause, { fallback = 'artifact-provider-rejected' } = {}) {
+  if (cause?.code?.startsWith?.('artifact-')) return cause;
+  const status = Number(cause?.status);
+  const providerCode = safeProviderCode(cause?.providerCode);
+  const providerText = providerCode ?? '';
+  let code = fallback;
+  let message = 'DingTalk could not prepare the file for delivery.';
+  if (status === 401 || status === 403 || providerCode === '401' || providerCode === '403'
+    || /(?:permission|forbidden|unauthor|access.?denied|\.auth(?:\.|$))/i.test(providerText)) {
+    code = 'artifact-permission-required';
+    message = 'DingTalk denied permission to send the file.';
+  } else if (status === 413 || providerCode === '413'
+    || /(?:too.?large|size.?limit)/i.test(providerText)) {
+    code = 'artifact-too-large';
+    message = 'The file exceeds DingTalk\'s size limit.';
+  } else if (status === 429 || providerCode === '429'
+    || /(?:rate.?limit|too.?many|throttl)/i.test(providerText)) {
+    code = 'artifact-rate-limited';
+    message = 'DingTalk rate-limited file delivery.';
+  } else if (fallback === 'artifact-provider-rejected') {
+    message = 'DingTalk rejected the file message.';
+  }
+  const error = new Error(message, { cause });
+  error.code = code;
+  return preserveArtifactMetadata(error, cause);
+}
+
+function uncertainDingtalkDelivery(cause) {
+  const error = new Error('DingTalk file delivery result is uncertain', { cause });
+  error.code = 'artifact-delivery-uncertain';
+  return preserveArtifactMetadata(error, cause);
+}
+
+function rejectedProviderResponse(value) {
+  if (!value || typeof value !== 'object') return null;
+  for (const field of ['errcode', 'code']) {
+    if (value[field] !== undefined && value[field] !== 0 && value[field] !== '0') {
+      return safeProviderCode(value[field]) ?? 'rejected';
+    }
+  }
+  return null;
+}
+
+function classifyDingtalkFinalDeliveryError(error, signal) {
+  if (signal?.aborted) throw abortError(signal);
+  const status = Number(error?.status);
+  if (error?.code === 'network-error' || error?.code === 'timeout'
+    || error?.code === 'invalid-response' || (status >= 500 && status < 600)) {
+    return uncertainDingtalkDelivery(error);
+  }
+  return dingtalkArtifactError(error);
 }
 
 function secureDingtalkDownloadUrl(value) {
@@ -174,6 +241,74 @@ async function requestJson(fetchImpl, url, {
   }
 }
 
+async function requestMultipart(fetchImpl, url, { body, signal, timeoutMs = 60_000 } = {}) {
+  const controller = new AbortController();
+  let timedOut = false;
+  const onAbort = () => controller.abort(signal?.reason);
+  if (signal?.aborted) throw abortError(signal);
+  signal?.addEventListener('abort', onAbort, { once: true });
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  try {
+    const response = await fetchImpl(url, {
+      method: 'POST',
+      body,
+      signal: controller.signal,
+      redirect: 'error',
+    });
+    let value;
+    let parseError;
+    try {
+      value = await response.json();
+    } catch (error) {
+      parseError = error;
+    }
+    if (!response.ok) {
+      throw new DingtalkApiError(
+        'http-error',
+        `钉钉服务请求失败（HTTP ${response.status}）。`,
+        { status: response.status, providerCode: safeProviderCode(value?.code ?? value?.errcode) },
+      );
+    }
+    if (parseError) {
+      throw new DingtalkApiError(
+        'invalid-response',
+        '钉钉服务返回了无法解析的响应。',
+        { cause: parseError },
+      );
+    }
+    return value;
+  } catch (error) {
+    if (signal?.aborted) throw abortError(signal);
+    if (timedOut) throw new DingtalkApiError('timeout', '钉钉服务请求超时。', { cause: error });
+    if (error instanceof DingtalkApiError) throw error;
+    throw new DingtalkApiError('network-error', '暂时无法完成钉钉文件上传请求。', { cause: error });
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
+  }
+}
+
+function normalizeFileTarget(target) {
+  const robotCode = nonEmptyString(target?.robotCode);
+  if (!robotCode) throw new TypeError('DingTalk robotCode is required');
+  if (target?.type === 'group') {
+    const openConversationId = nonEmptyString(target.openConversationId);
+    if (openConversationId) return { type: 'group', robotCode, openConversationId };
+  }
+  if (target?.type === 'user') {
+    const userId = nonEmptyString(target.userId);
+    if (userId) return { type: 'user', robotCode, userId };
+  }
+  throw new TypeError('DingTalk file target is invalid');
+}
+
+function dingtalkFileType(fileName) {
+  return extname(fileName).slice(1).toLowerCase();
+}
+
 function normalizeCardTarget(target) {
   if (target?.type === 'user') {
     const userId = nonEmptyString(target.userId);
@@ -277,18 +412,20 @@ export function createDingtalkApi({
   if (!source) throw new TypeError('registrationSource is required');
   const tokenCache = new Map();
   const tokenRequests = new Map();
+  const reactionTokenRequests = new Map();
   let cardSlotTail = Promise.resolve();
   let nextCardRequestAt = 0;
 
   const endpoint = (base, pathname) => new URL(pathname.replace(/^\//, ''), base);
 
-  async function accessToken({ clientId, clientSecret, signal }) {
+  async function accessToken({ clientId, clientSecret, signal, requestKind = 'normal' }) {
     const appKey = nonEmptyString(clientId);
     const appSecret = nonEmptyString(clientSecret);
     if (!appKey || !appSecret) throw new TypeError('clientId and clientSecret are required');
     const cached = tokenCache.get(appKey);
     if (cached && cached.expiresAt > now()) return cached.token;
-    if (tokenRequests.has(appKey)) return tokenRequests.get(appKey);
+    const requests = requestKind === 'reaction' ? reactionTokenRequests : tokenRequests;
+    if (requests.has(appKey)) return requests.get(appKey);
 
     const request = (async () => {
       const value = await requestJson(fetchImpl, endpoint(apiBase, 'v1.0/oauth2/accessToken'), {
@@ -302,9 +439,117 @@ export function createDingtalkApi({
       const refreshAfterMs = Math.max(1_000, (expiresInSeconds - 60) * 1_000);
       tokenCache.set(appKey, { token, expiresAt: now() + refreshAfterMs });
       return token;
-    })().finally(() => tokenRequests.delete(appKey));
-    tokenRequests.set(appKey, request);
-    return request;
+    })();
+    const shared = request.finally(() => requests.delete(appKey));
+    requests.set(appKey, shared);
+    return shared;
+  }
+
+  async function changeReaction({
+    clientId,
+    clientSecret,
+    robotCode,
+    messageId,
+    conversationId,
+    reactionName = DINGTALK_THINKING_REACTION_NAME,
+    signal,
+  }, action) {
+    const appKey = nonEmptyString(clientId);
+    const appSecret = nonEmptyString(clientSecret);
+    const botCode = nonEmptyString(robotCode) ?? appKey;
+    const openMsgId = nonEmptyString(messageId);
+    const openConversationId = nonEmptyString(conversationId);
+    const emotionName = nonEmptyString(reactionName);
+    if (!appKey || !appSecret) throw new TypeError('clientId and clientSecret are required');
+    if (!botCode) throw new TypeError('robotCode is required');
+    if (!openMsgId || !openConversationId) {
+      throw new TypeError('messageId and conversationId are required');
+    }
+    if (!emotionName) throw new TypeError('reactionName is required');
+    // Reactions deduplicate with each other but never own the normal reply's
+    // in-flight token request. Both paths may still reuse a cached token.
+    const token = await accessToken({
+      clientId: appKey,
+      clientSecret: appSecret,
+      signal,
+      requestKind: 'reaction',
+    });
+    const response = await requestJson(
+      fetchImpl,
+      endpoint(apiBase, `v1.0/robot/emotion/${action}`),
+      {
+        body: {
+          robotCode: botCode,
+          openMsgId,
+          openConversationId,
+          emotionType: 2,
+          emotionName,
+          textEmotion: {
+            emotionId: TEXT_REACTION_ID,
+            emotionName,
+            text: emotionName,
+            backgroundId: TEXT_REACTION_BACKGROUND_ID,
+          },
+        },
+        headers: { 'x-acs-dingtalk-access-token': token },
+        signal,
+        timeoutMs: REACTION_TIMEOUT_MS,
+        action: action === 'reply' ? '消息状态添加' : '消息状态撤回',
+      },
+    );
+    const rejection = response?.success === false
+      ? safeProviderCode(response?.code ?? response?.errcode) ?? 'rejected'
+      : rejectedProviderResponse(response);
+    if (rejection) {
+      throw new DingtalkApiError(
+        'reaction-rejected',
+        '钉钉服务拒绝了消息状态请求。',
+        { providerCode: rejection },
+      );
+    }
+    return true;
+  }
+
+  async function messageFileDownloadUrl({
+    clientId,
+    clientSecret,
+    robotCode,
+    downloadCode,
+    signal,
+    kind,
+  }) {
+    const botCode = nonEmptyString(robotCode);
+    const fileCode = nonEmptyString(downloadCode);
+    if (!botCode || !fileCode) throw new TypeError('robotCode and downloadCode are required');
+    const token = await accessToken({ clientId, clientSecret, signal });
+    let response;
+    try {
+      response = await requestJson(
+        fetchImpl,
+        endpoint(apiBase, 'v1.0/robot/messageFiles/download'),
+        {
+          body: { downloadCode: fileCode, robotCode: botCode },
+          headers: { 'x-acs-dingtalk-access-token': token },
+          signal,
+          action: `${kind === 'image' ? '图片' : '文件'}下载地址`,
+        },
+      );
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      throw new DingtalkApiError(
+        `${kind}-download-address-failed`,
+        `钉钉${kind === 'image' ? '图片' : '文件'}下载地址获取失败。`,
+        { cause: error, status: error?.status, providerCode: error?.providerCode },
+      );
+    }
+    const downloadUrl = nonEmptyString(response?.downloadUrl ?? response?.download_url);
+    if (!downloadUrl) {
+      throw new DingtalkApiError(
+        `invalid-${kind}-download`,
+        `钉钉服务没有返回${kind === 'image' ? '图片' : '文件'}下载地址。`,
+      );
+    }
+    return secureDingtalkDownloadUrl(downloadUrl);
   }
 
   function acquireCardRequestSlot(signal) {
@@ -370,6 +615,93 @@ export function createDingtalkApi({
     return true;
   }
 
+  async function sendArtifact({
+    clientId,
+    clientSecret,
+    target,
+    file,
+    signal,
+  }, { uploadType, messageKey, createMessageParams }) {
+    if (!file || typeof file !== 'object'
+      || typeof file.fileName !== 'string' || !file.fileName
+      || !Buffer.isBuffer(file.bytes)) {
+      throw new TypeError('A DingTalk file is required');
+    }
+    const normalizedTarget = normalizeFileTarget(target);
+    let token;
+    try {
+      token = await accessToken({ clientId, clientSecret, signal });
+    } catch (error) {
+      if (signal?.aborted) throw abortError(signal);
+      const status = Number(error?.status);
+      const fallback = error?.code === 'http-error' && status >= 400 && status < 500
+        ? 'artifact-provider-rejected'
+        : 'artifact-provider-failed';
+      throw dingtalkArtifactError(error, { fallback });
+    }
+    const uploadUrl = new URL('media/upload', DINGTALK_REGISTRATION_BASE_URL);
+    uploadUrl.searchParams.set('access_token', token);
+    uploadUrl.searchParams.set('type', uploadType);
+    const form = new FormData();
+    form.append(
+      'media',
+      new Blob([file.bytes], { type: file.mediaType ?? 'application/octet-stream' }),
+      file.fileName,
+    );
+    let uploaded;
+    try {
+      uploaded = await requestMultipart(fetchImpl, uploadUrl, { body: form, signal });
+    } catch (error) {
+      if (signal?.aborted) throw abortError(signal);
+      const status = Number(error?.status);
+      const fallback = error?.code === 'http-error' && status >= 400 && status < 500
+        ? 'artifact-provider-rejected'
+        : 'artifact-provider-failed';
+      throw dingtalkArtifactError(error, { fallback });
+    }
+    const uploadRejection = rejectedProviderResponse(uploaded);
+    const mediaId = nonEmptyString(uploaded?.media_id);
+    if (uploadRejection || !mediaId) {
+      throw dingtalkArtifactError(new DingtalkApiError(
+        'upload-rejected',
+        '钉钉服务拒绝了文件上传。',
+        { providerCode: uploadRejection ?? 'missing-media-id' },
+      ));
+    }
+    signal?.throwIfAborted();
+    const messageBody = {
+      robotCode: normalizedTarget.robotCode,
+      msgKey: messageKey,
+      msgParam: JSON.stringify(createMessageParams(mediaId, file)),
+      ...(normalizedTarget.type === 'group'
+        ? { openConversationId: normalizedTarget.openConversationId }
+        : { userIds: [normalizedTarget.userId] }),
+    };
+    const pathname = normalizedTarget.type === 'group'
+      ? 'v1.0/robot/groupMessages/send'
+      : 'v1.0/robot/oToMessages/batchSend';
+    let response;
+    try {
+      response = await requestJson(fetchImpl, endpoint(apiBase, pathname), {
+        body: messageBody,
+        headers: { 'x-acs-dingtalk-access-token': token },
+        signal,
+        action: '文件消息发送',
+      });
+    } catch (error) {
+      throw classifyDingtalkFinalDeliveryError(error, signal);
+    }
+    const sendRejection = rejectedProviderResponse(response);
+    if (sendRejection) {
+      throw dingtalkArtifactError(new DingtalkApiError(
+        'send-rejected',
+        '钉钉服务拒绝了文件消息。',
+        { providerCode: sendRejection },
+      ));
+    }
+    return response;
+  }
+
   return Object.freeze({
     async beginRegistration({ signal } = {}) {
       const initialized = assertRegistrationOk(await requestJson(
@@ -432,6 +764,28 @@ export function createDingtalkApi({
 
     accessToken,
 
+    async addReaction(request) {
+      return changeReaction(request, 'reply');
+    },
+
+    async recallReaction(request) {
+      return changeReaction(request, 'recall');
+    },
+
+    async addThinkingReaction(request) {
+      return changeReaction({
+        ...request,
+        reactionName: DINGTALK_THINKING_REACTION_NAME,
+      }, 'reply');
+    },
+
+    async recallThinkingReaction(request) {
+      return changeReaction({
+        ...request,
+        reactionName: DINGTALK_THINKING_REACTION_NAME,
+      }, 'recall');
+    },
+
     async downloadImage({
       clientId,
       clientSecret,
@@ -440,36 +794,16 @@ export function createDingtalkApi({
       signal,
       maxBytes,
     }) {
-      const botCode = nonEmptyString(robotCode);
-      const fileCode = nonEmptyString(downloadCode);
-      if (!botCode || !fileCode) throw new TypeError('robotCode and downloadCode are required');
-      const token = await accessToken({ clientId, clientSecret, signal });
-      let response;
+      const downloadUrl = await messageFileDownloadUrl({
+        clientId,
+        clientSecret,
+        robotCode,
+        downloadCode,
+        signal,
+        kind: 'image',
+      });
       try {
-        response = await requestJson(
-          fetchImpl,
-          endpoint(apiBase, 'v1.0/robot/messageFiles/download'),
-          {
-            body: { downloadCode: fileCode, robotCode: botCode },
-            headers: { 'x-acs-dingtalk-access-token': token },
-            signal,
-            action: '图片下载地址',
-          },
-        );
-      } catch (error) {
-        if (signal?.aborted) throw error;
-        throw new DingtalkApiError(
-          'image-download-address-failed',
-          '钉钉图片下载地址获取失败。',
-          { cause: error, status: error?.status, providerCode: error?.providerCode },
-        );
-      }
-      const downloadUrl = nonEmptyString(response?.downloadUrl ?? response?.download_url);
-      if (!downloadUrl) {
-        throw new DingtalkApiError('invalid-image-download', '钉钉服务没有返回图片下载地址。');
-      }
-      try {
-        return await fetchImageBuffer(secureDingtalkDownloadUrl(downloadUrl), {
+        return await fetchImageBuffer(downloadUrl, {
           fetchImpl,
           signal,
           maxBytes,
@@ -479,6 +813,50 @@ export function createDingtalkApi({
         throw new DingtalkApiError(
           'image-content-download-failed',
           '钉钉图片内容下载失败。',
+          { cause: error },
+        );
+      }
+    },
+
+    async downloadFile({
+      clientId,
+      clientSecret,
+      robotCode,
+      downloadCode,
+      signal,
+    }) {
+      const downloadUrl = await messageFileDownloadUrl({
+        clientId,
+        clientSecret,
+        robotCode,
+        downloadCode,
+        signal,
+        kind: 'file',
+      });
+      if (downloadUrl.protocol !== 'https:') {
+        throw new DingtalkApiError('invalid-file-download', '钉钉服务返回了无效的文件下载地址。');
+      }
+      try {
+        const response = await fetchImpl(downloadUrl, {
+          method: 'GET',
+          redirect: 'follow',
+          signal,
+        });
+        if (!response?.ok) {
+          await response?.body?.cancel?.().catch?.(() => undefined);
+          throw new DingtalkApiError(
+            'file-content-download-failed',
+            `钉钉文件内容下载失败（HTTP ${response?.status ?? 'unknown'}）。`,
+            { status: response?.status },
+          );
+        }
+        return Buffer.from(await response.arrayBuffer());
+      } catch (error) {
+        if (signal?.aborted) throw abortError(signal);
+        if (error instanceof DingtalkApiError) throw error;
+        throw new DingtalkApiError(
+          'file-content-download-failed',
+          '钉钉文件内容下载失败。',
           { cause: error },
         );
       }
@@ -548,7 +926,7 @@ export function createDingtalkApi({
             clientId: appKey,
             clientSecret: appSecret,
             cardInstanceId,
-            text: '消息处理失败，请稍后重试。',
+            text: t('卡片已结束，请查看后续消息。'),
             signal: cleanupSignal,
           }).catch(() => undefined);
         }
@@ -646,6 +1024,26 @@ export function createDingtalkApi({
         throw new DingtalkApiError('send-rejected', '钉钉服务拒绝了回复消息。');
       }
       return true;
+    },
+
+    async sendFile(request) {
+      return sendArtifact(request, {
+        uploadType: 'file',
+        messageKey: 'sampleFile',
+        createMessageParams: (mediaId, file) => ({
+          mediaId,
+          fileName: file.fileName,
+          fileType: dingtalkFileType(file.fileName),
+        }),
+      });
+    },
+
+    async sendImage(request) {
+      return sendArtifact(request, {
+        uploadType: 'image',
+        messageKey: 'sampleImageMsg',
+        createMessageParams: (mediaId) => ({ photoURL: mediaId }),
+      });
     },
 
     clearAccessToken(clientId) {

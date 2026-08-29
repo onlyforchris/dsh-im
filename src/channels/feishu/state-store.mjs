@@ -5,13 +5,19 @@ const EMPTY_STATE = Object.freeze({
   version: 1,
   sessions: {},
   seenMessageIds: [],
-  connectionTestTarget: null,
+  watches: {},
+  includeArchivedSessions: false,
 });
 
-function connectionTestTarget(value) {
-  const chatId = typeof value?.chatId === 'string' ? value.chatId.trim() : '';
-  const openId = typeof value?.openId === 'string' ? value.openId.trim() : '';
-  return chatId ? { chatId } : openId ? { openId } : null;
+/** One conversation key may watch at most this many sessions. */
+export const MAX_WATCHES_PER_KEY = 20;
+
+/** A persisted watch entry: the watched session plus its delivery target. */
+function validWatchEntry(value) {
+  return value
+    && typeof value === 'object'
+    && typeof value.sessionId === 'string' && value.sessionId.length > 0
+    && typeof value.chatId === 'string' && value.chatId.length > 0;
 }
 
 export class StateStore {
@@ -26,14 +32,14 @@ export class StateStore {
   async load() {
     try {
       const parsed = JSON.parse(await readFile(this.#path, 'utf8'));
-      const sessions = parsed.sessions && typeof parsed.sessions === 'object' ? parsed.sessions : {};
-      const p2pKey = Object.keys(sessions).findLast((key) => key.startsWith('p2p:'));
       this.#state = {
         version: 1,
-        sessions,
+        sessions: parsed.sessions && typeof parsed.sessions === 'object' ? parsed.sessions : {},
         seenMessageIds: Array.isArray(parsed.seenMessageIds) ? parsed.seenMessageIds.slice(-1000) : [],
-        connectionTestTarget: connectionTestTarget(parsed.connectionTestTarget)
-          ?? connectionTestTarget({ openId: p2pKey?.slice(4) }),
+        watches: parsed.watches && typeof parsed.watches === 'object' ? parsed.watches : {},
+        includeArchivedSessions: typeof parsed.includeArchivedSessions === 'boolean'
+          ? parsed.includeArchivedSessions
+          : false,
       };
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
@@ -61,17 +67,6 @@ export class StateStore {
     await this.#persist();
   }
 
-  connectionTestTarget() {
-    return structuredClone(this.#state.connectionTestTarget);
-  }
-
-  async setConnectionTestTarget(target) {
-    const normalized = connectionTestTarget(target);
-    if (!normalized) throw new TypeError('Feishu connection test target is required');
-    this.#state.connectionTestTarget = normalized;
-    await this.#persist();
-  }
-
   hasSeen(messageId) {
     return this.#state.seenMessageIds.includes(messageId);
   }
@@ -87,6 +82,69 @@ export class StateStore {
 
   snapshot() {
     return structuredClone(this.#state);
+  }
+
+  // ── Watches (persisted: surviving restarts) ─────────────────────────────
+
+  watchEntries(key) {
+    const list = this.#state.watches[key];
+    return Array.isArray(list) ? list.filter(validWatchEntry) : [];
+  }
+
+  watchEntry(key, sessionId) {
+    return this.watchEntries(key).find((entry) => entry.sessionId === sessionId) ?? null;
+  }
+
+  async setWatch(key, entry) {
+    const list = this.#state.watches[key] ?? [];
+    const index = list.findIndex((existing) => existing.sessionId === entry.sessionId);
+    if (index === -1) {
+      if (list.length >= MAX_WATCHES_PER_KEY) list.shift();
+      list.push(entry);
+    } else {
+      list[index] = entry;
+    }
+    this.#state.watches[key] = list;
+    await this.#persist();
+  }
+
+  async removeWatch(key, sessionId) {
+    const list = this.#state.watches[key] ?? [];
+    this.#state.watches[key] = list.filter((entry) => entry.sessionId !== sessionId);
+    await this.#persist();
+  }
+
+  async clearWatches(key) {
+    delete this.#state.watches[key];
+    await this.#persist();
+  }
+
+  /** Every conversation key currently watching the given session. */
+  keysWatching(sessionId) {
+    return Object.entries(this.#state.watches)
+      .filter(([, list]) => Array.isArray(list) && list.some((entry) => validWatchEntry(entry) && entry.sessionId === sessionId))
+      .map(([key]) => key);
+  }
+
+  /** Unique watched session ids across all keys (restart compensation). */
+  watchedSessionIds() {
+    const ids = new Set();
+    for (const list of Object.values(this.#state.watches)) {
+      if (!Array.isArray(list)) continue;
+      for (const entry of list) if (validWatchEntry(entry)) ids.add(entry.sessionId);
+    }
+    return [...ids];
+  }
+
+  // ── Session-list archived policy (per bot) ───────────────────
+
+  includesArchivedSessions() {
+    return this.#state.includeArchivedSessions === true;
+  }
+
+  async setIncludeArchivedSessions(include) {
+    this.#state.includeArchivedSessions = include === true;
+    await this.#persist();
   }
 
   async #persist() {

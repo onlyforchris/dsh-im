@@ -6,6 +6,10 @@ import { QqHarnessClient } from '../../../src/channels/qq/harness-client.mjs';
 import { SlackHarnessClient } from '../../../src/channels/slack/harness-client.mjs';
 import { TelegramHarnessClient } from '../../../src/channels/telegram/harness-client.mjs';
 import { WecomHarnessClient } from '../../../src/channels/wecom/harness-client.mjs';
+import {
+  HarnessHealthError,
+  HarnessTransportError,
+} from '../../../src/channels/shared/harness-client.mjs';
 import { HarnessClient, HarnessReplyTracker } from '../../../src/channels/weixin/harness-client.mjs';
 import { WhatsappHarnessClient } from '../../../src/channels/whatsapp/harness-client.mjs';
 
@@ -45,6 +49,98 @@ test('all legacy channel clients now use the shared Harness RPC transport', asyn
   }
 });
 
+test('shared Harness health checks expose precise safe availability codes', async () => {
+  const clientWithFetch = (fetchImpl, baseUrl = 'http://127.0.0.1:3080') => new HarnessClient({
+    baseUrl,
+    workspace: '/tmp/default-workspace',
+    fetchImpl,
+  });
+
+  const privateConnectionError = new Error('ECONNREFUSED at private loopback port');
+  await assert.rejects(
+    clientWithFetch(async () => { throw privateConnectionError; }).health(),
+    (error) => {
+      assert.ok(error instanceof HarnessTransportError);
+      assert.equal(error.code, 'harness-connect-failed');
+      assert.equal(error.cause, privateConnectionError);
+      assert.doesNotMatch(error.message, /private loopback port/);
+      return true;
+    },
+  );
+
+  const timeoutClient = clientWithFetch((_url, { signal }) => new Promise((_resolve, reject) => {
+    const rejectTimeout = () => reject(signal.reason);
+    if (signal.aborted) rejectTimeout();
+    else signal.addEventListener('abort', rejectTimeout, { once: true });
+  }));
+  await assert.rejects(timeoutClient.rpc('host.describe', {}, 1), (error) => {
+    assert.ok(error instanceof HarnessTransportError);
+    assert.equal(error.code, 'harness-timeout');
+    return true;
+  });
+
+  for (const [baseUrl, status, responseBody, expectedCode] of [
+    ['http://127.0.0.1:3080', 401, 'authentication required', 'harness-auth-required'],
+    ['http://127.0.0.1:3080', 407, 'proxy authentication required', 'harness-proxy-auth-required'],
+    ['http://127.0.0.1:3080', 403, 'forbidden', 'harness-loopback-forbidden'],
+    ['http://127.9.8.7:3080', 403, 'forbidden\n', 'harness-loopback-forbidden'],
+    ['http://localhost:3080', 403, 'forbidden', 'harness-loopback-forbidden'],
+    ['http://[::1]:3080', 403, 'forbidden', 'harness-loopback-forbidden'],
+    ['http://harness.internal:3080', 403, 'forbidden', 'harness-host-untrusted'],
+    ['http://127.0.0.1:3080', 403, 'proxy policy rejected: private detail', 'harness-request-forbidden'],
+    ['http://127.0.0.1:3080', 404, 'not found', 'harness-api-not-found'],
+    ['http://127.0.0.1:3080', 500, 'service unavailable', 'harness-http-failed'],
+  ]) {
+    await assert.rejects(
+      clientWithFetch(async () => new Response(responseBody, { status }), baseUrl).health(),
+      (error) => {
+        assert.ok(error instanceof HarnessTransportError);
+        assert.equal(error.code, expectedCode);
+        assert.equal(error.status, status);
+        assert.doesNotMatch(error.message, /private detail/);
+        return true;
+      },
+    );
+  }
+
+  await assert.rejects(
+    clientWithFetch(async () => ({
+      ok: true,
+      json: async () => { throw new SyntaxError('private malformed response body'); },
+    })).health(),
+    (error) => {
+      assert.ok(error instanceof HarnessTransportError);
+      assert.equal(error.code, 'harness-response-invalid');
+      assert.doesNotMatch(error.message, /private malformed response body/);
+      return true;
+    },
+  );
+
+  await assert.rejects(
+    clientWithFetch(async (_url, options) => {
+      const { rpcId } = JSON.parse(options.body);
+      return {
+        ok: true,
+        json: async () => ({
+          type: 'server-response',
+          rpcId,
+          result: {
+            ok: false,
+            error: { code: 'private-host-code', message: 'private Host RPC detail' },
+          },
+        }),
+      };
+    }).health(),
+    (error) => {
+      assert.ok(error instanceof HarnessHealthError);
+      assert.equal(error.code, 'harness-rpc-rejected');
+      assert.match(error.cause?.message ?? '', /private Host RPC detail/);
+      assert.doesNotMatch(error.message, /private-host-code|private Host RPC detail/);
+      return true;
+    },
+  );
+});
+
 test('HarnessClient lets the Host resolve an omitted agent preset and forwards an explicit override', async () => {
   const createPayload = async (options = {}) => {
     const client = new HarnessClient({
@@ -71,6 +167,28 @@ test('HarnessClient lets the Host resolve an omitted agent preset and forwards a
     agentPreset: 'router-standard',
   });
   assert.deepEqual(await createPayload({ agentPreset: null }), { workspaceId: 'workspace-one' });
+});
+
+test('HarnessClient forwards a per-session agent preset override', async () => {
+  const client = new HarnessClient({
+    baseUrl: 'http://127.0.0.1:3080',
+    workspace: '/tmp/default-workspace',
+    agentPreset: 'router-standard',
+  });
+  let payload;
+  client.ensureRunning = async () => true;
+  client.workspaceId = async () => 'workspace-one';
+  client.rpc = async (method, value) => {
+    assert.equal(method, 'session.create');
+    payload = value;
+    return { sessionId: 'session-one' };
+  };
+
+  assert.equal(await client.createSession({ agentPreset: 'marketing-jeep' }), 'session-one');
+  assert.deepEqual(payload, {
+    workspaceId: 'workspace-one',
+    agentPreset: 'marketing-jeep',
+  });
 });
 
 test('HarnessClient lists only absolute workspace paths', async () => {
@@ -147,14 +265,14 @@ test('HarnessClient lists sessions by workspace accounting in its stored order',
           sessionId: 'session-one',
           blank: false,
           cwd: '/tmp/target',
-          projections: { values: { title: null } },
+          projections: { asOfSeq: -1, values: { title: null } },
         },
         {
           sessionId: 'session-two',
           blank: true,
           origin: 'subagent',
           cwd: '/tmp/different',
-          projections: { values: { title: 'Second session' } },
+          projections: { asOfSeq: 0, values: { title: 'Second session' } },
         },
         {
           sessionId: 'cwd-only',
@@ -176,6 +294,7 @@ test('HarnessClient lists sessions by workspace accounting in its stored order',
         blank: true,
         origin: 'subagent',
         summaryAvailable: true,
+        lastSeq: 0,
       },
       {
         sessionId: 'session-missing',
@@ -192,6 +311,7 @@ test('HarnessClient lists sessions by workspace accounting in its stored order',
         blank: false,
         origin: null,
         summaryAvailable: true,
+        lastSeq: -1,
       },
     ],
   });

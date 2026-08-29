@@ -8,10 +8,18 @@ import { apply as applyTelegram } from './channels/telegram/index.mjs';
 import { apply as applyWecom } from './channels/wecom/index.mjs';
 import { apply as applyWeixin } from './channels/weixin/index.mjs';
 import { apply as applyWhatsapp } from './channels/whatsapp/index.mjs';
+import { installOutboundArtifactTool } from '../../src/channels/shared/semantic/artifact.mjs';
+import { setImHostLanguage } from '../../src/channels/shared/i18n.mjs';
+import { installUpdateRpc } from './update-rpc.mjs';
 import { installImPreAsk } from '../../src/channels/shared/im-pre-ask.mjs';
 
 export const name = 'dsh-im-host';
-export const inject = ['connection', 'credentials', 'webServer', 'typertGateway'];
+export const inject = [
+  'connection',
+  'credentials',
+  'apiProxy',
+  'typertGateway',
+];
 
 function channelConfig(config, name) {
   const channel = config[name] ?? {};
@@ -21,6 +29,7 @@ function channelConfig(config, name) {
 }
 
 export function createImHostPlugin(internals = {}) {
+  const startUpdate = internals.installUpdateRpc ?? installUpdateRpc;
   const startFeishu = internals.applyFeishu ?? applyFeishu;
   const startWeixin = internals.applyWeixin ?? applyWeixin;
   const startDingtalk = internals.applyDingtalk ?? applyDingtalk;
@@ -31,10 +40,23 @@ export function createImHostPlugin(internals = {}) {
   const startDiscord = internals.applyDiscord ?? applyDiscord;
   const startOffice = internals.applyOffice ?? applyOffice;
   const startWhatsapp = internals.applyWhatsapp ?? applyWhatsapp;
+  const channels = [
+    ['feishu', startFeishu],
+    ['weixin', startWeixin],
+    ['dingtalk', startDingtalk],
+    ['wecom', startWecom],
+    ['qq', startQq],
+    ['slack', startSlack],
+    ['telegram', startTelegram],
+    ['discord', startDiscord],
+    ['whatsapp', startWhatsapp],
+    ['office', startOffice],
+  ];
   return Object.freeze({
     name,
     inject,
     async apply(ctx, config = {}) {
+      setImHostLanguage(config.language ?? process.env.DSH_IM_LANGUAGE);
       // 通用扩展点：业务插件 ctx.on('im/pre-ask') 可短路固定回执（不进 LLM）
       const disposePreAsk = installImPreAsk(async (payload) => {
         if (typeof ctx.waterfall !== 'function') return { kind: 'continue' };
@@ -44,18 +66,38 @@ export function createImHostPlugin(internals = {}) {
           () => Promise.resolve({ kind: 'continue' }),
         );
       });
-      ctx.effect(() => disposePreAsk, 'dsh-im: im/pre-ask gate');
-
-      await startFeishu(ctx, channelConfig(config, 'feishu'));
-      await startWeixin(ctx, channelConfig(config, 'weixin'));
-      await startDingtalk(ctx, channelConfig(config, 'dingtalk'));
-      await startWecom(ctx, channelConfig(config, 'wecom'));
-      await startQq(ctx, channelConfig(config, 'qq'));
-      await startSlack(ctx, channelConfig(config, 'slack'));
-      await startTelegram(ctx, channelConfig(config, 'telegram'));
-      await startDiscord(ctx, channelConfig(config, 'discord'));
-      await startWhatsapp(ctx, channelConfig(config, 'whatsapp'));
-      await startOffice(ctx, channelConfig(config, 'office'));
+      if (typeof ctx?.effect === 'function') {
+        ctx.effect(() => disposePreAsk, 'dsh-im: im/pre-ask gate');
+      }
+      if (typeof ctx?.inject === 'function') {
+        ctx.inject(['tools', 'systemPrompt'], (artifactCtx) => {
+          installOutboundArtifactTool(artifactCtx);
+        });
+      } else {
+        installOutboundArtifactTool(ctx);
+      }
+      const logger = typeof ctx?.logger === 'function'
+        ? ctx.logger(name)
+        : (ctx?.logger ?? console);
+      if (ctx?.connection?.rpc) {
+        try {
+          startUpdate(ctx);
+        } catch (error) {
+          logger.error?.('[dsh-im] failed to activate update management; continuing with channels', error);
+        }
+      }
+      const failures = [];
+      for (const [channel, start] of channels) {
+        try {
+          await start(ctx, channelConfig(config, channel));
+        } catch (error) {
+          failures.push(error);
+          logger.error?.(`[dsh-im] failed to activate ${channel}; continuing with the remaining channels`, error);
+        }
+      }
+      if (failures.length === channels.length) {
+        throw new AggregateError(failures, 'dsh-im failed to activate every channel');
+      }
     },
   });
 }

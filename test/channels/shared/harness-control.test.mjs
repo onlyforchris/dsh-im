@@ -1,8 +1,19 @@
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 import { createBotWorkspaceScope } from '../../../src/channels/shared/bot-workspace-store.mjs';
-import { HarnessClient } from '../../../src/channels/shared/harness-client.mjs';
+import {
+  HarnessClient,
+  HarnessTurnError,
+} from '../../../src/channels/shared/harness-client.mjs';
+import {
+  OUTBOUND_ARTIFACT_TOOL,
+  createOutboundArtifactTool,
+  outboundArtifactRegistry,
+} from '../../../src/channels/shared/semantic/artifact.mjs';
 import { WORKSPACE_SESSION_STALE } from '../../../src/channels/shared/workspace-session.mjs';
 
 const CATALOG = {
@@ -85,9 +96,79 @@ test('HarnessClient exposes and validates model and run-state RPCs', async () =>
   assert.ok(calls.filter(([type]) => type === 'ensureRunning').every(([, value]) => value === options));
 });
 
+test('HarnessClient preserves reasoning metadata and forwards an optional reasoning effort', async () => {
+  const { calls, client, responses } = modelClient();
+  const reasoningCatalog = {
+    groups: [{
+      id: 'deepseek-official',
+      name: 'DeepSeek',
+      models: [{
+        id: 'deepseek-v4',
+        name: 'DeepSeek V4',
+        description: 'Reasoning model',
+        reasoning: {
+          efforts: [
+            { id: 'off', name: 'Off' },
+            { id: 'high', name: 'High', description: 'More thinking' },
+          ],
+          defaultEffort: 'high',
+        },
+      }],
+    }],
+    failures: [],
+  };
+  responses.set('llm.models', reasoningCatalog);
+  responses.set('session.models', {
+    ...reasoningCatalog,
+    current: {
+      provider: 'deepseek-official',
+      model: 'deepseek-v4',
+      reasoningEffort: 'high',
+    },
+    routable: true,
+  });
+  responses.set('session.selectModel', {
+    selected: {
+      provider: 'deepseek-official',
+      model: 'deepseek-v4',
+      reasoningEffort: 'off',
+    },
+  });
+
+  assert.equal((await client.listModels()).groups[0].models[0].reasoning.defaultEffort, 'high');
+  assert.equal((await client.getSessionModels('session-one')).current.reasoningEffort, 'high');
+  await client.selectSessionModel('session-one', {
+    provider: 'deepseek-official',
+    model: 'deepseek-v4',
+    reasoningEffort: 'off',
+  });
+
+  assert.deepEqual(
+    calls.find((entry) => entry[0] === 'rpc' && entry[1] === 'session.selectModel')?.[2],
+    {
+      sessionId: 'session-one',
+      provider: 'deepseek-official',
+      model: 'deepseek-v4',
+      reasoningEffort: 'off',
+    },
+  );
+});
+
 test('HarnessClient rejects malformed model and run-state responses', async () => {
   const { client, responses } = modelClient();
   responses.set('llm.models', { groups: null, failures: [] });
+  await assert.rejects(client.listModels(), /invalid response for llm\.models/);
+
+  responses.set('llm.models', {
+    ...CATALOG,
+    groups: [{
+      ...CATALOG.groups[0],
+      models: [{
+        ...CATALOG.groups[0].models[0],
+        reasoning: { efforts: [] },
+      }],
+    }],
+  });
   await assert.rejects(client.listModels(), /invalid response for llm\.models/);
 
   responses.set('session.models', {
@@ -100,10 +181,33 @@ test('HarnessClient rejects malformed model and run-state responses', async () =
     /invalid response for session\.models/,
   );
 
+  responses.set('session.models', {
+    ...CATALOG,
+    current: {
+      provider: 'deepseek-official',
+      model: 'deepseek-v4',
+      reasoningEffort: '',
+    },
+    routable: true,
+  });
+  await assert.rejects(
+    client.getSessionModels('session-one'),
+    /invalid response for session\.models/,
+  );
+
   responses.set('session.selectModel', { selected: { provider: '', model: 'bad' } });
   await assert.rejects(
     client.selectSessionModel('session-one', { provider: 'p', model: 'm' }),
     /invalid response for session\.selectModel/,
+  );
+
+  await assert.rejects(
+    client.selectSessionModel('session-one', {
+      provider: 'deepseek-official',
+      model: 'deepseek-v4',
+      reasoningEffort: '',
+    }),
+    /provider and model are required/,
   );
 
   responses.set('session.list', { items: [{ sessionId: 'session-one', running: 'yes' }] });
@@ -201,6 +305,7 @@ function controlledTurn({ sessionId, initialEnd = false, controlExecutor } = {})
     calls,
     client,
     admitted: admitted.promise,
+    promptRpcId: () => promptRpcId,
     setText(text) { answer = text; },
     failHistory(error = new Error('history unavailable')) { historyFailure = error; },
     finish({ text = '', reason = 'cancelled' } = {}) {
@@ -210,6 +315,78 @@ function controlledTurn({ sessionId, initialEnd = false, controlExecutor } = {})
     },
   };
 }
+
+test('HarnessClient preserves structured turn failures for channel classification', async () => {
+  for (const [reason, expectedCode, expectedProviderCode] of [
+    [{ kind: 'error', error: { code: 'RATE_LIMIT', message: 'private provider detail' } },
+      'harness-turn-failed', 'RATE_LIMIT'],
+    [{ kind: 'max-tokens' }, 'model-max-tokens', undefined],
+    [{ kind: 'completed' }, 'model-empty-response', undefined],
+    ['completed', 'model-empty-response', undefined],
+    ['stopped', 'turn-interrupted', undefined],
+  ]) {
+    const turn = controlledTurn();
+    const asking = turn.client.ask(turn.id, 'work', { timeoutMs: 2_000 });
+    await turn.admitted;
+    turn.finish({ reason });
+    await assert.rejects(asking, (error) => {
+      assert.ok(error instanceof HarnessTurnError);
+      assert.equal(error.code, expectedCode);
+      assert.equal(error.providerCode, expectedProviderCode);
+      assert.equal(error.promptAccepted, true);
+      assert.doesNotMatch(error.message, /private provider detail/);
+      return true;
+    });
+  }
+});
+
+test('HarnessClient does not treat partial text from a failed turn as success', async () => {
+  for (const [reason, expectedCode, expectedProviderCode] of [
+    [{ kind: 'error', error: { code: 'RATE_LIMIT' } },
+      'harness-turn-failed', 'RATE_LIMIT'],
+    [{ kind: 'error', error: { code: 'CONTENT_FILTER' } },
+      'harness-turn-failed', 'CONTENT_FILTER'],
+    [{ kind: 'max-tokens' }, 'model-max-tokens', undefined],
+    [{ kind: 'blocked' }, 'turn-blocked', undefined],
+    ['interrupted', 'turn-interrupted', undefined],
+    ['stopped', 'turn-interrupted', undefined],
+    ['cancelled', 'turn-interrupted', undefined],
+    ['aborted', 'turn-aborted', undefined],
+  ]) {
+    const turn = controlledTurn();
+    const asking = turn.client.ask(turn.id, 'work', { timeoutMs: 2_000 });
+    await turn.admitted;
+    turn.finish({ text: 'partial result must not escape', reason });
+    await assert.rejects(asking, (error) => {
+      assert.ok(error instanceof HarnessTurnError);
+      assert.equal(error.code, expectedCode);
+      assert.equal(error.providerCode, expectedProviderCode);
+      return true;
+    });
+  }
+});
+
+test('HarnessClient accepts partial text only for completed or omitted end reasons', async () => {
+  for (const reason of ['completed', { kind: 'completed' }, null]) {
+    const turn = controlledTurn();
+    const asking = turn.client.ask(turn.id, 'work', { timeoutMs: 2_000 });
+    await turn.admitted;
+    turn.finish({ text: 'valid partial result', reason });
+    assert.equal(await asking, 'valid partial result');
+  }
+});
+
+test('HarnessClient marks a reply timeout after prompt admission', async () => {
+  const turn = controlledTurn();
+  const asking = turn.client.ask(turn.id, 'work', { timeoutMs: 1 });
+  await turn.admitted;
+  await assert.rejects(asking, (error) => {
+    assert.ok(error instanceof HarnessTurnError);
+    assert.equal(error.code, 'harness-reply-timeout');
+    assert.equal(error.promptAccepted, true);
+    return true;
+  });
+});
 
 test('control methods require exact owner identity, key, and Session before any RPC', async () => {
   const turn = controlledTurn();
@@ -257,6 +434,96 @@ test('a stopped turn returns partial text instead of a generic failure', async (
   assert.equal(await turn.client.stopActiveTurn(turn.id, control), true);
   turn.finish({ text: 'partial result' });
   assert.equal(await asking, 'partial result');
+});
+
+test('an accepted stop preserves partial text but never hands off a registered artifact', async (t) => {
+  outboundArtifactRegistry.clear();
+  t.after(() => outboundArtifactRegistry.clear());
+  const workspace = await mkdtemp(join(tmpdir(), 'dsh-im-stopped-artifact-'));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  const turn = controlledTurn({ sessionId: 'session-stopped-artifact' });
+  const control = { owner: {}, key: 'direct:stopped-artifact' };
+  const handedOff = [];
+  const asking = turn.client.ask(turn.id, 'work', {
+    control,
+    timeoutMs: 2_000,
+    onArtifact: async (artifact) => handedOff.push(artifact),
+  });
+  await turn.admitted;
+  const agent = {
+    session: {
+      header: { id: turn.id, cwd: workspace },
+      events: [
+        { type: 'turn/start', data: { turn: 7 } },
+        {
+          type: 'user/message',
+          data: { turn: 7, source: { rpcId: turn.promptRpcId() } },
+        },
+      ],
+    },
+  };
+  await writeFile(join(workspace, 'must-not-send.txt'), 'cancelled result');
+  const tool = createOutboundArtifactTool({ registry: outboundArtifactRegistry });
+  const exec = {
+    name: OUTBOUND_ARTIFACT_TOOL,
+    callId: 'stopped-artifact-call',
+    rootCallId: 'stopped-artifact-call',
+    token: Symbol('stopped-artifact-call'),
+    agent,
+  };
+  await tool.definition.execute({ path: 'must-not-send.txt' }, exec);
+  tool.onResult(exec, { isError: false });
+
+  assert.equal(await turn.client.stopActiveTurn(turn.id, control), true);
+  turn.finish({ text: 'partial result', reason: 'stopped' });
+  assert.equal(await asking, 'partial result');
+  assert.deepEqual(handedOff, []);
+  assert.deepEqual(outboundArtifactRegistry.take(turn.id, 7), []);
+});
+
+test('an accepted stop also discards a file-only result instead of handing it off', async (t) => {
+  outboundArtifactRegistry.clear();
+  t.after(() => outboundArtifactRegistry.clear());
+  const workspace = await mkdtemp(join(tmpdir(), 'dsh-im-stopped-file-only-'));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  const turn = controlledTurn({ sessionId: 'session-stopped-file-only' });
+  const control = { owner: {}, key: 'direct:stopped-file-only' };
+  const handedOff = [];
+  const asking = turn.client.ask(turn.id, 'work', {
+    control,
+    timeoutMs: 2_000,
+    onArtifact: async (artifact) => handedOff.push(artifact),
+  });
+  await turn.admitted;
+  const agent = {
+    session: {
+      header: { id: turn.id, cwd: workspace },
+      events: [
+        { type: 'turn/start', data: { turn: 7 } },
+        {
+          type: 'user/message',
+          data: { turn: 7, source: { rpcId: turn.promptRpcId() } },
+        },
+      ],
+    },
+  };
+  await writeFile(join(workspace, 'must-not-send.txt'), 'cancelled file-only result');
+  const tool = createOutboundArtifactTool({ registry: outboundArtifactRegistry });
+  const exec = {
+    name: OUTBOUND_ARTIFACT_TOOL,
+    callId: 'stopped-file-only-call',
+    rootCallId: 'stopped-file-only-call',
+    token: Symbol('stopped-file-only-call'),
+    agent,
+  };
+  await tool.definition.execute({ path: 'must-not-send.txt' }, exec);
+  tool.onResult(exec, { isError: false });
+
+  assert.equal(await turn.client.stopActiveTurn(turn.id, control), true);
+  turn.finish({ reason: 'stopped' });
+  await assert.rejects(asking, (error) => error?.code === 'turn-stopped');
+  assert.deepEqual(handedOff, []);
+  assert.deepEqual(outboundArtifactRegistry.take(turn.id, 7), []);
 });
 
 test('accepted stop converts later polling failures to turn-stopped and preserves streamed text', async () => {

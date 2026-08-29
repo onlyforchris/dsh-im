@@ -1,0 +1,2112 @@
+commit e4034031aefbe7e876be86dc1fe393325b8bd524
+Author: Chris <zhangjim117@163.com>
+Date:   Mon Aug 24 18:03:21 2026 +0800
+
+    release: prepare @onlyforchris/dsh-im 0.16.5
+
+diff --git a/README.en.md b/README.en.md
+index c4d9f0d..61d0370 100644
+--- a/README.en.md
++++ b/README.en.md
+@@ -9,11 +9,8 @@
+   <p><strong>Connecting DeepSeek Harness</strong></p>
+ 
+   <p>
+-    <img src="https://dsh-im-random-badge.xmanrui-dsh-im.workers.dev" alt="滑动变祖器：今天是梁子或今天是梁圣（随机）">
+-    <a href="LICENSE"><img src="https://img.shields.io/github/license/xmanrui/dsh-im" alt="MIT license"></a>
++    <a href="LICENSE"><img src="https://img.shields.io/github/license/onlyforchris/dsh-im" alt="MIT license"></a>
+     <img src="https://img.shields.io/badge/agent-DeepSeek%20Harness-5865f2" alt="DeepSeek Harness">
+-    <a href="https://dshfind.com/zh/plugins/xmanrui/dsh-im?ref=badge"><img src="https://dshfind.com/api/badge/xmanrui/dsh-im?lang=zh" alt="dshfind"></a>
+-    <a href="https://dshfind.com/zh/plugins/xmanrui/dsh-im"><img src="https://img.shields.io/badge/dshfind-%E5%88%86%E7%B1%BB%E7%AC%AC%E4%B8%80-d97706" alt="dshfind: 分类第一"></a>
+   </p>
+ 
+   <p>
+@@ -71,21 +68,27 @@ A successful heartbeat response must be JSON: `{"ok":true,"protocolVersion":"off
+ 
+ ## Installation
+ 
+-Install the published stable release from npm (recommended):
++Download the `.tgz` from [GitHub Releases](https://github.com/onlyforchris/dsh-im/releases), then install it through the standard DSH plugin command:
+ 
+ ```sh
+-dsh plugin --profile web add -w @xmanrui/dsh-im
++dsh plugin --profile web add ./onlyforchris-dsh-im-0.16.5.tgz
+ ```
+ 
+ Restart `dsh web`, then open **Settings → Plugins → IM Bot**.
+ 
++After `@onlyforchris/dsh-im` is published to npm, the exact version can also be installed directly:
++
++```sh
++dsh plugin --profile web add --save-exact @onlyforchris/dsh-im@0.16.5
++```
++
+ To try the latest code before it is published to npm, use the GitHub-source installer instead:
+ 
+ ```sh
+-npx -y github:xmanrui/dsh-im install
++npx -y github:onlyforchris/dsh-im install
+ ```
+ 
+-A GitHub-source installation fetches and builds a Git dependency directly. With pnpm 10 or newer, the profile may first need an `allowBuilds` entry in `pnpm-workspace.yaml`. Most users should prefer the stable npm release.
++A GitHub-source installation fetches and builds a Git dependency directly. With pnpm 10 or newer, the profile may first need an `allowBuilds` entry in `pnpm-workspace.yaml`. Most users should prefer the pinned `.tgz` from Releases.
+ 
+ After installation, follow the built-in instructions on each channel page to scan a QR code or enter credentials. Secrets and Tokens are sent only to the local Harness Host and stored through its protected credential provider; status responses and bot lists never return them.
+ 
+@@ -101,7 +104,7 @@ Each Telegram bot has its own access-mode control on its bot card. Existing and
+ | Command | Description |
+ | --- | --- |
+ | `/help` | Show the commands and usage supported by the bot. |
+-| `/new` | Unbind the current chat so its next ordinary message starts a new Harness Session. |
++| `/new` | Immediately create and bind a new Harness Session, then return its Session ID. |
+ | `/status` | Check the connection between the current bot and DeepSeek Harness. |
+ | `/models` | List every currently configured model with a number. |
+ | `/model` | Show the model used by the Session bound to this chat. |
+@@ -122,7 +125,7 @@ Example: send `/models`, then `/model 2` to switch to the second model in the li
+ 
+ - `/help` takes no arguments and never creates a Session. It returns the complete command list supported by the current bot.
+ - `/status` takes no arguments, never prompts the model, and does not change the Session binding. It confirms that the current bot can reach DeepSeek Harness.
+-- `/new` only removes the current chat's saved dsh-im Session binding; it never deletes, empties, or archives the old Session. The next ordinary message creates and binds a new Session in the current workspace. If a task is running or waiting for a question or approval, finish the interaction or use `/stop` before `/new`.
++- `/new` immediately creates and binds a new Session in the current workspace and returns its Session ID. It never deletes, empties, or archives the old Session. If a task is running or waiting for a question or approval, finish the interaction or use `/stop` before `/new`.
+ - `/models` takes no arguments and never creates a Session. It assigns a number to every currently configured Harness model and also shows its stable, copyable `provider/model-id`. If one provider fails, models from the remaining providers are still shown.
+ - Bare `/model` only displays the current Session model. A model can be selected by the number or exact full ID returned by `/models`, for example `/model 2`. When the chat has no Session yet, a valid switch creates and binds a blank Session without prompting the model. The switch affects only that Session; Harness also attempts to save it as the default for future Sessions, while other existing Sessions remain unchanged.
+ - A model cannot be switched while a task is running or waiting for an approval or question answer. Wait for it to finish or use `/stop` first. A Session containing images cannot switch to a model that does not accept image input.
+@@ -147,7 +150,7 @@ Example: send `/models`, then `/model 2` to switch to the second model in the li
+ 
+ - **Image understanding**: all nine built-in channels can send JPEG, PNG, WebP, and GIF files sent as images to Harness, with an optional text description. Each image is limited to 5 MB, and all images in one message are limited to 20 MB in total.
+ - **Switch workspaces from a bot card**: every bot card on the settings page shows its current Harness workspace. Enter an existing absolute directory path directly or open the directory picker. Switching clears only that bot's old chat mappings; it never deletes, empties, or archives old Sessions. Replies already in progress may finish, while later messages use the new workspace.
+-- **Check the connection and send a test message**: when a bot is online, clicking **Check connection** verifies the platform connection and sends a “DeepSeek Harness connection test succeeded” message to the bot's most recently remembered direct conversation; WhatsApp uses the account's self-chat. The test neither creates a Harness Session nor invokes the model. The bot must have received at least one direct message before it has a remembered test target; otherwise the page reports that no test conversation is available yet.
++- **Check the connection and send a test message**: when a bot is online, clicking **Check connection** verifies the platform connection and sends a “DeepSeek Harness connection test succeeded” message to the bot's most recently remembered direct conversation; WhatsApp uses the account's self-chat. The test neither creates a Harness Session nor invokes the model. A new integration must receive one direct message first; after that, Feishu, DingTalk, Enterprise WeChat, and Weixin recover the recipient from the persisted Session binding across DSH restarts.
+ - **Retry a connection or remove an integration**: when a bot is offline, its card action changes to **Retry connection**. Use **Remove integration** when the bot is no longer needed. Each action affects only the selected bot and leaves other bots and channels unchanged.
+ - **Manage multiple bots independently**: a channel can have multiple connected bots. Credentials, connection state, workspace, and chat-to-Session mappings are kept separately for every bot, so card actions do not affect sibling bots.
+ - **Streaming replies and progress**: the plugin uses each platform's available capabilities to show thinking state, tool progress, and incremental answers. Platforms without a native streaming API complete replies through message edits, card updates, or a final message.
+@@ -174,7 +177,7 @@ node bin/dsh-im.mjs install --source .
+ IM management RPCs accept loopback browsers by default. When a Web profile is deliberately served on a trusted LAN, opt the plugin into the Host authorities already trusted by Connection in that profile's `cordis.patch.yml`:
+ 
+ ```yaml
+-- id: xmanrui-dsh-im
++- id: onlyforchris-dsh-im
+   config:
+     rpcAuthority: trusted-host
+ ```
+diff --git a/README.md b/README.md
+index ac75e9c..bcdfa08 100644
+--- a/README.md
++++ b/README.md
+@@ -71,21 +71,27 @@ Heartbeat 成功响应必须是 JSON：`{"ok":true,"protocolVersion":"office-har
+ 
+ ## 安装
+ 
+-推荐从 npm 安装已发布的稳定版本：
++从 [GitHub Releases](https://github.com/onlyforchris/dsh-im/releases) 下载 `.tgz` 后，使用 DSH 标准插件命令安装：
+ 
+ ```sh
+-dsh plugin --profile web add -w @xmanrui/dsh-im
++dsh plugin --profile web add ./onlyforchris-dsh-im-0.16.5.tgz
+ ```
+ 
+ 重启 `dsh web`，然后打开「设置 → 插件 → IM机器人」。
+ 
++`@onlyforchris/dsh-im` 发布到 npm 后，也可以直接安装固定版本：
++
++```sh
++dsh plugin --profile web add --save-exact @onlyforchris/dsh-im@0.16.5
++```
++
+ 如需试用尚未发布到 npm 的最新代码，可以改用 GitHub 源安装器：
+ 
+ ```sh
+-npx -y github:xmanrui/dsh-im install
++npx -y github:onlyforchris/dsh-im install
+ ```
+ 
+-GitHub 源安装会直接拉取并构建 Git 依赖；pnpm 10 及以上版本可能要求先在 profile 的 `pnpm-workspace.yaml` 中允许该依赖执行构建脚本。普通用户建议优先使用 npm 稳定版。
++GitHub 源安装会直接拉取并构建 Git 依赖；pnpm 10 及以上版本可能要求先在 profile 的 `pnpm-workspace.yaml` 中允许该依赖执行构建脚本。普通用户建议优先使用 Release 的固定 `.tgz`。
+ 
+ 安装后，在对应渠道页面按照内置引导完成扫码或凭据配置。所有 Secret 和 Token 只提交给本机 Harness Host，并写入受保护的凭据存储；状态接口和机器人列表不会回传这些凭据。
+ 
+@@ -101,7 +107,7 @@ GitHub 源安装会直接拉取并构建 Git 依赖；pnpm 10 及以上版本可
+ | 命令 | 作用 |
+ | --- | --- |
+ | `/help` | 显示机器人支持的命令和用法。 |
+-| `/new` | 解除当前聊天的会话绑定，让下一条普通消息开启全新 Harness 会话。 |
++| `/new` | 立即创建并绑定全新 Harness 会话，同时返回新的 Session ID。 |
+ | `/status` | 检查当前机器人与 DeepSeek Harness 的连接状态。 |
+ | `/models` | 按序号列出当前配置的全部可用模型。 |
+ | `/model` | 查看当前聊天绑定会话正在使用的模型。 |
+@@ -122,7 +128,7 @@ GitHub 源安装会直接拉取并构建 Git 依赖；pnpm 10 及以上版本可
+ 
+ - `/help` 不需要参数，也不会创建会话；它会返回当前机器人支持的完整命令列表。
+ - `/status` 不需要参数，也不会向模型发送消息或改变会话绑定；它用于确认当前机器人能够连接 DeepSeek Harness。
+-- `/new` 只解除当前聊天在 dsh-im 中保存的会话绑定，不会删除、清空或归档旧 Session。下一条普通消息会在当前工作区创建并绑定一个新 Session。任务正在运行或等待问题、审批时，应先完成交互或使用 `/stop`，再使用 `/new`。
++- `/new` 会在当前工作区立即创建并绑定一个新 Session，同时返回新的 Session ID；它不会删除、清空或归档旧 Session。任务正在运行或等待问题、审批时，应先完成交互或使用 `/stop`，再使用 `/new`。
+ - `/models` 不需要参数，也不会创建会话。它为 Harness 当前配置的全部可用模型分配序号，同时显示可稳定复制的 `Provider/模型ID`；某个 Provider 查询失败时，其他 Provider 的结果仍会显示。
+ - `/model` 不带参数时只查看当前会话模型；带参数时接受 `/models` 列出的序号或完整模型 ID，例如 `/model 2`。完整 ID 必须精确匹配。聊天尚无会话时，有效的切换命令会创建并绑定一个空白会话，但不会触发模型回复。切换只影响当前会话；Harness 还会尝试把它保存为以后新会话的默认模型，已有其他会话不受影响。
+ - 正在运行任务或等待审批、问题回答时不能切换模型；请等待完成，或先使用 `/stop`。含图片的会话无法切换到不支持图片输入的模型。
+@@ -147,7 +153,7 @@ GitHub 源安装会直接拉取并构建 Git 依赖；pnpm 10 及以上版本可
+ 
+ - **图片识别**：九个内置渠道都可以把 JPEG、PNG、WebP，以及以图片文件方式发送的 GIF 交给 Harness；图片可以附带文字说明。单张图片上限为 5 MB，单条消息中的图片总大小上限为 20 MB。
+ - **在机器人卡片切换工作区**：设置页中的每张机器人卡片都会显示当前 Harness 工作区。可以直接填写已有目录的绝对路径，也可以打开目录选择器。切换只清除该机器人的旧聊天映射，不会删除、清空或归档旧 Session；已经开始的回复可以继续完成，后续消息使用新工作区。
+-- **检查连接并发送测试消息**：机器人在线时，点击卡片上的「检查连接」会检查平台连接，并向该机器人最近记录的私聊发送一条“DeepSeek Harness 连接测试成功”消息；WhatsApp 会发送到账号自聊。测试消息不会创建 Harness Session，也不会调用模型。机器人必须至少收到过一条私聊才能记住测试目标，否则页面会提示尚无可用的测试会话。
++- **检查连接并发送测试消息**：机器人在线时，点击卡片上的「检查连接」会检查平台连接，并向该机器人最近记录的私聊发送一条“DeepSeek Harness 连接测试成功”消息；WhatsApp 会发送到账号自聊。测试消息不会创建 Harness Session，也不会调用模型。首次接入仍需至少收到一条私聊；此后飞书、钉钉、企业微信和微信会从已持久化的会话绑定恢复收件人，DSH 重启后无需再次唤醒。
+ - **重试连接和移除接入**：机器人离线时，卡片上的操作会变为「重试连接」；不再使用时可以点击「移除接入」。这些操作都只作用于所选机器人，不影响其他机器人或渠道。
+ - **多机器人独立管理**：同一渠道可以接入多个机器人。每个机器人分别保存凭据、连接状态、工作区和聊天会话映射，卡片上的工作区、连接检查、重试和移除操作互不影响。
+ - **流式回复和进度提示**：插件会按各平台能力显示正在思考、工具执行和逐步生成的回答；不支持原生流式接口的平台会通过编辑消息、卡片更新或最终消息完成回复。
+@@ -174,7 +180,7 @@ node bin/dsh-im.mjs install --source .
+ IM 管理 RPC 默认仅接受回环浏览器。如果 Web profile 在受信任的局域网内对外提供服务，可在该 profile 的 `cordis.patch.yml` 中显式开放给 Connection 已信任的 Host authority：
+ 
+ ```yaml
+-- id: xmanrui-dsh-im
++- id: onlyforchris-dsh-im
+   config:
+     rpcAuthority: trusted-host
+ ```
+diff --git a/bin/dsh-im.mjs b/bin/dsh-im.mjs
+index f2b46fd..27935dc 100755
+--- a/bin/dsh-im.mjs
++++ b/bin/dsh-im.mjs
+@@ -5,9 +5,10 @@ import { homedir, tmpdir } from 'node:os';
+ import { isAbsolute, join, resolve } from 'node:path';
+ import { spawnSync } from 'node:child_process';
+ 
+-const PACKAGE_NAME = '@xmanrui/dsh-im';
+-const DEFAULT_SOURCE = 'github:xmanrui/dsh-im';
++const PACKAGE_NAME = '@onlyforchris/dsh-im';
++const DEFAULT_SOURCE = 'github:onlyforchris/dsh-im';
+ const LEGACY_PACKAGES = [
++  '@xmanrui/dsh-im',
+   '@xmanrui/dsh-feishu',
+   '@xmanrui/dsh-weixin',
+   '@xmanrui/dsh-dingtalk',
+@@ -19,7 +20,7 @@ function usage() {
+   dsh-im uninstall [--profile web]
+ 
+ Examples:
+-  npx -y github:xmanrui/dsh-im install
++  npx -y github:onlyforchris/dsh-im install
+   dsh-im install --source .`);
+ }
+ 
+diff --git a/cordis.patch.yml b/cordis.patch.yml
+index 6798e9a..e57a900 100644
+--- a/cordis.patch.yml
++++ b/cordis.patch.yml
+@@ -1,3 +1,3 @@
+ - insert:
+-    - id: xmanrui-dsh-im
+-      name: '@xmanrui/dsh-im'
++    - id: onlyforchris-dsh-im
++      name: '@onlyforchris/dsh-im'
+diff --git a/package.json b/package.json
+index 10d69a3..e5768f1 100644
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+-  "name": "@xmanrui/dsh-im",
+-  "version": "0.16.2",
++  "name": "@onlyforchris/dsh-im",
++  "version": "0.16.5",
+   "description": "把九种 IM 机器人和公网 AI Office 接入本机 DeepSeek Harness。 Connect nine IM channels and a public AI Office to a local DeepSeek Harness.",
+   "keywords": [
+     "deepseek-harness",
+@@ -23,10 +23,14 @@
+     "ai-office"
+   ],
+   "author": {
+-    "name": "xmanrui",
+-    "url": "https://github.com/xmanrui"
++    "name": "onlyforchris",
++    "url": "https://github.com/onlyforchris"
+   },
+   "contributors": [
++    {
++      "name": "xmanrui",
++      "url": "https://github.com/xmanrui"
++    },
+     {
+       "name": "C3H3-AI",
+       "url": "https://github.com/C3H3-AI"
+@@ -36,10 +40,10 @@
+   "type": "module",
+   "repository": {
+     "type": "git",
+-    "url": "git+https://github.com/xmanrui/dsh-im.git"
++    "url": "git+https://github.com/onlyforchris/dsh-im.git"
+   },
+-  "homepage": "https://github.com/xmanrui/dsh-im#readme",
+-  "bugs": "https://github.com/xmanrui/dsh-im/issues",
++  "homepage": "https://github.com/onlyforchris/dsh-im#readme",
++  "bugs": "https://github.com/onlyforchris/dsh-im/issues",
+   "publishConfig": {
+     "access": "public"
+   },
+diff --git a/plugin-src/client/build.mjs b/plugin-src/client/build.mjs
+index 5b53de7..1fbd409 100644
+--- a/plugin-src/client/build.mjs
++++ b/plugin-src/client/build.mjs
+@@ -7,7 +7,7 @@ import { build } from 'esbuild';
+ const sourceDirectory = dirname(fileURLToPath(import.meta.url));
+ const packageRoot = resolve(sourceDirectory, '../..');
+ const outputPath = resolve(packageRoot, 'lib/client.js');
+-const loaderId = process.env.DSH_IM_CLIENT_ID ?? '@xmanrui/dsh-im';
++const loaderId = process.env.DSH_IM_CLIENT_ID ?? '@onlyforchris/dsh-im';
+ 
+ const result = await build({
+   entryPoints: [resolve(sourceDirectory, 'index.js')],
+diff --git a/plugin-src/client/channels/dingtalk/styles.js b/plugin-src/client/channels/dingtalk/styles.js
+index e97ea2f..b81b504 100644
+--- a/plugin-src/client/channels/dingtalk/styles.js
++++ b/plugin-src/client/channels/dingtalk/styles.js
+@@ -1,4 +1,4 @@
+-export const DINGTALK_STYLE_ID = 'xmanrui-dsh-dingtalk-settings';
++export const DINGTALK_STYLE_ID = 'onlyforchris-dsh-im-dingtalk-settings';
+ 
+ const CSS = String.raw`
+ .ddt-page {
+@@ -132,7 +132,7 @@ export function installDingtalkStyles() {
+   const existing = document.querySelector(`style[data-plugin-css="${DINGTALK_STYLE_ID}"]`);
+   if (existing) return () => {};
+   const style = document.createElement('style');
+-  style.dataset.plugin = '@xmanrui/dsh-dingtalk';
++  style.dataset.plugin = '@onlyforchris/dsh-im';
+   style.dataset.pluginCss = DINGTALK_STYLE_ID;
+   style.textContent = CSS;
+   document.head.appendChild(style);
+diff --git a/plugin-src/client/channels/discord/styles.js b/plugin-src/client/channels/discord/styles.js
+index 9a67dd2..dd2fb21 100644
+--- a/plugin-src/client/channels/discord/styles.js
++++ b/plugin-src/client/channels/discord/styles.js
+@@ -1,4 +1,4 @@
+-export const DISCORD_STYLE_ID = 'xmanrui-dsh-im-discord-settings';
++export const DISCORD_STYLE_ID = 'onlyforchris-dsh-im-discord-settings';
+ 
+ const CSS = String.raw`
+ .ddc-page { --ddt-accent: #5865f2; --ddt-accent-deep: #4752c4; --ddt-accent-wash: #eef0ff; }
+@@ -11,7 +11,7 @@ export function installDiscordStyles() {
+   const existing = document.querySelector(`style[data-plugin-css="${DISCORD_STYLE_ID}"]`);
+   if (existing) return () => {};
+   const style = document.createElement('style');
+-  style.dataset.plugin = '@xmanrui/dsh-im';
++  style.dataset.plugin = '@onlyforchris/dsh-im';
+   style.dataset.pluginCss = DISCORD_STYLE_ID;
+   style.textContent = CSS;
+   document.head.appendChild(style);
+diff --git a/plugin-src/client/channels/feishu/styles.js b/plugin-src/client/channels/feishu/styles.js
+index 967913b..a599536 100644
+--- a/plugin-src/client/channels/feishu/styles.js
++++ b/plugin-src/client/channels/feishu/styles.js
+@@ -496,7 +496,7 @@ export function installFeishuStyles() {
+   }
+ 
+   const style = document.createElement("style");
+-  style.dataset.plugin = "@xmanrui/dsh-feishu";
++  style.dataset.plugin = "@onlyforchris/dsh-im";
+   style.dataset.pluginCss = FEISHU_STYLE_ID;
+   style.textContent = CSS;
+   document.head.appendChild(style);
+diff --git a/plugin-src/client/channels/office/styles.js b/plugin-src/client/channels/office/styles.js
+index 0d417a4..9d224f7 100644
+--- a/plugin-src/client/channels/office/styles.js
++++ b/plugin-src/client/channels/office/styles.js
+@@ -1,4 +1,4 @@
+-export const OFFICE_STYLE_ID = 'xmanrui-dsh-im-office-settings';
++export const OFFICE_STYLE_ID = 'onlyforchris-dsh-im-office-settings';
+ 
+ const CSS = `
+ .dof-page { --dof-accent: var(--dsw-alias-brand-primary, #3964fe); }
+diff --git a/plugin-src/client/channels/qq/styles.js b/plugin-src/client/channels/qq/styles.js
+index 6131c08..ae45ffb 100644
+--- a/plugin-src/client/channels/qq/styles.js
++++ b/plugin-src/client/channels/qq/styles.js
+@@ -1,4 +1,4 @@
+-export const QQ_STYLE_ID = 'xmanrui-dsh-im-qq-settings';
++export const QQ_STYLE_ID = 'onlyforchris-dsh-im-qq-settings';
+ 
+ const CSS = String.raw`
+ .dqq-page { --ddt-accent: #1677ff; --ddt-accent-deep: #0958d9; --ddt-accent-wash: #eaf3ff; }
+@@ -11,7 +11,7 @@ export function installQqStyles() {
+   const existing = document.querySelector(`style[data-plugin-css="${QQ_STYLE_ID}"]`);
+   if (existing) return () => {};
+   const style = document.createElement('style');
+-  style.dataset.plugin = '@xmanrui/dsh-im';
++  style.dataset.plugin = '@onlyforchris/dsh-im';
+   style.dataset.pluginCss = QQ_STYLE_ID;
+   style.textContent = CSS;
+   document.head.appendChild(style);
+diff --git a/plugin-src/client/channels/slack/styles.js b/plugin-src/client/channels/slack/styles.js
+index 388141f..d64dac5 100644
+--- a/plugin-src/client/channels/slack/styles.js
++++ b/plugin-src/client/channels/slack/styles.js
+@@ -1,4 +1,4 @@
+-export const SLACK_STYLE_ID = 'xmanrui-dsh-im-slack-settings';
++export const SLACK_STYLE_ID = 'onlyforchris-dsh-im-slack-settings';
+ 
+ const CSS = String.raw`
+ .dsl-page { --ddt-accent: #4a154b; --ddt-accent-deep: #321033; --ddt-accent-wash: #f7eef7; }
+@@ -26,7 +26,7 @@ export function installSlackStyles() {
+   const existing = document.querySelector(`style[data-plugin-css="${SLACK_STYLE_ID}"]`);
+   if (existing) return () => {};
+   const style = document.createElement('style');
+-  style.dataset.plugin = '@xmanrui/dsh-im';
++  style.dataset.plugin = '@onlyforchris/dsh-im';
+   style.dataset.pluginCss = SLACK_STYLE_ID;
+   style.textContent = CSS;
+   document.head.appendChild(style);
+diff --git a/plugin-src/client/channels/telegram/styles.js b/plugin-src/client/channels/telegram/styles.js
+index 806c3f1..31f870f 100644
+--- a/plugin-src/client/channels/telegram/styles.js
++++ b/plugin-src/client/channels/telegram/styles.js
+@@ -1,4 +1,4 @@
+-export const TELEGRAM_STYLE_ID = 'xmanrui-dsh-im-telegram-settings';
++export const TELEGRAM_STYLE_ID = 'onlyforchris-dsh-im-telegram-settings';
+ 
+ const CSS = String.raw`
+ .dtg-page { --ddt-accent: #229ed9; --ddt-accent-deep: #1687bd; --ddt-accent-wash: #eaf7fd; }
+@@ -37,7 +37,7 @@ export function installTelegramStyles() {
+   const existing = document.querySelector(`style[data-plugin-css="${TELEGRAM_STYLE_ID}"]`);
+   if (existing) return () => {};
+   const style = document.createElement('style');
+-  style.dataset.plugin = '@xmanrui/dsh-im';
++  style.dataset.plugin = '@onlyforchris/dsh-im';
+   style.dataset.pluginCss = TELEGRAM_STYLE_ID;
+   style.textContent = CSS;
+   document.head.appendChild(style);
+diff --git a/plugin-src/client/channels/wecom/styles.js b/plugin-src/client/channels/wecom/styles.js
+index 1406c54..fdf23e1 100644
+--- a/plugin-src/client/channels/wecom/styles.js
++++ b/plugin-src/client/channels/wecom/styles.js
+@@ -1,4 +1,4 @@
+-export const WECOM_STYLE_ID = 'xmanrui-dsh-im-wecom-settings';
++export const WECOM_STYLE_ID = 'onlyforchris-dsh-im-wecom-settings';
+ 
+ const CSS = String.raw`
+ .dwecom-page { --ddt-accent: #3370ff; --ddt-accent-deep: #245bdb; --ddt-accent-wash: #eef4ff; }
+@@ -11,7 +11,7 @@ export function installWecomStyles() {
+   const existing = document.querySelector(`style[data-plugin-css="${WECOM_STYLE_ID}"]`);
+   if (existing) return () => {};
+   const style = document.createElement('style');
+-  style.dataset.plugin = '@xmanrui/dsh-im';
++  style.dataset.plugin = '@onlyforchris/dsh-im';
+   style.dataset.pluginCss = WECOM_STYLE_ID;
+   style.textContent = CSS;
+   document.head.appendChild(style);
+diff --git a/plugin-src/client/channels/weixin/styles.js b/plugin-src/client/channels/weixin/styles.js
+index 6ecde2a..00be74c 100644
+--- a/plugin-src/client/channels/weixin/styles.js
++++ b/plugin-src/client/channels/weixin/styles.js
+@@ -1,4 +1,4 @@
+-export const WEIXIN_STYLE_ID = 'xmanrui-dsh-weixin-settings';
++export const WEIXIN_STYLE_ID = 'onlyforchris-dsh-im-weixin-settings';
+ 
+ const CSS = String.raw`
+ .dxw-page {
+@@ -112,7 +112,7 @@ export function installWeixinStyles() {
+   const existing = document.querySelector(`style[data-plugin-css="${WEIXIN_STYLE_ID}"]`);
+   if (existing) return () => {};
+   const style = document.createElement('style');
+-  style.dataset.plugin = '@xmanrui/dsh-weixin';
++  style.dataset.plugin = '@onlyforchris/dsh-im';
+   style.dataset.pluginCss = WEIXIN_STYLE_ID;
+   style.textContent = CSS;
+   document.head.appendChild(style);
+diff --git a/plugin-src/client/channels/whatsapp/styles.js b/plugin-src/client/channels/whatsapp/styles.js
+index 338f042..74c6d28 100644
+--- a/plugin-src/client/channels/whatsapp/styles.js
++++ b/plugin-src/client/channels/whatsapp/styles.js
+@@ -1,4 +1,4 @@
+-export const WHATSAPP_STYLE_ID = 'xmanrui-dsh-im-whatsapp-settings';
++export const WHATSAPP_STYLE_ID = 'onlyforchris-dsh-im-whatsapp-settings';
+ 
+ const CSS = String.raw`
+ .dwa-page { --ddt-accent: #25d366; --ddt-accent-deep: #128c7e; --ddt-accent-wash: #eafbf0; }
+@@ -11,7 +11,7 @@ export function installWhatsappStyles() {
+   const existing = document.querySelector(`style[data-plugin-css="${WHATSAPP_STYLE_ID}"]`);
+   if (existing) return () => {};
+   const style = document.createElement('style');
+-  style.dataset.plugin = '@xmanrui/dsh-im';
++  style.dataset.plugin = '@onlyforchris/dsh-im';
+   style.dataset.pluginCss = WHATSAPP_STYLE_ID;
+   style.textContent = CSS;
+   document.head.appendChild(style);
+diff --git a/plugin-src/client/styles.js b/plugin-src/client/styles.js
+index 07689c4..7709887 100644
+--- a/plugin-src/client/styles.js
++++ b/plugin-src/client/styles.js
+@@ -1,4 +1,4 @@
+-export const IM_STYLE_ID = 'xmanrui-dsh-im-settings';
++export const IM_STYLE_ID = 'onlyforchris-dsh-im-settings';
+ 
+ const CSS = String.raw`
+ .dim-page {
+@@ -280,7 +280,7 @@ export function installImStyles() {
+   const existing = document.querySelector(`style[data-plugin-css="${IM_STYLE_ID}"]`);
+   if (existing) return () => {};
+   const style = document.createElement('style');
+-  style.dataset.plugin = '@xmanrui/dsh-im';
++  style.dataset.plugin = '@onlyforchris/dsh-im';
+   style.dataset.pluginCss = IM_STYLE_ID;
+   style.textContent = CSS;
+   document.head.appendChild(style);
+diff --git a/plugin-src/host/channels/weixin/production.mjs b/plugin-src/host/channels/weixin/production.mjs
+index 526df48..0b02bad 100644
+--- a/plugin-src/host/channels/weixin/production.mjs
++++ b/plugin-src/host/channels/weixin/production.mjs
+@@ -8,6 +8,7 @@ import { WeixinStateStore } from '../../../../src/channels/weixin/state-store.mj
+ import { createWeixinApi } from '../../../../src/channels/weixin/weixin-api.mjs';
+ import { WeixinController } from '../../../../src/channels/weixin/weixin-controller.mjs';
+ import { WeixinRuntime } from '../../../../src/channels/weixin/weixin-runtime.mjs';
++import { NotificationOutbox } from '../../../../src/channels/weixin/notification-outbox.mjs';
+ import {
+   BotWorkspaceStore,
+   createBotWorkspaceScope,
+@@ -108,6 +109,7 @@ export async function createProductionController(ctx, config = {}, internals = {
+         state: workspaceScope.state,
+         replyTimeoutMs: config.replyTimeoutMs ?? 600_000,
+         maxMessageChars: config.maxMessageChars ?? 4_000,
++        workspaceSessionCommandsEnabled: config.workspaceSessionCommandsEnabled !== false,
+         logger: {
+           error: (...args) => logger.error?.(`[${botId}]`, ...args),
+           warn: (...args) => logger.warn?.(`[${botId}]`, ...args),
+@@ -131,6 +133,17 @@ export async function createProductionController(ctx, config = {}, internals = {
+     },
+   });
+   const controller = createWorkspaceAwareController(coreController, { workspaces, stateFor });
++  if (config.notificationOutboxDir && !config.notificationBotId) {
++    throw new TypeError('notificationBotId is required when notificationOutboxDir is configured');
++  }
++  const notificationOutbox = config.notificationOutboxDir
++    ? new NotificationOutbox({
++        dir: config.notificationOutboxDir,
++        pollIntervalMs: config.notificationPollIntervalMs ?? 5_000,
++        logger,
++        send: (text) => controller.sendNotification(config.notificationBotId, text),
++      })
++    : null;
+   const supervisor = createSupervisor({
+     controller,
+     harness,
+@@ -138,10 +151,12 @@ export async function createProductionController(ctx, config = {}, internals = {
+     retryDelaysMs: config.retryDelaysMs,
+     healthyIntervalMs: config.healthyIntervalMs,
+   }).start();
++  await notificationOutbox?.start();
+   return {
+     controller,
+     ready: supervisor.ready,
+     async close() {
++      await notificationOutbox?.close();
+       await supervisor.close();
+       await controller.close();
+       harness.stopManagedProcess();
+diff --git a/plugin-src/host/index.mjs b/plugin-src/host/index.mjs
+index 9dbadc4..a2434f1 100644
+--- a/plugin-src/host/index.mjs
++++ b/plugin-src/host/index.mjs
+@@ -8,6 +8,7 @@ import { apply as applyTelegram } from './channels/telegram/index.mjs';
+ import { apply as applyWecom } from './channels/wecom/index.mjs';
+ import { apply as applyWeixin } from './channels/weixin/index.mjs';
+ import { apply as applyWhatsapp } from './channels/whatsapp/index.mjs';
++import { installImPreAsk } from '../../src/channels/shared/im-pre-ask.mjs';
+ 
+ export const name = 'dsh-im-host';
+ export const inject = ['connection', 'credentials', 'webServer', 'typertGateway'];
+@@ -34,6 +35,17 @@ export function createImHostPlugin(internals = {}) {
+     name,
+     inject,
+     async apply(ctx, config = {}) {
++      // 通用扩展点：业务插件 ctx.on('im/pre-ask') 可短路固定回执（不进 LLM）
++      const disposePreAsk = installImPreAsk(async (payload) => {
++        if (typeof ctx.waterfall !== 'function') return { kind: 'continue' };
++        return ctx.waterfall(
++          'im/pre-ask',
++          payload,
++          () => Promise.resolve({ kind: 'continue' }),
++        );
++      });
++      ctx.effect(() => disposePreAsk, 'dsh-im: im/pre-ask gate');
++
+       await startFeishu(ctx, channelConfig(config, 'feishu'));
+       await startWeixin(ctx, channelConfig(config, 'weixin'));
+       await startDingtalk(ctx, channelConfig(config, 'dingtalk'));
+diff --git a/scripts/verify-package.mjs b/scripts/verify-package.mjs
+index 87b087b..33dc06c 100644
+--- a/scripts/verify-package.mjs
++++ b/scripts/verify-package.mjs
+@@ -82,7 +82,7 @@ if (forbiddenDshLockPaths.length > 0) {
+   );
+ }
+ 
+-if (!client.includes('id: "@xmanrui/dsh-im"')) {
++if (!client.includes('id: "@onlyforchris/dsh-im"')) {
+   throw new Error('client bundle does not register the dsh-im loader id');
+ }
+ if (!client.includes('id: "im"')
+@@ -91,8 +91,8 @@ if (!client.includes('id: "im"')
+   || !client.includes('IM_LOCALE_NAMESPACE = "dsh-im"')) {
+   throw new Error('client bundle does not register the localized IM settings tab');
+ }
+-if ((client.match(/ctx\.slots\.inject\("settings\.plugins\.tab"/g) ?? []).length !== 1) {
+-  throw new Error('client bundle must register exactly one settings tab');
++if ((client.match(/ctx\.slots\.inject\("settings\.section"/g) ?? []).length !== 1) {
++  throw new Error('client bundle must register exactly one settings section');
+ }
+ if (/role:\s*["']switch|type:\s*["']checkbox/.test(client)) {
+   throw new Error('client bundle contains a channel enable switch');
+@@ -119,7 +119,7 @@ if (/@xmanrui\/dsh-(?:feishu|weixin|dingtalk)/.test(
+ )) {
+   throw new Error('source or package metadata still depends on an external channel plugin');
+ }
+-if (!patch.includes("name: '@xmanrui/dsh-im'") || /dsh-(?:feishu|weixin|dingtalk)/.test(patch)) {
++if (!patch.includes("name: '@onlyforchris/dsh-im'") || /dsh-(?:feishu|weixin|dingtalk)/.test(patch)) {
+   throw new Error('bundle patch must activate only dsh-im');
+ }
+ for (const name of ['@xmanrui/dsh-feishu', '@xmanrui/dsh-weixin', '@xmanrui/dsh-dingtalk']) {
+@@ -160,7 +160,9 @@ if (manifest.bin?.['dsh-im'] !== 'bin/dsh-im.mjs') {
+ if (/(?:from\s*|import\s*\(|require\s*\()\s*["'](?:@larksuiteoapi\/node-sdk|@whiskeysockets\/baileys|protobufjs)(?:\/[^"']*)?["']/.test(host)) {
+   throw new Error('host bundle must not import a bundled SDK or protobufjs at runtime');
+ }
+-if ((executable.mode & 0o111) === 0) throw new Error('dsh-im CLI is not executable');
++if (process.platform !== 'win32' && (executable.mode & 0o111) === 0) {
++  throw new Error('dsh-im CLI is not executable');
++}
+ if (/private-bot-token|must-be-rolled-back|DEEPSEEK_API_KEY=/.test(client + host)) {
+   throw new Error('built artifacts contain a test or environment secret marker');
+ }
+diff --git a/src/channels/dingtalk/dingtalk-bridge.mjs b/src/channels/dingtalk/dingtalk-bridge.mjs
+index 4a0b176..513e36c 100644
+--- a/src/channels/dingtalk/dingtalk-bridge.mjs
++++ b/src/channels/dingtalk/dingtalk-bridge.mjs
+@@ -19,7 +19,7 @@ import {
+   runModelCommand,
+ } from '../shared/model-command.mjs';
+ import { runWorkspaceCommand } from '../shared/workspace-command.mjs';
+-import { askInWorkspaceSession } from '../shared/workspace-session.mjs';
++import { askInWorkspaceSession, resetWorkspaceSession } from '../shared/workspace-session.mjs';
+ import {
+   hasInboundImages,
+   imagePromptUserMessage,
+@@ -328,7 +328,9 @@ export class DingtalkHarnessBridge {
+       // An unsafe reply route must never be able to submit an approval.
+     }
+     if (sessionWebhook && String(message.conversationType) !== '2') {
+-      rememberConnectionTestTarget(this.#state, { sessionWebhook });
++      void Promise.resolve(
++        rememberConnectionTestTarget(this.#state, { sessionWebhook, userId: sender }),
++      ).catch(() => this.#logger.warn?.('[dsh-dingtalk] unable to persist the private target'));
+     }
+     const pending = this.#pendingInteractions.get(key);
+     const promptMessage = dingtalkInboundMessage(message, {
+@@ -546,8 +548,13 @@ export class DingtalkHarnessBridge {
+         return;
+       }
+       if (isPlainText && !hasImages && command === '/new') {
+-        await this.#state.clearSession(key);
+-        await this.#send(sessionWebhook, '已开启新会话。请发送你的问题。');
++        const sessionId = await resetWorkspaceSession({
++          harness: this.#harness,
++          state: this.#state,
++          key,
++          createOptions: { signal: this.#signal },
++        });
++        await this.#send(sessionWebhook, `已开启新会话。\nID：${sessionId}`);
+         return;
+       }
+       const workspaceCommand = isPlainText && !hasImages
+@@ -594,6 +601,8 @@ export class DingtalkHarnessBridge {
+         state: this.#state,
+         key,
+         channelLabel: this.#sourceChannelLabel,
++        fromUserId: sender,
++        msgId: messageId,
+         ...(hasImages ? { content } : { text }),
+         createOptions: { signal: this.#signal },
+         existsOptions: { signal: this.#signal },
+diff --git a/src/channels/dingtalk/dingtalk-runtime.mjs b/src/channels/dingtalk/dingtalk-runtime.mjs
+index 90865a5..e99a16c 100644
+--- a/src/channels/dingtalk/dingtalk-runtime.mjs
++++ b/src/channels/dingtalk/dingtalk-runtime.mjs
+@@ -3,7 +3,11 @@ import {
+   createDingtalkBridgeStatus,
+   DingtalkHarnessBridge,
+ } from './dingtalk-bridge.mjs';
+-import { sendRememberedConnectionTest } from '../shared/connection-test.mjs';
++import {
++  connectionTestTarget,
++  latestBoundConversation,
++  sendRememberedConnectionTest,
++} from '../shared/connection-test.mjs';
+ 
+ function nonEmptyString(value) {
+   return typeof value === 'string' && value.trim() ? value.trim() : null;
+@@ -353,6 +357,29 @@ export class DingtalkRuntime {
+   }
+ 
+   async sendConnectionTest(text) {
++    const userId = connectionTestTarget(this.#state)?.userId
++      ?? latestBoundConversation(this.#state, 'p2p:')?.id;
++    if (userId && typeof this.#api.createAiCard === 'function'
++      && typeof this.#api.finishAiCard === 'function') {
++      if (!this.#status.ready || !this.#abortController) {
++        throw new Error('DingTalk runtime is not connected');
++      }
++      const card = await this.#api.createAiCard({
++        clientId: this.#config.clientId,
++        clientSecret: this.#clientSecret,
++        target: { type: 'user', userId },
++        initialText: text,
++        signal: this.#abortController.signal,
++      });
++      await this.#api.finishAiCard({
++        clientId: this.#config.clientId,
++        clientSecret: this.#clientSecret,
++        cardInstanceId: card.cardInstanceId,
++        text,
++        signal: this.#abortController.signal,
++      });
++      return { sent: true };
++    }
+     return sendRememberedConnectionTest({
+       state: this.#state,
+       text,
+diff --git a/src/channels/dingtalk/state-store.mjs b/src/channels/dingtalk/state-store.mjs
+index a68a194..2ba3929 100644
+--- a/src/channels/dingtalk/state-store.mjs
++++ b/src/channels/dingtalk/state-store.mjs
+@@ -7,6 +7,7 @@ const EMPTY_STATE = Object.freeze({
+   sessions: {},
+   seenMessageIds: [],
+   pendingSenders: {},
++  connectionTestTarget: null,
+ });
+ 
+ function nonEmptyString(value) {
+@@ -17,6 +18,11 @@ function displayName(value) {
+   return (nonEmptyString(value) ?? '钉钉用户').slice(0, 100);
+ }
+ 
++function connectionTestTarget(value) {
++  const userId = nonEmptyString(value?.userId);
++  return userId ? { userId } : null;
++}
++
+ function normalizePendingSender(value, fallbackRequestId) {
+   if (!value || typeof value !== 'object') return null;
+   const requestId = nonEmptyString(value.requestId) ?? nonEmptyString(fallbackRequestId);
+@@ -67,6 +73,10 @@ function normalizeState(value) {
+       ? [...new Set(value.seenMessageIds.map(nonEmptyString).filter(Boolean))].slice(-1_000)
+       : [],
+     pendingSenders,
++    connectionTestTarget: connectionTestTarget(value.connectionTestTarget)
++      ?? connectionTestTarget({
++        userId: Object.keys(sessions).findLast((key) => key.startsWith('p2p:'))?.slice(4),
++      }),
+   };
+ }
+ 
+@@ -122,6 +132,17 @@ export class DingtalkStateStore {
+     await this.#persist();
+   }
+ 
++  connectionTestTarget() {
++    return structuredClone(this.#state.connectionTestTarget);
++  }
++
++  async setConnectionTestTarget(target) {
++    const normalized = connectionTestTarget(target);
++    if (!normalized) throw new TypeError('DingTalk connection test target is required');
++    this.#state.connectionTestTarget = normalized;
++    await this.#persist();
++  }
++
+   hasSeen(messageId) {
+     const id = nonEmptyString(messageId);
+     return Boolean(id && this.#state.seenMessageIds.includes(id));
+diff --git a/src/channels/discord/discord-api.mjs b/src/channels/discord/discord-api.mjs
+index 6c4f59b..1be4b8b 100644
+--- a/src/channels/discord/discord-api.mjs
++++ b/src/channels/discord/discord-api.mjs
+@@ -108,7 +108,7 @@ export class DiscordApi {
+         headers: {
+           authorization: `Bot ${this.#token}`,
+           'content-type': 'application/json',
+-          'user-agent': 'DeepSeek-Harness-dsh-im (https://github.com/xmanrui/dsh-im, 0.16.0)',
++          'user-agent': 'DeepSeek-Harness-dsh-im (https://github.com/onlyforchris/dsh-im, 0.16.5)',
+         },
+         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+         signal: requestSignal(signal, timeoutMs),
+diff --git a/src/channels/feishu/bridge.mjs b/src/channels/feishu/bridge.mjs
+index 5f601f3..ef7ab8f 100644
+--- a/src/channels/feishu/bridge.mjs
++++ b/src/channels/feishu/bridge.mjs
+@@ -29,7 +29,7 @@ import {
+   runModelCommand,
+ } from '../shared/model-command.mjs';
+ import { runWorkspaceCommand, resolveSessionListWorkspace, workspacePathSnapshot } from '../shared/workspace-command.mjs';
+-import { askInWorkspaceSession } from '../shared/workspace-session.mjs';
++import { askInWorkspaceSession, resetWorkspaceSession } from '../shared/workspace-session.mjs';
+ import {
+   MENU_PAGE_SIZE,
+   menuCard,
+@@ -325,7 +325,9 @@ export class FeishuHarnessBridge {
+ 
+     if (event.message.chat_type === 'p2p') {
+       const chatId = nonEmptyString(event.message.chat_id);
+-      if (chatId) rememberConnectionTestTarget(this.#state, { chatId });
++      if (chatId) void Promise.resolve(
++        rememberConnectionTestTarget(this.#state, { chatId }),
++      ).catch(() => this.#logger.warn?.('[dsh-feishu] unable to persist the private target'));
+     }
+ 
+     this.#acceptedMessageIds.add(messageId);
+@@ -589,8 +591,13 @@ export class FeishuHarnessBridge {
+       return;
+     }
+     if (commandText === '/new') {
+-      await this.#state.clearSession(key);
+-      await this.#send(event.message.chat_id, '已开启全新 Harness 会话。');
++      const sessionId = await resetWorkspaceSession({
++        harness: this.#harness,
++        state: this.#state,
++        key,
++        createOptions: { signal: this.#signal },
++      });
++      await this.#send(event.message.chat_id, `已开启全新 Harness 会话。\nID：${sessionId}`);
+       return;
+     }
+     if (commandText === '/status') {
+@@ -1013,8 +1020,13 @@ export class FeishuHarnessBridge {
+       return;
+     }
+     if (action === 'new') {
+-      await this.#state.clearSession(key);
+-      await this.#send(chatId, '已开启全新 Harness 会话。');
++      const sessionId = await resetWorkspaceSession({
++        harness: this.#harness,
++        state: this.#state,
++        key,
++        createOptions: { signal: this.#signal },
++      });
++      await this.#send(chatId, `已开启全新 Harness 会话。\nID：${sessionId}`);
+       return;
+     }
+     if (action === 'status') {
+@@ -1204,6 +1216,8 @@ export class FeishuHarnessBridge {
+         text,
+         content,
+         channelLabel: this.#sourceChannelLabel,
++        fromUserId: senderOpenId(event),
++        msgId: messageId,
+         createOptions: { signal: this.#signal },
+         existsOptions: { signal: this.#signal },
+         askOptions: this.#interactionAskOptions(event, key),
+@@ -1233,6 +1247,8 @@ export class FeishuHarnessBridge {
+             text,
+             content,
+             channelLabel: this.#sourceChannelLabel,
++            fromUserId: senderOpenId(event),
++            msgId: messageId,
+             createOptions: { signal: this.#signal },
+             existsOptions: { signal: this.#signal },
+             askOptions,
+@@ -1262,6 +1278,8 @@ export class FeishuHarnessBridge {
+         text,
+         content,
+         channelLabel: this.#sourceChannelLabel,
++        fromUserId: senderOpenId(event),
++        msgId: messageId,
+         createOptions: { signal: this.#signal },
+         existsOptions: { signal: this.#signal },
+         askOptions: this.#interactionAskOptions(event, key),
+diff --git a/src/channels/feishu/feishu-runtime.mjs b/src/channels/feishu/feishu-runtime.mjs
+index b2ca2ee..cc1b24f 100644
+--- a/src/channels/feishu/feishu-runtime.mjs
++++ b/src/channels/feishu/feishu-runtime.mjs
+@@ -3,8 +3,9 @@ import { FeishuHarnessBridge } from './bridge.mjs';
+ import { cardActionProbeCard } from './feishu-cards.mjs';
+ import { VerifiedFeishuChannel } from './feishu-channel.mjs';
+ import {
++  connectionTestTarget,
+   connectionTestTargetUnavailable,
+-  sendRememberedConnectionTest,
++  latestBoundConversation,
+ } from '../shared/connection-test.mjs';
+ 
+ const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+@@ -465,16 +466,16 @@ export class FeishuRuntime {
+       return { sent: true };
+     }
+ 
+-    return sendRememberedConnectionTest({
+-      state: this.#state,
+-      text,
+-      channelLabel: '飞书机器人',
+-      send: async (target, content) => {
+-        const chatId = typeof target?.chatId === 'string' ? target.chatId.trim() : '';
+-        if (!chatId) throw connectionTestTargetUnavailable('飞书机器人');
+-        await send('chat_id', chatId, content);
+-      },
+-    });
++    const chatId = nonEmptyString(connectionTestTarget(this.#state)?.chatId);
++    if (chatId) {
++      await send('chat_id', chatId, text);
++      return { sent: true };
++    }
++    const boundOpenId = nonEmptyString(connectionTestTarget(this.#state)?.openId)
++      ?? latestBoundConversation(this.#state, 'p2p:')?.id;
++    if (!boundOpenId) throw connectionTestTargetUnavailable('飞书机器人');
++    await send('open_id', boundOpenId, text);
++    return { sent: true };
+   }
+ 
+   async stop({ preserveError = false } = {}) {
+diff --git a/src/channels/feishu/state-store.mjs b/src/channels/feishu/state-store.mjs
+index 1e73039..4b577aa 100644
+--- a/src/channels/feishu/state-store.mjs
++++ b/src/channels/feishu/state-store.mjs
+@@ -1,7 +1,18 @@
+ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+ import { dirname } from 'node:path';
+ 
+-const EMPTY_STATE = Object.freeze({ version: 1, sessions: {}, seenMessageIds: [] });
++const EMPTY_STATE = Object.freeze({
++  version: 1,
++  sessions: {},
++  seenMessageIds: [],
++  connectionTestTarget: null,
++});
++
++function connectionTestTarget(value) {
++  const chatId = typeof value?.chatId === 'string' ? value.chatId.trim() : '';
++  const openId = typeof value?.openId === 'string' ? value.openId.trim() : '';
++  return chatId ? { chatId } : openId ? { openId } : null;
++}
+ 
+ export class StateStore {
+   #path;
+@@ -15,10 +26,14 @@ export class StateStore {
+   async load() {
+     try {
+       const parsed = JSON.parse(await readFile(this.#path, 'utf8'));
++      const sessions = parsed.sessions && typeof parsed.sessions === 'object' ? parsed.sessions : {};
++      const p2pKey = Object.keys(sessions).findLast((key) => key.startsWith('p2p:'));
+       this.#state = {
+         version: 1,
+-        sessions: parsed.sessions && typeof parsed.sessions === 'object' ? parsed.sessions : {},
++        sessions,
+         seenMessageIds: Array.isArray(parsed.seenMessageIds) ? parsed.seenMessageIds.slice(-1000) : [],
++        connectionTestTarget: connectionTestTarget(parsed.connectionTestTarget)
++          ?? connectionTestTarget({ openId: p2pKey?.slice(4) }),
+       };
+     } catch (error) {
+       if (error?.code !== 'ENOENT') throw error;
+@@ -46,6 +61,17 @@ export class StateStore {
+     await this.#persist();
+   }
+ 
++  connectionTestTarget() {
++    return structuredClone(this.#state.connectionTestTarget);
++  }
++
++  async setConnectionTestTarget(target) {
++    const normalized = connectionTestTarget(target);
++    if (!normalized) throw new TypeError('Feishu connection test target is required');
++    this.#state.connectionTestTarget = normalized;
++    await this.#persist();
++  }
++
+   hasSeen(messageId) {
+     return this.#state.seenMessageIds.includes(messageId);
+   }
+diff --git a/src/channels/qq/qq-bridge.mjs b/src/channels/qq/qq-bridge.mjs
+index f0d6c56..fb84d04 100644
+--- a/src/channels/qq/qq-bridge.mjs
++++ b/src/channels/qq/qq-bridge.mjs
+@@ -426,6 +426,8 @@ export class QqHarnessBridge {
+           state: this.#state,
+           key,
+           channelLabel: this.#sourceChannelLabel,
++          fromUserId: key,
++          msgId: messageId,
+           ...(hasImages ? { content } : { text }),
+           createOptions: { signal: this.#signal },
+           existsOptions: { signal: this.#signal },
+diff --git a/src/channels/shared/connection-test.mjs b/src/channels/shared/connection-test.mjs
+index 3fd3305..89e39f2 100644
+--- a/src/channels/shared/connection-test.mjs
++++ b/src/channels/shared/connection-test.mjs
+@@ -14,17 +14,31 @@ export function rememberConnectionTestTarget(state, target) {
+   if (!state || !target || typeof target !== 'object') return false;
+   try {
+     targets.set(stateIdentity(state), structuredClone(target));
+-    return true;
++    return typeof stateIdentity(state)?.setConnectionTestTarget === 'function'
++      ? stateIdentity(state).setConnectionTestTarget(target)
++      : true;
+   } catch {
+     return false;
+   }
+ }
+ 
+ export function connectionTestTarget(state) {
+-  const target = state ? targets.get(stateIdentity(state)) : null;
++  const identity = stateIdentity(state);
++  const target = identity
++    ? targets.get(identity) ?? identity.connectionTestTarget?.()
++    : null;
+   return target ? structuredClone(target) : null;
+ }
+ 
++export function latestBoundConversation(state, prefix) {
++  const normalizedPrefix = cleanText(prefix);
++  const sessions = stateIdentity(state)?.snapshot?.()?.sessions;
++  if (!normalizedPrefix || !sessions || typeof sessions !== 'object') return null;
++  const key = Object.keys(sessions).findLast((value) => value.startsWith(normalizedPrefix));
++  const id = key ? cleanText(key.slice(normalizedPrefix.length)) : null;
++  return id ? { key, id } : null;
++}
++
+ export function connectionTestMessage(botName, channelLabel = '机器人') {
+   const name = cleanText(botName) ?? channelLabel;
+   return `✅ DeepSeek Harness 连接测试成功\n这条消息由插件页面中的“${name}”机器人卡片发出。`;
+diff --git a/src/channels/shared/harness-client.mjs b/src/channels/shared/harness-client.mjs
+index 7c3347a..27a8f76 100644
+--- a/src/channels/shared/harness-client.mjs
++++ b/src/channels/shared/harness-client.mjs
+@@ -449,6 +449,11 @@ export class HarnessClient {
+     this.#controlOwnerships = this.#interactionRegistry.controls;
+   }
+ 
++  /** Absolute workspace path this client creates sessions in. */
++  get workspace() {
++    return this.#workspace;
++  }
++
+   async rpc(method, payload = {}, timeoutMs = 30_000, options = {}) {
+     const rpcId = options.rpcId ?? `${this.#rpcIdPrefix}-${randomUUID()}`;
+     const timeoutSignal = AbortSignal.timeout(timeoutMs);
+diff --git a/src/channels/shared/im-pre-ask.mjs b/src/channels/shared/im-pre-ask.mjs
+new file mode 100644
+index 0000000..c1a863d
+--- /dev/null
++++ b/src/channels/shared/im-pre-ask.mjs
+@@ -0,0 +1,35 @@
++/**
++ * IM 入站 pre-ask 扩展点（产品无关）。
++ *
++ * dsh-im host 在 apply 时 installImPreAsk(runner)。
++ * 业务插件（如 recruiting-flow-bus）监听 Cordis 事件 `im/pre-ask`：
++ *   payload: { channelLabel, fromUserId, msgId, text, content }
++ *   返回: { kind: 'continue' } | { kind: 'reply', text } | { kind: 'silent' }
++ *
++ * askInWorkspaceSession 在调用 Harness 前先 runImPreAsk；
++ * reply/silent 时不进 LLM。
++ */
++let preAskRunner = null;
++
++export function installImPreAsk(runner) {
++  preAskRunner = typeof runner === 'function' ? runner : null;
++  return () => {
++    if (preAskRunner === runner) preAskRunner = null;
++  };
++}
++
++export async function runImPreAsk(payload = {}) {
++  if (!preAskRunner) return { kind: 'continue' };
++  try {
++    const decision = await preAskRunner(payload);
++    if (!decision || typeof decision !== 'object') return { kind: 'continue' };
++    if (decision.kind === 'reply' && typeof decision.text === 'string') {
++      return { kind: 'reply', text: decision.text };
++    }
++    if (decision.kind === 'silent') return { kind: 'silent' };
++    return { kind: 'continue' };
++  } catch (error) {
++    payload?.logger?.warn?.('[im/pre-ask] runner failed:', error?.message ?? error);
++    return { kind: 'continue' };
++  }
++}
+diff --git a/src/channels/shared/text-harness-bridge.mjs b/src/channels/shared/text-harness-bridge.mjs
+index 784a679..e214ce7 100644
+--- a/src/channels/shared/text-harness-bridge.mjs
++++ b/src/channels/shared/text-harness-bridge.mjs
+@@ -386,6 +386,8 @@ export class TextHarnessBridge {
+         text,
+         content,
+         channelLabel: this.#sourceChannelLabel,
++        fromUserId: senderId,
++        msgId: messageId,
+         createOptions: this.#signal ? { signal: this.#signal } : undefined,
+         existsOptions: this.#signal ? { signal: this.#signal } : undefined,
+         askOptions: {
+diff --git a/src/channels/shared/workspace-session.mjs b/src/channels/shared/workspace-session.mjs
+index a189148..0f4449a 100644
+--- a/src/channels/shared/workspace-session.mjs
++++ b/src/channels/shared/workspace-session.mjs
+@@ -1,4 +1,5 @@
+ import { withSessionBindingLock } from './session-binding-lock.mjs';
++import { runImPreAsk } from './im-pre-ask.mjs';
+ 
+ export const WORKSPACE_SESSION_STALE = 'workspace-session-stale';
+ 
+@@ -31,14 +32,34 @@ async function createSession(harness, options) {
+     : harness.createSession(options);
+ }
+ 
++export async function resetWorkspaceSession({ harness, state, key, createOptions }) {
++  while (true) {
++    try {
++      const sessionId = await withSessionBindingLock(state, key, async () => {
++        const created = await createSession(harness, createOptions);
++        return await state.setSession(key, created) === false ? null : created;
++      });
++      if (sessionId) return sessionId;
++    } catch (error) {
++      if (error?.code !== WORKSPACE_SESSION_STALE) throw error;
++    }
++  }
++}
++
+ /**
+- * Tag an inbound prompt with its source channel so the agent can attribute
+- * work (e.g. cross-channel work logs) without guessing from context.
++ * Tag an inbound prompt with channel + sender + msgId so downstream plugins
++ * can route without guessing.
++ * Format: `[来源渠道:微信｜发送人:<id>｜消息ID:<id>]`
+  */
+-export function tagPromptWithChannel(text, content, channelLabel) {
++export function tagPromptWithChannel(text, content, channelLabel, meta = {}) {
+   const label = typeof channelLabel === 'string' ? channelLabel.trim() : '';
+   if (!label) return { text, content };
+-  const tag = `[来源渠道:${label}]`;
++  const fromUserId = typeof meta.fromUserId === 'string' ? meta.fromUserId.trim() : '';
++  const msgId = typeof meta.msgId === 'string' ? meta.msgId.trim() : '';
++  let tag = `[来源渠道:${label}`;
++  if (fromUserId) tag += `｜发送人:${fromUserId}`;
++  if (msgId) tag += `｜消息ID:${msgId}`;
++  tag += ']';
+   if (Array.isArray(content)) {
+     const tagged = content.slice();
+     const index = tagged.findIndex((item) => item?.type === 'text');
+@@ -53,10 +74,20 @@ export function tagPromptWithChannel(text, content, channelLabel) {
+   return { text: text ? `${tag}\n${text}` : tag, content };
+ }
+ 
++function extractPlainText(text, content) {
++  if (typeof text === 'string' && text.trim()) return text.trim();
++  if (Array.isArray(content)) {
++    const block = content.find((b) => b?.type === 'text' && typeof b.text === 'string');
++    if (block) {
++      return String(block.text).replace(/^\[来源渠道:[^\]]+\]\s*/u, '').trim();
++    }
++  }
++  return '';
++}
++
+ /**
+  * Resolve, persist, and ask through a session that belongs to the bot's
+- * current workspace. A concurrent workspace switch invalidates the scoped
+- * session and retries before any prompt is sent to the stale session.
++ * current workspace. Runs optional `im/pre-ask` gate before Harness.
+  */
+ export async function askInWorkspaceSession({
+   harness,
+@@ -65,11 +96,45 @@ export async function askInWorkspaceSession({
+   text,
+   content,
+   channelLabel,
++  fromUserId,
++  msgId,
+   createOptions,
+   existsOptions,
+   askOptions,
++  logger,
++  workspace,
+ }) {
+-  const prompt = tagPromptWithChannel(text, content, channelLabel);
++  const plainText = extractPlainText(text, content);
++  const resolvedWorkspace =
++    workspace
++    || (typeof harness?.workspace === 'string' ? harness.workspace : '')
++    || (typeof harness?.workspace === 'function' ? harness.workspace() : '')
++    || '';
++  const pre = await runImPreAsk({
++    channelLabel: channelLabel || '',
++    fromUserId: fromUserId || '',
++    msgId: msgId || '',
++    text: plainText,
++    content,
++    workspace: resolvedWorkspace,
++    logger,
++  });
++  if (pre.kind === 'reply') {
++    return {
++      sessionId: state.sessionFor?.(key) || '',
++      answer: pre.text,
++      shortCircuited: true,
++    };
++  }
++  if (pre.kind === 'silent') {
++    return {
++      sessionId: state.sessionFor?.(key) || '',
++      answer: '',
++      shortCircuited: true,
++    };
++  }
++
++  const prompt = tagPromptWithChannel(text, content, channelLabel, { fromUserId, msgId });
+   while (true) {
+     try {
+       const binding = await withSessionBindingLock(state, key, async () => {
+diff --git a/src/channels/slack/slack-api.mjs b/src/channels/slack/slack-api.mjs
+index 8e8b370..1a88fb3 100644
+--- a/src/channels/slack/slack-api.mjs
++++ b/src/channels/slack/slack-api.mjs
+@@ -285,7 +285,7 @@ export class SlackApi {
+           'content-type': body === undefined
+             ? 'application/x-www-form-urlencoded;charset=utf-8'
+             : 'application/json;charset=utf-8',
+-          'user-agent': 'DeepSeek-Harness-dsh-im (https://github.com/xmanrui/dsh-im, 0.2.2)',
++          'user-agent': 'DeepSeek-Harness-dsh-im (https://github.com/onlyforchris/dsh-im, 0.16.5)',
+         },
+         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+         signal: requestSignal(signal, timeoutMs),
+diff --git a/src/channels/wecom/state-store.mjs b/src/channels/wecom/state-store.mjs
+index f3c76c6..e0b905b 100644
+--- a/src/channels/wecom/state-store.mjs
++++ b/src/channels/wecom/state-store.mjs
+@@ -1,7 +1,17 @@
+ import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+ import { dirname } from 'node:path';
+ 
+-const EMPTY_STATE = Object.freeze({ version: 1, sessions: {}, seenMessageIds: [] });
++const EMPTY_STATE = Object.freeze({
++  version: 1,
++  sessions: {},
++  seenMessageIds: [],
++  connectionTestTarget: null,
++});
++
++function connectionTestTarget(value) {
++  const chatId = typeof value?.chatId === 'string' ? value.chatId.trim() : '';
++  return chatId ? { chatId } : null;
++}
+ 
+ function normalizeState(value) {
+   if (!value || typeof value !== 'object') return structuredClone(EMPTY_STATE);
+@@ -17,6 +27,10 @@ function normalizeState(value) {
+     seenMessageIds: Array.isArray(value.seenMessageIds)
+       ? value.seenMessageIds.filter((id) => typeof id === 'string').slice(-1_000)
+       : [],
++    connectionTestTarget: connectionTestTarget(value.connectionTestTarget)
++      ?? connectionTestTarget({
++        chatId: Object.keys(sessions).findLast((key) => key.startsWith('direct:'))?.slice(7),
++      }),
+   };
+ }
+ 
+@@ -72,6 +86,21 @@ export class WecomStateStore {
+     await this.#persist();
+   }
+ 
++  connectionTestTarget() {
++    return structuredClone(this.#state.connectionTestTarget);
++  }
++
++  async setConnectionTestTarget(target) {
++    const normalized = connectionTestTarget(target);
++    if (!normalized) throw new TypeError('Enterprise WeChat connection test target is required');
++    this.#state.connectionTestTarget = normalized;
++    await this.#persist();
++  }
++
++  snapshot() {
++    return structuredClone(this.#state);
++  }
++
+   async remove() {
+     try {
+       await unlink(this.#path);
+diff --git a/src/channels/wecom/wecom-bridge.mjs b/src/channels/wecom/wecom-bridge.mjs
+index 144c58c..3e53ee6 100644
+--- a/src/channels/wecom/wecom-bridge.mjs
++++ b/src/channels/wecom/wecom-bridge.mjs
+@@ -15,7 +15,7 @@ import {
+   runModelCommand,
+ } from '../shared/model-command.mjs';
+ import { runWorkspaceCommand } from '../shared/workspace-command.mjs';
+-import { askInWorkspaceSession } from '../shared/workspace-session.mjs';
++import { askInWorkspaceSession, resetWorkspaceSession } from '../shared/workspace-session.mjs';
+ import {
+   hasInboundImages,
+   ImagePromptError,
+@@ -288,7 +288,9 @@ export class WecomHarnessBridge {
+     const key = conversationKey(frame);
+     this.#acceptedMessageIds.add(messageId);
+     if (body.chattype === 'single') {
+-      rememberConnectionTestTarget(this.#state, { chatId });
++      void Promise.resolve(
++        rememberConnectionTestTarget(this.#state, { chatId }),
++      ).catch(() => this.#logger.warn?.('[dsh-wecom] unable to persist the private target'));
+     }
+     const pending = this.#pendingInteractions.get(key);
+     const commandMessage = wecomInboundMessage(frame, this.#client);
+@@ -508,8 +510,13 @@ export class WecomHarnessBridge {
+         return;
+       }
+       if (!hasImages && command === '/new') {
+-        await this.#state.clearSession(key);
+-        await this.#sendImmediate(frame, chatId, '已开启新会话。请发送你的问题。');
++        const sessionId = await resetWorkspaceSession({
++          harness: this.#harness,
++          state: this.#state,
++          key,
++          createOptions: { signal: this.#signal },
++        });
++        await this.#sendImmediate(frame, chatId, `已开启新会话。\nID：${sessionId}`);
+         await this.#state.markSeen(messageId);
+         return;
+       }
+@@ -556,6 +563,8 @@ export class WecomHarnessBridge {
+         text,
+         content,
+         channelLabel: this.#sourceChannelLabel,
++        fromUserId: senderId,
++        msgId: messageId,
+         createOptions: { signal: this.#signal },
+         existsOptions: { signal: this.#signal },
+         askOptions: {
+diff --git a/src/channels/wecom/wecom-runtime.mjs b/src/channels/wecom/wecom-runtime.mjs
+index 87a349b..1ed4c14 100644
+--- a/src/channels/wecom/wecom-runtime.mjs
++++ b/src/channels/wecom/wecom-runtime.mjs
+@@ -1,7 +1,15 @@
+ import { WSAuthFailureError, WSClient, WSReconnectExhaustedError } from '@wecom/aibot-node-sdk';
+ 
+ import { createWecomBridgeStatus, WecomHarnessBridge } from './wecom-bridge.mjs';
+-import { sendRememberedConnectionTest } from '../shared/connection-test.mjs';
++import {
++  connectionTestTarget,
++  connectionTestTargetUnavailable,
++  latestBoundConversation,
++} from '../shared/connection-test.mjs';
++
++function nonEmptyString(value) {
++  return typeof value === 'string' && value.trim() ? value.trim() : null;
++}
+ 
+ function timeoutError() {
+   const error = new Error('Enterprise WeChat WebSocket authentication timed out');
+@@ -203,20 +211,18 @@ export class WecomRuntime {
+   }
+ 
+   async sendConnectionTest(text) {
+-    return sendRememberedConnectionTest({
+-      state: this.#state,
+-      text,
+-      channelLabel: '企业微信机器人',
+-      send: async ({ chatId }, content) => {
+-        if (!this.#status.ready || !this.#client) {
+-          throw new Error('Enterprise WeChat runtime is not connected');
+-        }
+-        await this.#client.sendMessage(chatId, {
+-          msgtype: 'markdown',
+-          markdown: { content },
+-        });
+-      },
++    const remembered = connectionTestTarget(this.#state);
++    const chatId = nonEmptyString(remembered?.chatId)
++      ?? latestBoundConversation(this.#state, 'direct:')?.id;
++    if (!chatId) throw connectionTestTargetUnavailable('企业微信机器人');
++    if (!this.#status.ready || !this.#client) {
++      throw new Error('Enterprise WeChat runtime is not connected');
++    }
++    await this.#client.sendMessage(chatId, {
++      msgtype: 'markdown',
++      markdown: { content: text },
+     });
++    return { sent: true };
+   }
+ 
+   async #stopActive() {
+diff --git a/src/channels/weixin/notification-outbox.mjs b/src/channels/weixin/notification-outbox.mjs
+new file mode 100644
+index 0000000..4809234
+--- /dev/null
++++ b/src/channels/weixin/notification-outbox.mjs
+@@ -0,0 +1,92 @@
++import { mkdir, readdir, readFile, rename } from 'node:fs/promises';
++import { join, resolve } from 'node:path';
++
++class InvalidNotification extends Error {}
++
++export class NotificationOutbox {
++  #dir;
++  #send;
++  #logger;
++  #pollIntervalMs;
++  #timer = null;
++  #running = null;
++
++  constructor({ dir, send, logger = console, pollIntervalMs = 5_000 }) {
++    if (!dir) throw new TypeError('notification outbox dir is required');
++    if (typeof send !== 'function') throw new TypeError('notification send function is required');
++    this.#dir = resolve(dir);
++    this.#send = send;
++    this.#logger = logger;
++    this.#pollIntervalMs = pollIntervalMs;
++  }
++
++  async start() {
++    await Promise.all(['processing', 'sent', 'failed'].map((name) => mkdir(join(this.#dir, name), { recursive: true })));
++    for (const name of await readdir(join(this.#dir, 'processing'))) {
++      if (!name.endsWith('.json')) continue;
++      try {
++        await rename(join(this.#dir, 'processing', name), join(this.#dir, name));
++      } catch (error) {
++        if (error?.code !== 'ENOENT') this.#logger.warn?.(`[dsh-weixin] could not recover ${name}:`, error);
++      }
++    }
++    await this.scan();
++    this.#timer = setInterval(() => void this.scan(), this.#pollIntervalMs);
++    this.#timer.unref?.();
++    return this;
++  }
++
++  scan() {
++    if (this.#running) return this.#running;
++    this.#running = this.#scan().finally(() => { this.#running = null; });
++    return this.#running;
++  }
++
++  async close() {
++    clearInterval(this.#timer);
++    this.#timer = null;
++    await this.#running;
++  }
++
++  async #scan() {
++    const entries = await readdir(this.#dir, { withFileTypes: true });
++    for (const entry of entries) {
++      if (entry.isFile() && entry.name.endsWith('.json')) await this.#process(entry.name);
++    }
++  }
++
++  async #process(name) {
++    const pending = join(this.#dir, name);
++    const processing = join(this.#dir, 'processing', name);
++    try {
++      await rename(pending, processing);
++    } catch (error) {
++      if (error?.code === 'ENOENT') return;
++      throw error;
++    }
++    try {
++      const event = JSON.parse(await readFile(processing, 'utf8'));
++      this.#validate(event);
++      await this.#send(event.text);
++      await rename(processing, join(this.#dir, 'sent', name));
++    } catch (error) {
++      if (error instanceof InvalidNotification || error instanceof SyntaxError) {
++        await rename(processing, join(this.#dir, 'failed', name));
++        this.#logger.warn?.(`[dsh-weixin] rejected notification ${name}: ${error.message}`);
++        return;
++      }
++      // ponytail: 文件投递为至少一次；若进程恰在平台接收后退出，可能重复一条。
++      await rename(processing, pending);
++      this.#logger.warn?.(`[dsh-weixin] notification ${name} will retry:`, error);
++    }
++  }
++
++  #validate(event) {
++    if (!event || event.schema_version !== 1) throw new InvalidNotification('unsupported schema_version');
++    if (event.type !== 'recruiting.score_ready') throw new InvalidNotification('unsupported event type');
++    if (!/^[a-z0-9][a-z0-9-]{0,127}$/i.test(event.event_id ?? '')) throw new InvalidNotification('invalid event_id');
++    if (typeof event.text !== 'string' || !event.text.trim() || event.text.length > 12_000) {
++      throw new InvalidNotification('invalid text');
++    }
++  }
++}
+diff --git a/src/channels/weixin/state-store.mjs b/src/channels/weixin/state-store.mjs
+index 801f8a9..86900b9 100644
+--- a/src/channels/weixin/state-store.mjs
++++ b/src/channels/weixin/state-store.mjs
+@@ -6,8 +6,14 @@ const EMPTY_STATE = Object.freeze({
+   sessions: {},
+   seenMessageIds: [],
+   getUpdatesBuf: '',
++  connectionTestTarget: null,
+ });
+ 
++function connectionTestTarget(value) {
++  const toUserId = typeof value?.toUserId === 'string' ? value.toUserId.trim() : '';
++  return toUserId ? { toUserId } : null;
++}
++
+ function normalizeState(value) {
+   if (!value || typeof value !== 'object') return structuredClone(EMPTY_STATE);
+   const sessions = {};
+@@ -25,6 +31,10 @@ function normalizeState(value) {
+       ? value.seenMessageIds.filter((id) => typeof id === 'string').slice(-1_000)
+       : [],
+     getUpdatesBuf: typeof value.getUpdatesBuf === 'string' ? value.getUpdatesBuf : '',
++    connectionTestTarget: connectionTestTarget(value.connectionTestTarget)
++      ?? connectionTestTarget({
++        toUserId: Object.keys(sessions).findLast((key) => key.startsWith('p2p:'))?.slice(4),
++      }),
+   };
+ }
+ 
+@@ -67,6 +77,17 @@ export class WeixinStateStore {
+     await this.#persist();
+   }
+ 
++  connectionTestTarget() {
++    return structuredClone(this.#state.connectionTestTarget);
++  }
++
++  async setConnectionTestTarget(target) {
++    const normalized = connectionTestTarget(target);
++    if (!normalized) throw new TypeError('Weixin connection test target is required');
++    this.#state.connectionTestTarget = normalized;
++    await this.#persist();
++  }
++
+   hasSeen(messageId) {
+     return this.#state.seenMessageIds.includes(messageId);
+   }
+diff --git a/src/channels/weixin/weixin-bridge.mjs b/src/channels/weixin/weixin-bridge.mjs
+index f2f12a9..c3ab54f 100644
+--- a/src/channels/weixin/weixin-bridge.mjs
++++ b/src/channels/weixin/weixin-bridge.mjs
+@@ -20,7 +20,7 @@ import {
+   runModelCommand,
+ } from '../shared/model-command.mjs';
+ import { runWorkspaceCommand } from '../shared/workspace-command.mjs';
+-import { askInWorkspaceSession } from '../shared/workspace-session.mjs';
++import { askInWorkspaceSession, resetWorkspaceSession } from '../shared/workspace-session.mjs';
+ import {
+   hasInboundImages,
+   imagePromptUserMessage,
+@@ -30,16 +30,22 @@ import { rememberConnectionTestTarget } from '../shared/connection-test.mjs';
+ 
+ const INTERACTION_RESOLVED_TEXT = '这个问题已在其他客户端处理，无需再次回答。';
+ 
+-const HELP_TEXT = [
++const WORKSPACE_SESSION_COMMAND = /^\/(?:workspace(?:list)?|session(?:list)?)(?:\s|$)/i;
++const WORKSPACE_SESSION_HELP = [
++  '/workspace 工作区绝对路径  切换工作区',
++  '/workspacelist  列出工作区绝对路径',
++  '/sessionlist [工作区序号或绝对路径]  列出会话 ID 和标题',
++  '/session Session ID 或当前工作区序号  将当前聊天绑定到指定会话',
++];
++
++function helpText(workspaceSessionCommandsEnabled) {
++  return [
+   '微信已连接 DeepSeek Harness。',
+   '',
+   '直接发送文字、图片或带文字识别结果的语音即可继续当前会话。',
+   '/new  开启一个全新会话',
+   '/compact  压缩当前会话的较早上下文',
+-  '/workspace 工作区绝对路径  切换工作区',
+-  '/workspacelist  列出工作区绝对路径',
+-  '/sessionlist [工作区序号或绝对路径]  列出会话 ID 和标题',
+-  '/session Session ID 或当前工作区序号  将当前聊天绑定到指定会话',
++  ...(workspaceSessionCommandsEnabled ? WORKSPACE_SESSION_HELP : []),
+   '/models  按序号列出所有可用模型',
+   '/model [序号或完整模型ID]  查看或切换当前会话模型',
+   '示例：先发 /models，再发 /model 2',
+@@ -47,7 +53,8 @@ const HELP_TEXT = [
+   '/steer 补充指令  纠偏当前任务',
+   '/status  检查连接状态',
+   '/help  显示本帮助',
+-].join('\n');
++  ].join('\n');
++}
+ 
+ function conversationKey(userId) {
+   return `p2p:${userId}`;
+@@ -94,6 +101,7 @@ export class WeixinHarnessBridge {
+   #maxMessageChars;
+   #signal;
+   #sourceChannelLabel;
++  #workspaceSessionCommandsEnabled;
+   #queues = new Map();
+   #pendingInteractions = new Map();
+   #interactionKeys = new Map();
+@@ -114,6 +122,7 @@ export class WeixinHarnessBridge {
+     replyTimeoutMs = 600_000,
+     maxMessageChars = 4_000,
+     sourceChannelLabel,
++    workspaceSessionCommandsEnabled = true,
+     signal,
+   }) {
+     if (!api || typeof api.sendText !== 'function') throw new TypeError('Weixin API is required');
+@@ -131,6 +140,7 @@ export class WeixinHarnessBridge {
+     this.#maxMessageChars = maxMessageChars;
+     this.#signal = signal;
+     this.#sourceChannelLabel = sourceChannelLabel;
++    this.#workspaceSessionCommandsEnabled = workspaceSessionCommandsEnabled !== false;
+     this.#approvals = new HarnessApprovalQueue({ label: 'weixin', logger });
+   }
+ 
+@@ -147,7 +157,9 @@ export class WeixinHarnessBridge {
+       || this.#acceptedMessageIds.has(messageId)) return Promise.resolve();
+     this.#acceptedMessageIds.add(messageId);
+     if (sender === this.#ownerUserId) {
+-      rememberConnectionTestTarget(this.#state, { toUserId: sender });
++      void Promise.resolve(
++        rememberConnectionTestTarget(this.#state, { toUserId: sender }),
++      ).catch(() => this.#logger.warn?.('[dsh-weixin] unable to persist the private target'));
+     }
+     const key = conversationKey(sender);
+     const contextToken = nonEmptyString(message?.context_token) ?? undefined;
+@@ -327,7 +339,12 @@ export class WeixinHarnessBridge {
+ 
+       const command = text.trim().toLowerCase();
+       if (!hasImages && command === '/help') {
+-        await this.#send(sender, HELP_TEXT, contextToken, runId);
++        await this.#send(
++          sender,
++          helpText(this.#workspaceSessionCommandsEnabled),
++          contextToken,
++          runId,
++        );
+         await this.#state.markSeen(messageId);
+         return;
+       }
+@@ -338,8 +355,24 @@ export class WeixinHarnessBridge {
+         return;
+       }
+       if (!hasImages && command === '/new') {
+-        await this.#state.clearSession(key);
+-        await this.#send(sender, '已开启新会话。请发送你的问题。', contextToken, runId);
++        const sessionId = await resetWorkspaceSession({
++          harness: this.#harness,
++          state: this.#state,
++          key,
++          createOptions: { signal: this.#signal },
++        });
++        await this.#send(sender, `已开启新会话。\nID：${sessionId}`, contextToken, runId);
++        await this.#state.markSeen(messageId);
++        return;
++      }
++      if (!hasImages && !this.#workspaceSessionCommandsEnabled
++        && WORKSPACE_SESSION_COMMAND.test(text.trim())) {
++        await this.#send(
++          sender,
++          '当前机器人未开放工作区或会话管理命令。',
++          contextToken,
++          runId,
++        );
+         await this.#state.markSeen(messageId);
+         return;
+       }
+@@ -372,12 +405,16 @@ export class WeixinHarnessBridge {
+         ? await promptContentForMessage(promptMessage, { signal: this.#signal })
+         : undefined;
+       let answer;
++      let shortCircuited = false;
+       try {
+-        ({ answer } = await askInWorkspaceSession({
++        ({ answer, shortCircuited } = await askInWorkspaceSession({
+           harness: this.#harness,
+           state: this.#state,
+           key,
+           channelLabel: this.#sourceChannelLabel,
++          fromUserId: sender,
++          msgId: messageId,
++          logger: this.#logger,
+           ...(hasImages ? { content } : { text }),
+           createOptions: { signal: this.#signal },
+           existsOptions: { signal: this.#signal },
+@@ -400,10 +437,14 @@ export class WeixinHarnessBridge {
+           this.#approvals.closeRoute(key),
+         ]);
+       }
+-      await this.#send(sender, answer, contextToken, runId);
++      if (answer) {
++        await this.#send(sender, answer, contextToken, runId);
++        this.#status.messagesReplied += 1;
++        this.#status.lastReplyAt = new Date().toISOString();
++      } else if (shortCircuited) {
++        this.#logger?.info?.('[dsh-weixin] recruiting short-circuit silent (duplicate/empty)');
++      }
+       await this.#state.markSeen(messageId);
+-      this.#status.messagesReplied += 1;
+-      this.#status.lastReplyAt = new Date().toISOString();
+       this.#status.lastError = null;
+     } catch (error) {
+       if (error?.code === 'turn-stopped') {
+diff --git a/src/channels/weixin/weixin-controller.mjs b/src/channels/weixin/weixin-controller.mjs
+index 0439458..ddc7a5d 100644
+--- a/src/channels/weixin/weixin-controller.mjs
++++ b/src/channels/weixin/weixin-controller.mjs
+@@ -286,6 +286,18 @@ export class WeixinController {
+     });
+   }
+ 
++  async sendNotification(botId, text) {
++    const config = this.#configStore.get(botId);
++    if (!config) throw new Error('Unknown Weixin account');
++    return this.#withBotTransition(botId, async () => {
++      const runtime = this.#runtimes.get(botId);
++      if (!runtime?.status?.ready || typeof runtime.sendNotification !== 'function') {
++        throw new Error('Weixin runtime is not connected');
++      }
++      return runtime.sendNotification(text);
++    });
++  }
++
+   async deleteBot(botId) {
+     const config = this.#configStore.get(botId);
+     if (!config) throw new Error('Unknown Weixin account');
+diff --git a/src/channels/weixin/weixin-runtime.mjs b/src/channels/weixin/weixin-runtime.mjs
+index b6af61b..4a4ca8a 100644
+--- a/src/channels/weixin/weixin-runtime.mjs
++++ b/src/channels/weixin/weixin-runtime.mjs
+@@ -3,6 +3,7 @@ import { createWeixinBridgeStatus, WeixinHarnessBridge } from './weixin-bridge.m
+ import {
+   connectionTestTarget,
+   connectionTestTargetUnavailable,
++  latestBoundConversation,
+ } from '../shared/connection-test.mjs';
+ 
+ const DEFAULT_START_RETRY_DELAYS_MS = Object.freeze([250, 1_000, 3_000]);
+@@ -75,6 +76,7 @@ export class WeixinRuntime {
+   #maxMessageChars;
+   #startRetryDelaysMs;
+   #sourceChannelLabel;
++  #workspaceSessionCommandsEnabled;
+   #status = createWeixinRuntimeStatus();
+   #bridge = null;
+   #abortController = null;
+@@ -92,6 +94,7 @@ export class WeixinRuntime {
+     maxMessageChars = 4_000,
+     startRetryDelaysMs,
+     sourceChannelLabel,
++    workspaceSessionCommandsEnabled = true,
+   }) {
+     if (!api || !config || !token || !harness || !state) {
+       throw new TypeError('WeixinRuntime requires API, account, token, Harness, and state');
+@@ -106,6 +109,7 @@ export class WeixinRuntime {
+     this.#maxMessageChars = maxMessageChars;
+     this.#startRetryDelaysMs = startRetryDelays(startRetryDelaysMs);
+     this.#sourceChannelLabel = sourceChannelLabel;
++    this.#workspaceSessionCommandsEnabled = workspaceSessionCommandsEnabled !== false;
+   }
+ 
+   get status() {
+@@ -148,6 +152,7 @@ export class WeixinRuntime {
+         replyTimeoutMs: this.#replyTimeoutMs,
+         maxMessageChars: this.#maxMessageChars,
+         sourceChannelLabel: this.#sourceChannelLabel,
++        workspaceSessionCommandsEnabled: this.#workspaceSessionCommandsEnabled,
+         signal,
+       });
+       this.#status.ready = true;
+@@ -270,13 +275,13 @@ export class WeixinRuntime {
+     return this.status;
+   }
+ 
+-  async sendConnectionTest(text) {
++  async sendNotification(text) {
+     const remembered = connectionTestTarget(this.#state);
+     const toUserId = typeof remembered?.toUserId === 'string' && remembered.toUserId.trim()
+       ? remembered.toUserId.trim()
+       : typeof this.#config.ownerUserId === 'string' && this.#config.ownerUserId.trim()
+         ? this.#config.ownerUserId.trim()
+-        : null;
++        : latestBoundConversation(this.#state, 'p2p:')?.id ?? null;
+     if (!toUserId) throw connectionTestTargetUnavailable('微信机器人');
+     if (!this.#status.ready || !this.#abortController) {
+       throw new Error('Weixin runtime is not connected');
+@@ -290,4 +295,8 @@ export class WeixinRuntime {
+     });
+     return { sent: true };
+   }
++
++  async sendConnectionTest(text) {
++    return this.sendNotification(text);
++  }
+ }
+diff --git a/test/channels/dingtalk/dingtalk-bridge.test.mjs b/test/channels/dingtalk/dingtalk-bridge.test.mjs
+index fba27da..84a64bb 100644
+--- a/test/channels/dingtalk/dingtalk-bridge.test.mjs
++++ b/test/channels/dingtalk/dingtalk-bridge.test.mjs
+@@ -95,6 +95,7 @@ test('DingTalk remembers any private inbound session webhook for connection test
+   await privateBridge.accept(message('help-private', '/help'));
+   assert.deepEqual(connectionTestTarget(privateFixture.state), {
+     sessionWebhook: 'https://oapi.dingtalk.com/robot/reply?ticket=help-private',
++    userId: 'staff-approved',
+   });
+   assert.match(privateSent.at(-1).text, /\/help/);
+ 
+@@ -554,6 +555,7 @@ test('commands stay local and unsafe session webhooks are rejected before Harnes
+     clientSecret: 'host-secret',
+     harness: {
+       ensureRunning: async () => true,
++      createSession: async () => 'new-session',
+       sessionExists: async () => true,
+       ask: async () => { asked += 1; },
+     },
+@@ -562,12 +564,12 @@ test('commands stay local and unsafe session webhooks are rejected before Harnes
+   });
+ 
+   await bridge.accept(message('new', '/new'));
+-  assert.equal(fixture.sessions.has('p2p:staff-approved'), false);
++  assert.equal(fixture.sessions.get('p2p:staff-approved'), 'new-session');
+   await bridge.accept(message('unsafe', '不应执行', {
+     sessionWebhook: 'https://oapi.dingtalk.com.attacker.example/reply?private=one',
+   }));
+   assert.equal(asked, 0);
+-  assert.equal(sent[0], '已开启新会话。请发送你的问题。');
++  assert.equal(sent[0], '已开启新会话。\nID：new-session');
+   assert.equal(sent.length, 1);
+   assert.equal(bridge.status.lastError, '钉钉消息没有安全的回复地址。');
+ });
+diff --git a/test/channels/dingtalk/dingtalk-runtime.test.mjs b/test/channels/dingtalk/dingtalk-runtime.test.mjs
+index 2696af0..1847741 100644
+--- a/test/channels/dingtalk/dingtalk-runtime.test.mjs
++++ b/test/channels/dingtalk/dingtalk-runtime.test.mjs
+@@ -81,6 +81,41 @@ test('runtime sends a DingTalk connection test only through the remembered priva
+   await runtime.stop();
+ });
+ 
++test('runtime restores a DingTalk push target from the persisted Session binding', async () => {
++  const state = stateFixture();
++  state.snapshot = () => ({ sessions: { 'p2p:staff-saved': 'session-saved' } });
++  const calls = [];
++  const client = {
++    connected: true,
++    socket: { readyState: 1 },
++    registerCallbackListener() {},
++    async connect() {},
++    socketCallBackResponse() {},
++    disconnect() {},
++  };
++  const runtime = new DingtalkRuntime({
++    config: { clientId: 'ding-client', approvedSenders: [] },
++    clientSecret: 'host-secret',
++    harness: { ensureRunning: async () => true },
++    state,
++    api: {
++      sendText: async () => {},
++      createAiCard: async (request) => {
++        calls.push(['create', request]);
++        return { cardInstanceId: 'card-saved' };
++      },
++      finishAiCard: async (request) => calls.push(['finish', request]),
++    },
++    streamFactory: async () => ({ client, topic: 'robot-topic' }),
++  });
++
++  await runtime.start();
++  assert.deepEqual(await runtime.sendConnectionTest('持久化测试'), { sent: true });
++  assert.deepEqual(calls[0][1].target, { type: 'user', userId: 'staff-saved' });
++  assert.equal(calls[1][1].cardInstanceId, 'card-saved');
++  await runtime.stop();
++});
++
+ test('runtime owns one DWClient, waits for socket OPEN, acknowledges first, and disconnects on stop', async () => {
+   const order = [];
+   const state = stateFixture();
+diff --git a/test/channels/dingtalk/state-store.test.mjs b/test/channels/dingtalk/state-store.test.mjs
+index 6eb31c2..27c370f 100644
+--- a/test/channels/dingtalk/state-store.test.mjs
++++ b/test/channels/dingtalk/state-store.test.mjs
+@@ -18,6 +18,10 @@ test('state store persists sessions, dedupe IDs, and host-only pending sender re
+ 
+   await store.setSession('p2p:staff-one', 'session-one');
+   await store.markSeen('message-one');
++  await store.setConnectionTestTarget({
++    userId: 'staff-one',
++    sessionWebhook: 'https://oapi.dingtalk.com/reply?secret=must-not-persist',
++  });
+   const first = await store.recordPendingSender({
+     staffId: 'staff-one',
+     displayName: '小明',
+@@ -33,12 +37,14 @@ test('state store persists sessions, dedupe IDs, and host-only pending sender re
+   assert.equal(updated.requestedAt, '2026-08-15T01:00:00.000Z');
+   assert.equal(updated.lastSeenAt, '2026-08-15T01:05:00.000Z');
+   assert.deepEqual(store.pendingSender(first.requestId), updated);
++  assert.deepEqual(store.connectionTestTarget(), { userId: 'staff-one' });
+ 
+   const storedText = await readFile(path, 'utf8');
+   assert.doesNotMatch(storedText, /sessionWebhook|must-not-persist/);
+   assert.equal((await stat(path)).mode & 0o777, 0o600);
+ 
+   const reloaded = await new DingtalkStateStore(path).load();
++  assert.deepEqual(reloaded.connectionTestTarget(), { userId: 'staff-one' });
+   assert.deepEqual(reloaded.pendingSenders(), [updated]);
+   assert.equal(await reloaded.removePendingSenderByStaffId('staff-one'), true);
+   assert.deepEqual(reloaded.pendingSenders(), []);
+@@ -79,5 +85,6 @@ test('state store keeps only normalized fields from an existing pending-sender d
+         lastSeenAt: '2026-08-15T01:02:00.000Z',
+       },
+     },
++    connectionTestTarget: null,
+   });
+ });
+diff --git a/test/channels/feishu/bridge.test.mjs b/test/channels/feishu/bridge.test.mjs
+index bbd2a7b..6d13630 100644
+--- a/test/channels/feishu/bridge.test.mjs
++++ b/test/channels/feishu/bridge.test.mjs
+@@ -1938,6 +1938,7 @@ function sessionsHarness(count) {
+   }));
+   return {
+     ensureRunning: async () => true,
++    createSession: async () => 'session-new',
+     currentWorkspace: () => workspace,
+     listWorkspaceSessions: async () => ({ workspace, sessions }),
+     listWorkspaces: async () => [workspace],
+@@ -1999,6 +2000,8 @@ test('card buttons from an allowed sender work', async () => {
+   await bridge.onCardAction(cardActionEvent('om_card_1', 'new', 'ou_owner'));
+   await bridge.waitForIdle();
+   assert.equal(sent.length, 2, 'allowed operator click should send a reply');
++  assert.equal(fixture.sessions.get('p2p:ou_owner'), 'session-new');
++  assert.match(sent.at(-1).content, /ID：session-new/);
+ });
+ 
+ test('card buttons honor the wildcard sender allowlist', async () => {
+@@ -2127,7 +2130,8 @@ test('session pagination preserves an explicitly selected workspace', async () =
+   await bridge.onCardAction(cardActionEvent('om_card_1', 'sessions:1', 'ou_owner'));
+   await bridge.waitForIdle();
+   assert.equal(useActionsFromCard(cards(sent).at(-1).content)[0], 'selected-11');
+-  assert.match(JSON.stringify(cards(sent).at(-1).content), new RegExp(workspaceB.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
++  const workspaceText = cards(sent).at(-1).content.body.elements[0].text.content;
++  assert.match(workspaceText, /dsh-im-card-selected-/);
+ });
+ 
+ const REPAIR_APP_ID = 'cli_repair_test';
+diff --git a/test/channels/feishu/state-store.test.mjs b/test/channels/feishu/state-store.test.mjs
+index e1f0116..ec6394a 100644
+--- a/test/channels/feishu/state-store.test.mjs
++++ b/test/channels/feishu/state-store.test.mjs
+@@ -11,10 +11,14 @@ test('StateStore persists sessions and dedupe ids', async () => {
+   const first = await new StateStore(path).load();
+   await first.setSession('group:one', 'session-one');
+   await first.markSeen('message-one');
++  await first.setConnectionTestTarget({ chatId: 'oc_private' });
+ 
+   const second = await new StateStore(path).load();
+   assert.equal(second.sessionFor('group:one'), 'session-one');
+   assert.equal(second.hasSeen('message-one'), true);
++  assert.deepEqual(second.connectionTestTarget(), { chatId: 'oc_private' });
++  await second.clearSessions();
++  assert.deepEqual(second.connectionTestTarget(), { chatId: 'oc_private' });
+   assert.equal(JSON.parse(await readFile(path, 'utf8')).version, 1);
+ });
+ 
+diff --git a/test/channels/wecom/state-store.test.mjs b/test/channels/wecom/state-store.test.mjs
+new file mode 100644
+index 0000000..8f1abc2
+--- /dev/null
++++ b/test/channels/wecom/state-store.test.mjs
+@@ -0,0 +1,20 @@
++import assert from 'node:assert/strict';
++import { mkdtemp } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import test from 'node:test';
++
++import { WecomStateStore } from '../../../src/channels/wecom/state-store.mjs';
++
++test('Enterprise WeChat keeps its private push target when Session bindings are cleared', async () => {
++  const root = await mkdtemp(join(tmpdir(), 'dsh-wecom-state-'));
++  const path = join(root, 'state.json');
++  const state = await new WecomStateStore(path).load();
++  await state.setSession('direct:user', 'session-one');
++  await state.setConnectionTestTarget({ chatId: 'user' });
++  await state.clearSessions();
++
++  const restored = await new WecomStateStore(path).load();
++  assert.equal(restored.sessionFor('direct:user'), null);
++  assert.deepEqual(restored.connectionTestTarget(), { chatId: 'user' });
++});
+diff --git a/test/channels/weixin/notification-outbox.test.mjs b/test/channels/weixin/notification-outbox.test.mjs
+new file mode 100644
+index 0000000..520ea2a
+--- /dev/null
++++ b/test/channels/weixin/notification-outbox.test.mjs
+@@ -0,0 +1,40 @@
++import assert from 'node:assert/strict';
++import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import test from 'node:test';
++
++import { NotificationOutbox } from '../../../src/channels/weixin/notification-outbox.mjs';
++
++test('notification outbox retries once then archives the sent event', async () => {
++  const dir = await mkdtemp(join(tmpdir(), 'dsh-im-outbox-'));
++  const event = {
++    schema_version: 1,
++    event_id: 'score-ready-test',
++    type: 'recruiting.score_ready',
++    text: '招聘评分更新',
++  };
++  await writeFile(join(dir, 'score-ready-test.json'), JSON.stringify(event));
++  let ready = false;
++  const sent = [];
++  const outbox = new NotificationOutbox({
++    dir,
++    pollIntervalMs: 60_000,
++    logger: { warn() {} },
++    send: async (text) => {
++      if (!ready) throw new Error('offline');
++      sent.push(text);
++    },
++  });
++  try {
++    await outbox.start();
++    assert.equal(await readFile(join(dir, 'score-ready-test.json'), 'utf8'), JSON.stringify(event));
++    ready = true;
++    await outbox.scan();
++    assert.deepEqual(sent, ['招聘评分更新']);
++    assert.equal(JSON.parse(await readFile(join(dir, 'sent', 'score-ready-test.json'))).event_id, event.event_id);
++  } finally {
++    await outbox.close();
++    await rm(dir, { recursive: true, force: true });
++  }
++});
+diff --git a/test/channels/weixin/stores.test.mjs b/test/channels/weixin/stores.test.mjs
+index 1e935bb..f5ea402 100644
+--- a/test/channels/weixin/stores.test.mjs
++++ b/test/channels/weixin/stores.test.mjs
+@@ -53,10 +53,14 @@ test('state store retains sessions, deduplication, and the getUpdates cursor', a
+   await state.setSession('p2p:user', 'session-1');
+   await state.markSeen('message-1');
+   await state.setGetUpdatesBuf('cursor-2');
++  await state.setConnectionTestTarget({ toUserId: 'user' });
+ 
+   const restored = await new WeixinStateStore(path).load();
+   assert.equal(restored.sessionFor('p2p:user'), 'session-1');
+   assert.equal(restored.hasSeen('message-1'), true);
+   assert.equal(restored.getUpdatesBuf(), 'cursor-2');
++  assert.deepEqual(restored.connectionTestTarget(), { toUserId: 'user' });
++  await restored.clearSessions();
++  assert.deepEqual(restored.connectionTestTarget(), { toUserId: 'user' });
+   assert.equal((await stat(path)).mode & 0o777, 0o600);
+ });
+diff --git a/test/channels/weixin/weixin-bridge.test.mjs b/test/channels/weixin/weixin-bridge.test.mjs
+index 86a913c..1ea1c9c 100644
+--- a/test/channels/weixin/weixin-bridge.test.mjs
++++ b/test/channels/weixin/weixin-bridge.test.mjs
+@@ -98,6 +98,36 @@ test('Weixin remembers any authorized private inbound as a connection-test targe
+   assert.equal(connectionTestTarget(rejectedFixture.state), null);
+ });
+ 
++test('Weixin can disable workspace and session management commands for a recruiting bot', async () => {
++  const fixture = stateFixture();
++  const sent = [];
++  const bridge = new WeixinHarnessBridge({
++    api: { sendText: async (request) => sent.push(request) },
++    baseUrl: 'https://ilinkai.weixin.qq.com/',
++    token: 'host-token',
++    ownerUserId: 'owner-user',
++    harness: {
++      ask: async () => assert.fail('disabled management commands must not reach Harness'),
++      listWorkspaces: async () => assert.fail('disabled management commands must not list workspaces'),
++    },
++    state: fixture.state,
++    workspaceSessionCommandsEnabled: false,
++  });
++
++  for (const [index, command] of [
++    '/workspace D:\\other',
++    '/workspacelist',
++    '/sessionlist',
++    '/session session-other',
++  ].entries()) {
++    await bridge.accept(message(`disabled-management-${index}`, command));
++    assert.equal(sent.at(-1).text, '当前机器人未开放工作区或会话管理命令。');
++  }
++
++  await bridge.accept(message('disabled-management-help', '/help'));
++  assert.doesNotMatch(sent.at(-1).text, /\/(?:workspace|session)/);
++});
++
+ test('Weixin sends image-only messages to Harness as structured content', async () => {
+   const fixture = stateFixture();
+   fixture.sessions.set('p2p:owner-user', 'session-image');
+@@ -1095,6 +1125,7 @@ test('bridge commands are local and internal failures return a generic message',
+     ownerUserId: 'owner-user',
+     harness: {
+       ensureRunning: async () => true,
++      createSession: async () => 'new-session',
+       sessionExists: async () => true,
+       ask: async () => { throw new Error('private path /secret and token-shaped detail'); },
+     },
+@@ -1103,7 +1134,8 @@ test('bridge commands are local and internal failures return a generic message',
+   });
+ 
+   await bridge.accept(message('new', '/new'));
+-  assert.equal(fixture.sessions.has('p2p:owner-user'), false);
++  assert.equal(fixture.sessions.get('p2p:owner-user'), 'new-session');
++  assert.equal(sent[0], '已开启新会话。\nID：new-session');
+   await bridge.accept(message('failure', '触发失败'));
+   assert.match(sent.at(-1), /消息处理失败/);
+   assert.doesNotMatch(sent.at(-1), /private path|secret|token-shaped/);
+diff --git a/test/host.test.mjs b/test/host.test.mjs
+index d3422fd..a9a6e37 100644
+--- a/test/host.test.mjs
++++ b/test/host.test.mjs
+@@ -3,6 +3,13 @@ import test from 'node:test';
+ 
+ import { createImHostPlugin, inject, name } from '../plugin-src/host/index.mjs';
+ 
++function hostContext(extra = {}) {
++  return {
++    effect(register) { register()?.(); },
++    ...extra,
++  };
++}
++
+ test('Host composes nine IM channels and the AI Office connector inside one plugin context', async () => {
+   const calls = [];
+   const plugin = createImHostPlugin({
+@@ -17,7 +24,7 @@ test('Host composes nine IM channels and the AI Office connector inside one plug
+     applyWhatsapp: async (ctx, config) => calls.push(['whatsapp', ctx, config]),
+     applyOffice: async (ctx, config) => calls.push(['office', ctx, config]),
+   });
+-  const ctx = { marker: 'shared-context' };
++  const ctx = hostContext({ marker: 'shared-context' });
+   const config = {
+     rpcAuthority: 'trusted-host',
+     feishu: { domain: 'feishu' },
+@@ -60,7 +67,7 @@ test('Host does not start Weixin when Feishu activation fails', async () => {
+     applyQq: async () => { throw new Error('QQ must not start'); },
+   });
+ 
+-  await assert.rejects(() => plugin.apply({}, {}), /feishu unavailable/);
++  await assert.rejects(() => plugin.apply(hostContext(), {}), /feishu unavailable/);
+   assert.equal(weixinStarted, false);
+ });
+ 
+@@ -74,7 +81,7 @@ test('Host does not start DingTalk when Weixin activation fails', async () => {
+     applyQq: async () => { throw new Error('QQ must not start'); },
+   });
+ 
+-  await assert.rejects(() => plugin.apply({}, {}), /weixin unavailable/);
++  await assert.rejects(() => plugin.apply(hostContext(), {}), /weixin unavailable/);
+   assert.equal(dingtalkStarted, false);
+ });
+ 
+@@ -88,7 +95,7 @@ test('Host does not start Enterprise WeChat when DingTalk activation fails', asy
+     applyQq: async () => { throw new Error('QQ must not start'); },
+   });
+ 
+-  await assert.rejects(() => plugin.apply({}, {}), /dingtalk unavailable/);
++  await assert.rejects(() => plugin.apply(hostContext(), {}), /dingtalk unavailable/);
+   assert.equal(wecomStarted, false);
+ });
+ 
+@@ -102,6 +109,6 @@ test('Host does not start QQ when Enterprise WeChat activation fails', async ()
+     applyQq: async () => { qqStarted = true; },
+   });
+ 
+-  await assert.rejects(() => plugin.apply({}, {}), /wecom unavailable/);
++  await assert.rejects(() => plugin.apply(hostContext(), {}), /wecom unavailable/);
+   assert.equal(qqStarted, false);
+ });

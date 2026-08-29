@@ -18,10 +18,6 @@ test('state store persists sessions, dedupe IDs, and host-only pending sender re
 
   await store.setSession('p2p:staff-one', 'session-one');
   await store.markSeen('message-one');
-  await store.setConnectionTestTarget({
-    userId: 'staff-one',
-    sessionWebhook: 'https://oapi.dingtalk.com/reply?secret=must-not-persist',
-  });
   const first = await store.recordPendingSender({
     staffId: 'staff-one',
     displayName: '小明',
@@ -37,14 +33,12 @@ test('state store persists sessions, dedupe IDs, and host-only pending sender re
   assert.equal(updated.requestedAt, '2026-08-15T01:00:00.000Z');
   assert.equal(updated.lastSeenAt, '2026-08-15T01:05:00.000Z');
   assert.deepEqual(store.pendingSender(first.requestId), updated);
-  assert.deepEqual(store.connectionTestTarget(), { userId: 'staff-one' });
 
   const storedText = await readFile(path, 'utf8');
   assert.doesNotMatch(storedText, /sessionWebhook|must-not-persist/);
   assert.equal((await stat(path)).mode & 0o777, 0o600);
 
   const reloaded = await new DingtalkStateStore(path).load();
-  assert.deepEqual(reloaded.connectionTestTarget(), { userId: 'staff-one' });
   assert.deepEqual(reloaded.pendingSenders(), [updated]);
   assert.equal(await reloaded.removePendingSenderByStaffId('staff-one'), true);
   assert.deepEqual(reloaded.pendingSenders(), []);
@@ -85,6 +79,5 @@ test('state store keeps only normalized fields from an existing pending-sender d
         lastSeenAt: '2026-08-15T01:02:00.000Z',
       },
     },
-    connectionTestTarget: null,
   });
 });

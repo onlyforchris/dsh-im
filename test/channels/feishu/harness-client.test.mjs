@@ -1,9 +1,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   HarnessClient,
   HarnessReplyTracker,
 } from '../../../src/channels/feishu/harness-client.mjs';
+import {
+  OUTBOUND_ARTIFACT_TOOL,
+  createOutboundArtifactTool,
+  materializeOutboundArtifact,
+  outboundArtifactRegistry,
+  releaseOutboundArtifact,
+} from '../../../src/channels/shared/semantic/artifact.mjs';
 
 function deferred() {
   let resolve;
@@ -159,6 +169,84 @@ test('interaction watcher uses the real Harness wire protocol and leaves approva
   assert.equal(socket.readyState, 3);
 });
 
+test('global event watcher reconnects without resolving until abort', async () => {
+  const sockets = [];
+  const socketUrls = [];
+  const client = new HarnessClient({
+    baseUrl: 'http://127.0.0.1:3080/base',
+    workspace: '/tmp/dsh-feishu-workspace',
+    interactionReconnectDelayMs: 0,
+    createWebSocket: (url) => {
+      const socket = new FakeSocket();
+      sockets.push(socket);
+      socketUrls.push(url);
+      queueMicrotask(() => socket.open());
+      return socket;
+    },
+  });
+  const controller = new AbortController();
+  const events = [];
+  let reconnects = 0;
+  let settled = false;
+  const watching = client.watchHarnessEvents({
+    signal: controller.signal,
+    onReconnect: () => { reconnects += 1; },
+    onSessionEvent: (payload) => events.push(payload),
+  });
+  watching.finally(() => { settled = true; });
+
+  await eventually(() => reconnects === 1);
+  sockets[0].frame({
+    type: 'server-request',
+    rpcId: 'event-one',
+    method: 'session/event',
+    payload: {
+      type: 'session/event',
+      sessionId: 'session-one',
+      event: { type: 'turn/end', seq: 1 },
+    },
+  });
+  sockets[0].frame({
+    type: 'server-request',
+    rpcId: 'invalid-method',
+    method: 'different/method',
+    payload: {
+      type: 'session/event',
+      sessionId: 'ignored',
+      event: { type: 'turn/end', seq: 2 },
+    },
+  });
+  await eventually(() => events.length === 1);
+
+  sockets[0].close();
+  await eventually(() => reconnects === 2);
+  assert.equal(settled, false, 'a dropped socket must not complete the watcher');
+  sockets[1].frame({
+    type: 'server-request',
+    rpcId: 'event-two',
+    method: 'session/event',
+    payload: {
+      type: 'session/event',
+      sessionId: 'session-two',
+      event: { type: 'turn/end', seq: 3 },
+    },
+  });
+  await eventually(() => events.length === 2);
+
+  assert.deepEqual(socketUrls, [
+    'ws://127.0.0.1:3080/api/events.mux',
+    'ws://127.0.0.1:3080/api/events.mux',
+  ]);
+  assert.deepEqual(events.map(({ sessionId, event }) => [sessionId, event.seq]), [
+    ['session-one', 1],
+    ['session-two', 3],
+  ]);
+  controller.abort();
+  await watching;
+  assert.equal(sockets[1].readyState, 3);
+  assert.equal(settled, true);
+});
+
 test('HarnessClient lists only absolute workspace paths', async () => {
   const client = new HarnessClient({
     baseUrl: 'http://127.0.0.1:3080',
@@ -233,14 +321,14 @@ test('HarnessClient lists sessions by workspace accounting in its stored order',
           sessionId: 'session-one',
           blank: false,
           cwd: '/tmp/target',
-          projections: { values: { title: null } },
+          projections: { asOfSeq: -1, values: { title: null } },
         },
         {
           sessionId: 'session-two',
           blank: true,
           origin: 'subagent',
           cwd: '/tmp/different',
-          projections: { values: { title: 'Second session' } },
+          projections: { asOfSeq: 0, values: { title: 'Second session' } },
         },
         {
           sessionId: 'cwd-only',
@@ -262,6 +350,7 @@ test('HarnessClient lists sessions by workspace accounting in its stored order',
         blank: true,
         origin: 'subagent',
         summaryAvailable: true,
+        lastSeq: 0,
       },
       {
         sessionId: 'session-missing',
@@ -278,6 +367,7 @@ test('HarnessClient lists sessions by workspace accounting in its stored order',
         blank: false,
         origin: null,
         summaryAvailable: true,
+        lastSeq: -1,
       },
     ],
   });
@@ -504,6 +594,280 @@ test('HarnessClient reads the nested workspace.create response used by DSH rc.6'
   assert.deepEqual(methods, ['workspace.list', 'workspace.create']);
 });
 
+test('HarnessClient asks do not control file-return tool availability', async () => {
+  const client = new HarnessClient({
+    baseUrl: 'http://127.0.0.1:3080',
+    workspace: '/tmp/dsh-feishu-workspace',
+  });
+  client.ensureRunning = async () => undefined;
+  let promptRpcId;
+  let prompted = false;
+  const agent = {
+    session: {
+      header: { id: 'session-artifact-availability', cwd: '/tmp/dsh-feishu-workspace' },
+      events: [],
+    },
+  };
+  client.rpc = async (method, _payload, _timeoutMs, options) => {
+    if (method === 'session.history' && !prompted) return { events: [] };
+    if (method === 'session.prompt') {
+      prompted = true;
+      promptRpcId = options.rpcId;
+      agent.session.events = [
+        { type: 'turn/start', data: { turn: 1 } },
+        { type: 'user/message', data: { turn: 1, source: { rpcId: promptRpcId } } },
+      ];
+      return {};
+    }
+    return {
+      events: [
+        { event: { type: 'turn/start', seq: 1, data: { turn: 1 } } },
+        {
+          event: {
+            type: 'user/message',
+            seq: 2,
+            data: { turn: 1, source: { rpcId: promptRpcId } },
+          },
+        },
+        {
+          event: {
+            type: 'assistant/message',
+            seq: 3,
+            data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: 'done' }] } },
+          },
+        },
+        { event: { type: 'turn/end', seq: 4, data: { turn: 1, reason: { kind: 'completed' } } } },
+      ],
+    };
+  };
+
+  assert.equal(await client.ask('session-artifact-availability', 'create a file', {
+    onArtifact: async () => undefined,
+  }), 'done');
+});
+
+test('HarnessClient stages inbound files, appends a neutral manifest, and cleans after turn end', async () => {
+  const inboundSources = [{ name: '用户报告.bin', load: async () => Buffer.from('bytes') }];
+  const ingressCalls = [];
+  let cleanupCalls = 0;
+  let promptPayload;
+  let promptRpcId;
+  let prompted = false;
+  const stagedFiles = [{
+    name: '用户报告.bin',
+    path: '.dsh-im/inbound/turn-abc/01-用户报告.bin',
+    mediaType: 'application/octet-stream',
+  }];
+  const client = new HarnessClient({
+    baseUrl: 'http://127.0.0.1:3080',
+    workspace: '/tmp/must-not-select-the-session-cwd',
+    fileIngressExecutor: async (request) => {
+      ingressCalls.push(request);
+      return {
+        files: stagedFiles,
+        async cleanup() { cleanupCalls += 1; },
+      };
+    },
+  });
+  client.ensureRunning = async () => undefined;
+  client.rpc = async (method, payload, _timeoutMs, options) => {
+    if (method === 'session.history' && !prompted) return { events: [] };
+    if (method === 'session.list') {
+      return { items: [{ sessionId: 'session-inbound-files', cwd: '/tmp/exact-session-cwd' }] };
+    }
+    if (method === 'session.prompt') {
+      prompted = true;
+      promptPayload = payload;
+      promptRpcId = options.rpcId;
+      assert.equal(cleanupCalls, 0, 'files remain available while the prompt is running');
+      return {};
+    }
+    return {
+      events: [
+        { event: { type: 'turn/start', seq: 1, data: { turn: 3 } } },
+        {
+          event: {
+            type: 'user/message',
+            seq: 2,
+            data: { turn: 3, source: { rpcId: promptRpcId } },
+          },
+        },
+        {
+          event: {
+            type: 'assistant/message',
+            seq: 3,
+            data: {
+              turn: 3,
+              step: 1,
+              message: { content: [{ type: 'text', text: '已读取附件。' }] },
+            },
+          },
+        },
+        { event: { type: 'turn/end', seq: 4, data: { turn: 3, reason: { kind: 'completed' } } } },
+      ],
+    };
+  };
+
+  assert.equal(await client.ask('session-inbound-files', '请查看附件', {
+    files: inboundSources,
+  }), '已读取附件。');
+
+  assert.equal(ingressCalls.length, 1);
+  assert.equal(ingressCalls[0].sessionId, 'session-inbound-files');
+  assert.equal(ingressCalls[0].workspace, '/tmp/exact-session-cwd');
+  assert.deepEqual(ingressCalls[0].files, inboundSources);
+  assert.equal(ingressCalls[0].files[0], inboundSources[0]);
+  assert.equal(ingressCalls[0].signal, undefined);
+  assert.equal(promptPayload.sessionId, 'session-inbound-files');
+  assert.equal(promptPayload.mode, 'queue');
+  assert.equal(promptPayload.content.length, 1);
+  assert.equal(promptPayload.content[0].type, 'text');
+  const promptText = promptPayload.content[0].text;
+  assert.match(promptText, /^请查看附件\n\n<dsh_im_files>\n/);
+  assert.match(promptText, /\n<\/dsh_im_files>$/);
+  const manifest = JSON.parse(promptText.match(/<dsh_im_files>\n(.+)\n<\/dsh_im_files>$/s)[1]);
+  assert.deepEqual(manifest, {
+    description: 'Files uploaded with this user message. Paths are relative to the current Harness workspace.',
+    files: stagedFiles,
+  });
+  assert.doesNotMatch(promptText, /summari[sz]e|解析|总结|处理这些文件/i);
+  assert.equal(cleanupCalls, 1);
+});
+
+test('HarnessClient cleans staged inbound files when session.prompt rejects them', async () => {
+  const promptFailure = new Error('Harness rejected prompt');
+  let cleanupCalls = 0;
+  let prompted = false;
+  const client = new HarnessClient({
+    baseUrl: 'http://127.0.0.1:3080',
+    workspace: '/tmp/default-workspace',
+    fileIngressExecutor: async () => ({
+      files: [{ name: 'rejected.dat', path: '.dsh-im/inbound/turn-rejected/01-rejected.dat' }],
+      async cleanup() { cleanupCalls += 1; },
+    }),
+  });
+  client.ensureRunning = async () => undefined;
+  client.rpc = async (method) => {
+    if (method === 'session.history' && !prompted) return { events: [] };
+    if (method === 'session.list') {
+      return { items: [{ sessionId: 'session-rejected-file', cwd: '/tmp/rejected-cwd' }] };
+    }
+    assert.equal(method, 'session.prompt');
+    prompted = true;
+    throw promptFailure;
+  };
+
+  await assert.rejects(
+    client.ask('session-rejected-file', '', {
+      files: [{ name: 'rejected.dat', data: Buffer.from('bytes') }],
+    }),
+    (error) => error === promptFailure,
+  );
+  assert.equal(cleanupCalls, 1);
+});
+
+test('HarnessClient retains staged files when an accepted turn outcome is unknown', async () => {
+  const uncertainFailure = new Error('history transport failed after prompt acceptance');
+  let cleanupCalls = 0;
+  let prompted = false;
+  const client = new HarnessClient({
+    baseUrl: 'http://127.0.0.1:3080',
+    workspace: '/tmp/default-workspace',
+    fileIngressExecutor: async () => ({
+      files: [{ name: 'uncertain.dat', path: '.dsh-im/inbound/turn-unknown/01-uncertain.dat' }],
+      async cleanup() { cleanupCalls += 1; },
+    }),
+  });
+  client.ensureRunning = async () => undefined;
+  client.rpc = async (method) => {
+    if (method === 'session.history' && !prompted) return { events: [] };
+    if (method === 'session.list') {
+      return { items: [{ sessionId: 'session-uncertain-file', cwd: '/tmp/uncertain-cwd' }] };
+    }
+    if (method === 'session.prompt') {
+      prompted = true;
+      return { accepted: true };
+    }
+    assert.equal(method, 'session.history');
+    throw uncertainFailure;
+  };
+
+  await assert.rejects(
+    client.ask('session-uncertain-file', 'use the attached file', {
+      files: [{ name: 'uncertain.dat', data: Buffer.from('bytes') }],
+      timeoutMs: 1_000,
+    }),
+    (error) => error === uncertainFailure,
+  );
+  assert.equal(cleanupCalls, 0, 'uncertain accepted turns may still be reading the staged path');
+});
+
+test('HarnessClient delivers an existing file-only Turn directly', async (t) => {
+  outboundArtifactRegistry.clear();
+  t.after(() => outboundArtifactRegistry.clear());
+  const workspace = await mkdtemp(join(tmpdir(), 'dsh-im-file-only-'));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  const client = new HarnessClient({
+    baseUrl: 'http://127.0.0.1:3080',
+    workspace,
+  });
+  client.ensureRunning = async () => undefined;
+  const tool = createOutboundArtifactTool({ registry: outboundArtifactRegistry });
+  const delivered = [];
+  await writeFile(join(workspace, 'file-only.txt'), 'file only');
+  let promptRpcId;
+  let prompted = false;
+  const agent = {
+    session: {
+      header: { id: 'session-file-only', cwd: workspace },
+      events: [],
+    },
+  };
+  client.rpc = async (method, _payload, _timeoutMs, options) => {
+    if (method === 'session.history' && !prompted) return { events: [] };
+    if (method === 'session.prompt') {
+      prompted = true;
+      promptRpcId = options.rpcId;
+      agent.session.events = [
+        { type: 'turn/start', data: { turn: 2 } },
+        { type: 'user/message', data: { turn: 2, source: { rpcId: promptRpcId } } },
+      ];
+      const exec = {
+        name: OUTBOUND_ARTIFACT_TOOL,
+        callId: 'file-only-call',
+        token: Symbol('file-only-call'),
+        agent,
+        signal: new AbortController().signal,
+      };
+      await tool.definition.execute({ path: 'file-only.txt' }, exec);
+      tool.onResult(exec, { isError: false });
+      return {};
+    }
+    return {
+      events: [
+        { event: { type: 'turn/start', seq: 1, data: { turn: 2 } } },
+        {
+          event: {
+            type: 'user/message',
+            seq: 2,
+            data: { turn: 2, source: { rpcId: promptRpcId } },
+          },
+        },
+        { event: { type: 'turn/end', seq: 3, data: { turn: 2, reason: { kind: 'completed' } } } },
+      ],
+    };
+  };
+
+  const answer = await client.ask('session-file-only', 'create and return a file', {
+    onArtifact: async (artifact) => delivered.push(artifact),
+  });
+  assert.equal(answer, '');
+  assert.equal(delivered.length, 1);
+  const file = await materializeOutboundArtifact(delivered[0]);
+  assert.equal(file.bytes.toString(), 'file only');
+  releaseOutboundArtifact(delivered[0]);
+});
+
 test('HarnessReplyTracker correlates the prompt and emits only answer text', () => {
   const tracker = new HarnessReplyTracker({ promptRpcId: 'prompt-1', afterSeq: 10 });
 
@@ -589,5 +953,24 @@ test('HarnessReplyTracker emits tool progress without exposing tool results', ()
 
   assert.deepEqual(tracker.consume([
     { type: 'tool/result', seq: 4, data: { turn: 1, step: 1, secret: 'not rendered' } },
-  ]), { type: 'status', text: '正在整理结果…' });
+  ]), { type: 'status', text: '正在整理结果…', toolName: 'web_search' });
+});
+
+test('HarnessReplyTracker keeps every frame of a batched turn in order', () => {
+  const tracker = new HarnessReplyTracker({ promptRpcId: 'prompt-batch' });
+  const updates = tracker.consumeAll([
+    { type: 'turn/start', seq: 1, data: { turn: 1 } },
+    { type: 'user/message', seq: 2, data: { source: { rpcId: 'prompt-batch' } } },
+    { type: 'assistant/chunk', seq: 3, data: { turn: 1, step: 0, chunk: { type: 'text-delta', index: 0, text: '先创建再观察：' } } },
+    { type: 'tool/call', seq: 4, data: { turn: 1, step: 1, name: 'add_observations' } },
+    { type: 'tool/result', seq: 5, data: { turn: 1, step: 1, error: { message: 'Status code: 404.' } } },
+    { type: 'tool/call', seq: 6, data: { turn: 1, step: 2, name: 'create_entities' } },
+  ]);
+  assert.deepEqual(updates, [
+    { type: 'text', text: '先创建再观察：' },
+    { type: 'tool', name: 'add_observations' },
+    { type: 'status', text: '正在整理结果…', toolName: 'add_observations', error: 'Status code: 404.' },
+    { type: 'tool', name: 'create_entities' },
+  ]);
+  assert.equal(tracker.answer, '先创建再观察：');
 });

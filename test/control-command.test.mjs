@@ -36,12 +36,29 @@ function fixture({ sessionId = 'session-one', stopped = true, steered = true } =
 test('isControlCommand reserves valid and malformed control command forms', () => {
   for (const value of [
     '/stop', ' /STOP ', '/stop now', '/steer', '/StEeR do this', '/steer line one\nline two',
+    '/version', ' /VERSION ', '/version now',
   ]) {
     assert.equal(isControlCommand(value), true, value);
   }
-  for (const value of [null, '', 'stop', '/stopping', '/steering', 'hello /stop']) {
+  for (const value of [null, '', 'stop', '/stopping', '/steering', '/versions', 'hello /stop']) {
     assert.equal(isControlCommand(value), false, String(value));
   }
+});
+
+test('/version returns the package version without touching Harness or Session state', async () => {
+  const { calls, harness, state } = fixture();
+  const { version } = await import('../package.json', { with: { type: 'json' } })
+    .then((module) => module.default);
+
+  assert.deepEqual(
+    await runControlCommand('/VERSION', harness, state, 'direct:one'),
+    { message: `dsh-im v${version}` },
+  );
+  assert.match(
+    (await runControlCommand('/version details', harness, state, 'direct:one')).message,
+    /用法/,
+  );
+  assert.equal(calls.length, 0);
 });
 
 test('/stop is exact, text-only, and never creates a Session', async () => {
@@ -88,7 +105,7 @@ test('/stop and /steer return friendly no-session messages without creating one'
   );
   assert.match(
     (await runControlCommand('/steer 补充', harness, state, 'direct:one')).message,
-    /普通消息/,
+    /没有绑定会话/,
   );
   assert.equal(calls.some(([method]) => method === 'workspaceSession'), false);
 });
@@ -135,7 +152,7 @@ test('/steer reports a lost active-turn race instead of starting new work', asyn
   const result = await runControlCommand('/steer continue', harness, state, 'direct:one', {
     control: { owner: {}, key: 'direct:one' },
   });
-  assert.match(result.message, /普通消息/);
+  assert.match(result.message, /没有正在运行/);
   assert.equal(calls.filter(([method]) => method === 'steerActiveTurn').length, 1);
 });
 

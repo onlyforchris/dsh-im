@@ -1,3 +1,6 @@
+import { normalizeAgentPresetCatalog, normalizeAgentPresetId, SET_AGENT_PRESET_ENDPOINT } from '../../agent-preset.js';
+import { normalizeLastMessageError } from '../../last-message-error.js';
+
 export const QQ_RPC_CHANNEL = '/qq';
 
 export const QQ_ENDPOINTS = Object.freeze({
@@ -9,6 +12,7 @@ export const QQ_ENDPOINTS = Object.freeze({
   reconnectBot: 'bot.reconnect',
   deleteBot: 'bot.delete',
   setWorkspace: 'bot.workspace.set',
+  setAgentPreset: SET_AGENT_PRESET_ENDPOINT,
 });
 
 const PROVISION_STATES = new Set(['starting', 'pending', 'refreshing', 'connecting', 'connected', 'failed', 'cancelled']);
@@ -82,6 +86,7 @@ function normalizeBot(value) {
     connected,
     state: connected ? 'connected' : state,
     workspace: text(value.workspace, '', 4_096),
+    agentPreset: normalizeAgentPresetId(value.agentPreset),
     bot: {
       name: text(value.bot?.name, 'QQ机器人', 100),
       appIdMasked: text(value.bot?.appIdMasked, '应用标识已安全保存', 140),
@@ -90,6 +95,7 @@ function normalizeBot(value) {
       summary: text(value.health?.summary, connected ? 'QQ WebSocket 长连接运行正常' : 'QQ 连接尚未就绪'),
       lastCheckedAt: timestamp(value.health?.lastCheckedAt),
     },
+    lastMessageError: normalizeLastMessageError(value.lastMessageError),
     error: isRecord(value.error) ? {
       code: text(value.error.code, 'QQ_ACCOUNT_ERROR', 80),
       message: text(value.error.message, 'QQ 连接尚未就绪'),
@@ -117,6 +123,7 @@ export function normalizeSnapshot(value) {
     bots,
     totals: { configured: bots.length, connected: bots.filter((bot) => bot.connected).length },
     provisioning: source.provisioning ? normalizeProvisioning(source.provisioning) : null,
+    agentPresetCatalog: normalizeAgentPresetCatalog(source.agentPresetCatalog),
     ...(testMessage ? { testMessage } : {}),
   };
 }

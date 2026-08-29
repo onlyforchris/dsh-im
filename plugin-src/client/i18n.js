@@ -7,7 +7,64 @@ const EN = Object.freeze({
   'IM机器人': 'IM bots',
   'IM机器人设置': 'IM bot settings',
   'IM 渠道': 'IM channels',
-  '让 DeepSeek Harness 触手可及': 'DeepSeek Harness, always within reach',
+  '让 DeepSeek Harness 触手可及': 'Connecting DeepSeek Harness',
+  '当前版本': 'Current version',
+  'DSH-IM 更新': 'DSH-IM update',
+  '检查更新': 'Check for updates',
+  '重新检查': 'Check again',
+  '刷新状态': 'Refresh status',
+  '更新至': 'Update to',
+  '安装更新': 'Install update',
+  '正在更新…': 'Updating…',
+  '待手动重启': 'Restart needed',
+  '运行版本': 'Running version',
+  '已安装版本': 'Installed version',
+  'npm 最新版本': 'Latest on npm',
+  '目标 profile': 'Target profile',
+  '目标版本': 'Target version',
+  '更新来源': 'Update source',
+  '页面版本': 'Page version',
+  '无法确认': 'Unknown',
+  '发现新版本': 'Update available',
+  '已是最新版本': 'Up to date',
+  '当前版本无需更新': 'No newer version available',
+  '已获取 npm 最新版本': 'Latest npm version retrieved',
+  '检查 npm 最新版本，不会自动安装。': 'Check the latest npm version. Nothing is installed automatically.',
+  '正在从 npm 检查最新版本…': 'Checking npm for the latest version…',
+  '正在安装，请稍候…': 'Installing, please wait…',
+  '正在校验安装结果…': 'Verifying the installation…',
+  '已安装，待手动重启': 'Installed — manual restart needed',
+  '更新已生效': 'Updated version is active',
+  '更新失败': 'Update failed',
+  '更新请求失败': 'Update request failed',
+  '仅更新 DSH-IM。安装完成后需手动重启后台；本功能不会自动重启或主动刷新页面。': 'Only DSH-IM will be updated. Restart the backend manually after installation. This feature does not automatically restart it or initiate a page refresh.',
+  '当前是源码或链接安装，只能检查版本；请手动更新源码，或迁移到 npm 安装。': 'This is a source or linked installation. You can check versions, but must update the source manually or migrate to an npm installation.',
+  '无法确认当前 profile，请在对应的 Harness 环境中手动更新。': 'The current profile could not be identified. Update manually in the corresponding Harness environment.',
+  '当前运行环境不支持按钮安装，请手动更新插件。': 'This runtime cannot install through this button. Update the plugin manually.',
+  '当前 npm 源配置与官方源不一致，请先检查 registry 配置。': 'The npm registry configuration differs from the official registry. Check your registry settings first.',
+  '当前 Host 的 Node.js 版本不满足新版要求，请先更新运行环境。': 'The Host Node.js version does not meet the new version’s requirements. Update the runtime first.',
+  '新版本已安装，请在方便时手动重启当前 Harness 或 Desktop。': 'The new version is installed. Manually restart this Harness or Desktop when convenient.',
+  '上次安装结果无法确认，请先检查此 profile 的插件安装状态。': 'The previous installation result is uncertain. Check this profile’s plugin installation first.',
+  '无法访问 npm 或请求超时，请稍后重新检查。': 'npm is unreachable or the request timed out. Check again later.',
+  'npm 返回的版本信息无效，暂时无法更新。': 'npm returned invalid release information. Updating is unavailable.',
+  '版本确认已过期，请重新检查后再安装。': 'The version confirmation expired. Check again before installing.',
+  '插件安装状态已发生变化，请重新检查。': 'The plugin installation changed. Check again.',
+  '此 profile 正在更新，请稍后查看状态。': 'This profile is already updating. Check its status shortly.',
+  '安装失败，请检查当前安装状态后重试。': 'Installation failed. Check the current installation before retrying.',
+  '安装结果校验失败，请手动检查插件版本。': 'Installation verification failed. Check the plugin version manually.',
+  '无法安全保存更新状态，请先检查当前安装结果。': 'Update state could not be saved safely. Check the current installation result before retrying.',
+  '上次更新已中断，请检查安装状态后重试。': 'The previous update was interrupted. Check the installation before retrying.',
+  '更新服务已关闭，请手动重新打开设置页。': 'The update service has closed. Reopen settings manually.',
+  '更新请求无效，请重新检查版本。': 'The update request is invalid. Check the version again.',
+  '当前插件安装不完整或与 profile 不符，请手动检查安装配置。': 'The plugin installation is incomplete or does not match this profile. Check the installation configuration manually.',
+  '无法确认当前 npm 源配置，暂时不能安装更新。': 'The npm registry configuration could not be verified. Installation is unavailable.',
+  '安装超时，请先确认当前安装状态，再决定是否重试。': 'Installation timed out. Check the current installation before retrying.',
+  '更新请求失败，请重试。': 'The update request failed. Try again.',
+  '更新服务返回了无法识别的响应。': 'The update service returned an unrecognized response.',
+  '当前 Host 不支持更新接口，请先手动更新插件并重启。': 'This Host does not support the update API. Update the plugin manually and restart first.',
+  '关闭窗口不会取消安装。请勿同时在其他窗口管理此 profile 的插件。': 'Closing this window does not cancel installation. Do not manage this profile’s plugins in another window at the same time.',
+  '页面版本与运行版本不同，请手动刷新页面；若仍不一致，请手动重启 Harness 或 Desktop。': 'The page and running versions differ. Refresh the page manually; if they still differ, manually restart Harness or Desktop.',
+  '请在机器人空闲时安装；安装会修改当前 profile 的依赖，完成后需手动重启。': 'Install while bots are idle. This changes the current profile’s dependencies and requires a manual restart afterward.',
   'AI Office': 'AI Office',
   '（实验功能）': '(Experimental)',
   'AI Office 设置': 'AI Office settings',
@@ -55,10 +112,10 @@ const EN = Object.freeze({
   '本机暂时无法访问 AI Office。': 'AI Office cannot currently be reached from this machine.',
   'AI Office 连接已中断。': 'The AI Office connection was interrupted.',
   '帮助与反馈 · 前往 GitHub': 'Help & feedback · Open GitHub',
-  '已连接': 'Connected',
-  '已配置，未连接': 'Configured, not connected',
-  '未配置': 'Not configured',
-  '已连接 ${statusCounts.connected} · 未连接 ${statusCounts.offline} · 未配置 ${unconfigured}': '${statusCounts.connected} connected · ${statusCounts.offline} offline · ${unconfigured} not configured',
+  '请改用 localhost 重新打开': 'Reopen with localhost',
+  '页面会在当前端口重新打开，机器人配置不会改变。': 'The page will reopen on the current port. Your bot configuration will not change.',
+  '使用 localhost 重新打开': 'Reopen with localhost',
+  '当前地址与浏览器的本机请求校验不兼容。请使用上方按钮改用 localhost 重新打开。': 'This address is incompatible with the browser’s local-request checks. Use the button above to reopen with localhost.',
   '微信': 'WeChat',
   '飞书': 'Feishu',
   '钉钉': 'DingTalk',
@@ -72,6 +129,24 @@ const EN = Object.freeze({
   'WhatsApp账号': 'WhatsApp account',
   '微信设置': 'WeChat settings',
   '飞书机器人设置': 'Feishu bot settings',
+  '群聊响应方式': 'Group response mode',
+  '仅在 @机器人时响应（推荐）': 'Only respond when @mentioned (recommended)',
+  '响应所有群消息': 'Respond to all group messages',
+  '响应所有群消息（需飞书敏感权限）': 'Respond to all group messages (requires a sensitive Feishu scope)',
+  '重新授权': 'Reauthorize',
+  '去授权': 'Authorize',
+  '重新授权群消息权限': 'Reauthorize group-message permission',
+  '授权群消息权限': 'Authorize group-message permission',
+  '正在准备授权…': 'Preparing authorization…',
+  '正在准备…': 'Preparing…',
+  '私聊始终响应；群聊仅处理明确 @当前机器人的消息。群消息权限已开通，再次切换无需授权。': 'Direct messages always work; group chats require an explicit @mention of this bot. The group-message permission is already granted, so switching again needs no authorization.',
+  '私聊始终响应；群聊仅处理明确 @当前机器人的消息。选择全部消息后会打开飞书官方授权流程。': 'Direct messages always work; group chats require an explicit @mention of this bot. Selecting all messages opens the official Feishu authorization flow.',
+  '已开通“获取群组中所有消息”权限（im:message.group_msg）；机器人会处理群聊中的所有可见消息。': 'The “Read all messages in associated group chat” scope (im:message.group_msg) is granted; the bot processes every visible group message.',
+  '尚未确认“获取群组中所有消息”权限，请完成飞书授权。': 'The “Read all messages in associated group chat” scope has not been confirmed. Complete Feishu authorization.',
+  '私聊始终响应；群聊仅处理明确 @当前机器人的消息。': 'Direct messages always work; group chats require an explicit @mention of this bot.',
+  '需在飞书为该机器人开通“获取群组中所有消息”权限（im:message.group_msg）；开通后，机器人会处理群聊中的所有可见消息。': 'Grant this bot the “Read all messages in associated group chat” Feishu scope (im:message.group_msg); once granted, it will process every visible group message.',
+  '群聊响应方式修改失败，请重试。': 'Could not update the group response mode. Try again.',
+  '群消息权限授权失败，请重试。': 'Could not authorize group-message permission. Try again.',
   '钉钉设置': 'DingTalk settings',
   '企业微信设置': 'WeCom settings',
   '扫码接入机器人': 'Scan QR code',
@@ -93,12 +168,21 @@ const EN = Object.freeze({
   '离线': 'Offline',
   '已断开': 'Disconnected',
   '消息通道': 'Message channel',
+  '查看消息通道说明': 'View message channel details',
   '最近检查': 'Last checked',
+  '最近一条消息处理失败': 'Latest message failed',
+  '错误码': 'Code',
+  '参考号': 'Reference',
   '当前工作区': 'Current workspace',
   '选择目录': 'Choose folder',
   '选择机器人工作区目录': 'Select bot workspace folder',
   '当前目录': 'Current folder',
   '主目录': 'Home',
+  '直接输入路径': 'Enter a path directly',
+  '支持 Windows 盘符、UNC 与 POSIX 绝对路径。': 'Supports Windows drives, UNC paths, and POSIX absolute paths.',
+  '输入 Host 上的完整绝对路径': 'Enter a full absolute path on the Host',
+  '前往': 'Go',
+  '读取中…': 'Loading…',
   '正在准备目录选择器…': 'Preparing folder picker…',
   '正在读取目录…': 'Loading folders…',
   '这个目录中没有子文件夹。': 'This folder has no subfolders.',
@@ -121,6 +205,16 @@ const EN = Object.freeze({
   '工作区路径不存在。': 'The workspace path does not exist.',
   '工作区路径必须指向一个目录。': 'The workspace path must point to a directory.',
   '找不到要修改的机器人。': 'The bot could not be found.',
+  'Agent Preset': 'Agent Preset',
+  '查看 Agent Preset 说明': 'View Agent Preset help',
+  '跟随 Host 默认': 'Follow the Host default',
+  '（已不可用）': ' (unavailable)',
+  '只影响新建会话；若当前聊天已有会话，先发送 /new，再发送普通消息生效。': 'This affects only new sessions. If the current chat already has a session, send /new, then send a regular message to apply it.',
+  '当前 Agent Preset 已不可用，请选择其他 Preset 或跟随 Host 默认。': 'The current Agent Preset is unavailable. Choose another preset or follow the Host default.',
+  'Agent Preset 修改失败，请重试。': 'Could not update the Agent Preset. Try again.',
+  '请选择 Agent Preset。': 'Choose an Agent Preset.',
+  'Agent Preset 无效。': 'The Agent Preset is invalid.',
+  'Agent Preset 不存在或不可用。': 'The Agent Preset does not exist or is unavailable.',
   '尚未检查': 'Not checked yet',
   '刚刚': 'Just now',
   '检查连接': 'Check connection',
@@ -185,6 +279,7 @@ const EN = Object.freeze({
   '生成 QQ 二维码': 'Generate QQ QR code',
   '正在生成二维码…': 'Generating QR code…',
   '正在准备授权二维码': 'Preparing authorization QR code',
+  '正在准备权限授权二维码': 'Preparing permission authorization QR code',
   '正在准备微信二维码': 'Preparing WeChat QR code',
   '正在添加新机器人': 'Adding a new bot',
   '正在申请钉钉授权二维码…': 'Requesting DingTalk authorization QR code…',
@@ -201,27 +296,50 @@ const EN = Object.freeze({
   '保持本页打开，等待新机器人的长连接就绪': 'Keep this page open until the bot connection is ready',
   '在飞书中打开': 'Open in Feishu',
   '取消添加': 'Cancel',
-  '使用飞书扫码修复卡片按钮': 'Scan with Feishu to repair card buttons',
-  '扫码会更新现有飞书应用，只增量补充卡片按钮回调；不会创建新应用。确认后此机器人会短暂重连，其他机器人不受影响。': 'Scanning updates the existing Feishu app with only the card-button callback. It does not create a new app. This bot reconnects briefly after confirmation; other bots are not affected.',
-  '核对现有应用名称，并确认只新增卡片回调': 'Review the existing app name and confirm that only the card callback is added',
-  '保持本页打开，等待卡片按钮修复完成': 'Keep this page open until card-button repair finishes',
-  '取消修复': 'Cancel repair',
-  '已确认，正在完成卡片按钮修复': 'Confirmed. Finishing card-button repair',
-  '正在准备修复二维码': 'Preparing the repair QR code',
-  '配置已提交，正在验证卡片按钮回调并重连此机器人；此阶段无法取消，其他机器人不会中断。': 'The update was submitted. Verifying the card callback and reconnecting this bot. This stage cannot be cancelled; other bots will not be interrupted.',
+  '使用飞书扫码补全权限': 'Scan with Feishu to complete permissions',
+  '使用飞书确认群消息权限': 'Confirm group-message permission with Feishu',
+  '扫码会更新现有飞书应用，只增量开通“获取群组中所有消息”权限；不会创建新应用。确认后会自动启用“响应所有群消息”，其他机器人不受影响。': 'Scanning updates the existing Feishu app with only the “Read all messages in associated group chat” scope. It does not create a new app. After confirmation, “Respond to all group messages” is enabled automatically; other bots are unaffected.',
+  '核对现有应用，并确认“获取群组中所有消息”权限': 'Review the existing app and confirm the “Read all messages in associated group chat” permission',
+  '保持本页打开，等待权限生效并自动切换响应方式': 'Keep this page open while the permission takes effect and the response mode switches automatically',
+  '取消授权': 'Cancel authorization',
+  '已确认，正在启用全部消息模式': 'Confirmed. Enabling all-message mode',
+  '权限配置已提交，正在保存设置并重连此机器人；此阶段无法取消，其他机器人不会中断。': 'The permission update was submitted. Saving the setting and reconnecting this bot. This stage cannot be cancelled; other bots will not be interrupted.',
+  '权限配置已提交，正在启用全部消息模式并重连此机器人；此阶段无法取消，其他机器人不会中断。': 'The permission update was submitted. Enabling all-message mode and reconnecting this bot. This stage cannot be cancelled; other bots will not be interrupted.',
+  '正在为现有飞书应用申请群消息权限二维码，请稍候。': 'Requesting a group-message permission QR code for the existing Feishu app…',
+  '群消息权限没有开通完成': 'Group-message permission was not granted',
+  '扫码会更新现有飞书应用，最多增量补充卡片按钮回调、读取用户消息内图片或文件所需的 im:message:readonly（飞书显示为“获取单聊、群组消息”），以及上传机器人图片或文件所需的 im:resource；不会创建新应用。确认页只显示当前缺少项，完成后此机器人会短暂重连，其他机器人不受影响。': 'Scanning updates the existing Feishu app with up to three missing items: the card-button callback, im:message:readonly for reading images or files in user messages (shown by Feishu as “Read direct and group messages”), and im:resource for uploading images or files sent by the bot. It does not create a new app. The confirmation page shows only missing items; this bot reconnects briefly afterward, while other bots are unaffected.',
+  '核对现有应用名称，并确认只新增当前缺少的上述配置': 'Review the existing app name and confirm that only the missing items described above are added',
+  '保持本页打开，等待权限与回调补全完成': 'Keep this page open until permissions and the callback are complete',
+  '取消补全': 'Cancel setup',
+  '已确认，正在完成权限与回调配置': 'Confirmed. Completing permissions and callback setup',
+  '正在准备权限补全二维码': 'Preparing the permission-completion QR code',
+  '配置已提交，正在保存权限、验证卡片回调并重连此机器人；此阶段无法取消，其他机器人不会中断。': 'The update was submitted. Saving permissions, verifying the card callback, and reconnecting this bot. This stage cannot be cancelled; other bots will not be interrupted.',
   '正在为现有飞书应用申请一次性更新二维码，请稍候。': 'Requesting a one-time update QR code for the existing Feishu app…',
-  '卡片按钮没有修复完成': 'Card-button repair did not finish',
-  '修复卡片按钮': 'Repair card buttons',
+  '权限与回调没有补全完成': 'Permissions and callback setup did not finish',
+  '补全权限': 'Complete permissions',
+  '补全范围': 'Completion scope',
+  '最多增量添加卡片回调 card.action.trigger、读取消息内图片或文件所需的 im:message:readonly（飞书显示为“获取单聊、群组消息”），以及上传机器人图片或文件所需的 im:resource；确认页只显示当前缺少项，不会创建新应用。': 'Adds up to the missing card callback card.action.trigger, im:message:readonly for reading images or files in messages (shown by Feishu as “Read direct and group messages”), and im:resource for uploading images or files sent by the bot. The confirmation page shows only missing items; no new app is created.',
   '等待扫码…': 'Waiting for scan…',
-  '飞书服务返回了不匹配的卡片修复二维码': 'Feishu returned a repair QR code for a different bot',
+  '飞书服务返回了不匹配的权限补全二维码': 'Feishu returned a permission-completion QR code for a different bot',
+  '飞书服务返回了不匹配的群消息权限二维码': 'Feishu returned a group-message permission QR code for a different bot',
   '飞书服务返回的修复信息缺少 botId': 'Feishu repair status is missing the bot ID',
+  '飞书服务返回的应用更新信息缺少 botId': 'Feishu app-update status is missing the bot ID',
   '飞书服务返回了不匹配的注册进度': 'Feishu returned registration progress for a different operation',
   '此机器人': 'this bot',
-  '${botName ?? "机器人"}的修复二维码已生成，请使用飞书扫码。': 'Repair QR code generated for ${botName ?? "bot"}. Scan it with Feishu.',
+  '用于为${botName}开通群消息权限的一次性授权二维码': 'One-time QR code for granting group-message permission to ${botName}',
+  '正在为「${botName}」开通群消息权限': 'Granting group-message permission to “${botName}”',
+  '${botName ?? "机器人"}的权限补全二维码已生成，请使用飞书扫码。': 'Permission-completion QR code generated for ${botName ?? "bot"}. Scan it with Feishu.',
+  '${botName ?? "机器人"}的群消息权限二维码已生成，请使用飞书确认。': 'Group-message permission QR code generated for ${botName ?? "bot"}. Confirm it with Feishu.',
+  '${targetBotName}已开通群消息权限，并启用“响应所有群消息”。': '${targetBotName} now has group-message permission and “Respond to all group messages” is enabled.',
+  '${targetBot.bot.name}已开通群消息权限，并启用“响应所有群消息”。': '${targetBot.bot.name} now has group-message permission and “Respond to all group messages” is enabled.',
   '${targetBot.bot.name}已连接，可以在飞书中开始聊天。': '${targetBot.bot.name} is connected and ready to chat in Feishu.',
-  '已取消卡片按钮修复。': 'Card-button repair was cancelled.',
-  '卡片按钮已更新，但暂时无法确认机器人连接状态': 'The card callback was updated, but the bot connection could not be confirmed yet',
-  '飞书卡片按钮修复失败': 'Could not repair the Feishu card buttons',
+  '已取消补全权限与回调。': 'Completing permissions and the callback was cancelled.',
+  '已取消群消息权限授权。': 'Group-message permission authorization was cancelled.',
+  '权限与回调已更新，但暂时无法确认机器人连接状态': 'Permissions and the callback were updated, but the bot connection could not be confirmed yet',
+  '群消息权限已更新，但暂时无法确认机器人连接状态': 'The group-message permission was updated, but the bot connection could not be confirmed yet',
+  '飞书权限与回调补全失败': 'Could not complete Feishu permissions and callback setup',
+  '飞书群消息权限开通失败': 'Could not grant the Feishu group-message permission',
+  '请先完成当前飞书授权操作，再开通群消息权限。': 'Finish the current Feishu authorization before granting group-message permission.',
   '已确认，正在连接新机器人': 'Confirmed. Connecting the new bot',
   '正在安全保存凭据并检查新机器人的消息通道，其他机器人不会中断。': 'Saving credentials and checking the new bot connection. Existing bots will not be interrupted.',
   '正在向飞书申请一次性授权二维码，请稍候。': 'Requesting a one-time authorization QR code from Feishu…',
@@ -260,7 +378,14 @@ const EN = Object.freeze({
   '微信已授权，但登录凭据无法写入 DSH 凭据存储。请检查凭据存储是否可写。': 'WeChat was authorized, but the login credential could not be written to the DSH credential store. Check that the store is writable.',
   '微信已授权，但账号配置无法写入本机。请检查 DSH_HOME 目录权限。': 'WeChat was authorized, but the account configuration could not be saved locally. Check the DSH_HOME directory permissions.',
   '微信已授权，但无法初始化账号状态或工作区。请检查 DSH_HOME 和工作区目录。': 'WeChat was authorized, but the account state or workspace could not be initialized. Check DSH_HOME and the workspace directory.',
-  '微信已授权，但插件无法连接本机 Harness。请确认 dsh web 已正常启动。': 'WeChat was authorized, but the plugin could not reach the local Harness. Confirm that dsh web is running normally.',
+  '微信已授权，但插件无法连接本机 Harness。请检查 dsh web 地址和端口。': 'WeChat was authorized, but the plugin could not connect to the local Harness. Check the dsh web address and port.',
+  '微信已授权，但 Harness 健康检查超时。请确认 dsh web 未阻塞。': 'WeChat was authorized, but the Harness health check timed out. Confirm that dsh web is not blocked.',
+  '微信已授权，但 Harness 拒绝了本机健康检查。请检查 Host 信任配置。': 'WeChat was authorized, but Harness denied the local health check. Check the Host trust configuration.',
+  '微信已授权，但找不到 Harness 健康检查接口。请确认 Harness 与插件版本兼容。': 'WeChat was authorized, but the Harness health endpoint was not found. Confirm that Harness and the plugin are compatible.',
+  '微信已授权，但 Harness 健康检查返回服务错误。请查看 dsh web 日志。': 'WeChat was authorized, but the Harness health check returned a service error. Check the dsh web logs.',
+  '微信已授权，但 Harness 返回了无法识别的响应。请确认 Harness 与插件版本兼容。': 'WeChat was authorized, but Harness returned an unrecognized response. Confirm that Harness and the plugin are compatible.',
+  '微信已授权，但 Harness 拒绝了健康检查请求。请查看 dsh web 日志。': 'WeChat was authorized, but Harness rejected the health-check request. Check the dsh web logs.',
+  '微信已授权，但 Harness 健康检查发生未知错误。请查看 dsh web 日志。': 'WeChat was authorized, but the Harness health check failed unexpectedly. Check the dsh web logs.',
   '微信已授权，但消息连接初始化失败。请查看 dsh web 日志后重试。': 'WeChat was authorized, but the message connection could not be initialized. Check the dsh web logs and try again.',
   '微信已授权，但激活过程中发生未知错误。请查看 dsh web 日志。': 'WeChat was authorized, but an unknown error occurred during activation. Check the dsh web logs.',
   '微信已绑定，可以开始向已绑定的机器人发消息。': 'WeChat is connected and ready for messages.',
@@ -306,6 +431,24 @@ const EN = Object.freeze({
   '正在建立安全的关联设备会话。': 'Creating a secure linked-device session.',
   '关联设备正在接入 DeepSeek Harness。': 'Linking the device to DeepSeek Harness.',
   'WhatsApp Web 关联设备运行正常': 'WhatsApp linked device is healthy',
+  '查看 WhatsApp 访问模式说明': 'View WhatsApp access mode details',
+  'WhatsApp 访问模式': 'WhatsApp access mode',
+  '仅自己模式': 'Only me',
+  '指定联系人模式': 'Selected contacts',
+  '开放响应模式': 'Open responses',
+  '仅自己模式（默认）': 'Only me (default)',
+  '已生效：': 'Active: ',
+  '只响应已绑定 WhatsApp 账号的自聊消息。': 'Only respond to self-chat messages from the linked WhatsApp account.',
+  '响应自聊和白名单联系人的私聊，忽略群聊。': 'Respond to self-chat and allowlisted direct messages; ignore group messages.',
+  '响应所有私聊、已绑定账号自己发出的群聊消息，以及其他群成员的提及或回复。': 'Respond to all direct messages, group messages sent by the linked account, and mentions or replies from other group members.',
+  '允许私聊的 WhatsApp 电话号码': 'WhatsApp phone numbers allowed to send direct messages',
+  '每行一个含国家或地区代码的号码': 'One number with country or region code per line',
+  '可以包含开头的 +，保存时会自动移除。': 'A leading + is allowed and removed when saved.',
+  '仅指定联系人模式使用白名单，切换模式时会保留。': 'Only Selected contacts uses the allowlist; it is retained when modes change.',
+  '白名单为空；保存后将只接受自聊消息。': 'The allowlist is empty; only self-chat messages will be accepted after saving.',
+  '电话号码必须包含国家或地区代码，每行一个。': 'Each phone number must include a country or region code on its own line.',
+  'WhatsApp 访问设置暂不可用。': 'WhatsApp access settings are currently unavailable.',
+  'WhatsApp 访问设置保存失败。': 'Could not save WhatsApp access settings.',
   'Bot API 长轮询': 'Bot API long polling',
   ' Gateway 长连接': ' Gateway persistent connection',
   'Gateway 长连接': 'Gateway persistent connection',
@@ -435,6 +578,9 @@ const EN = Object.freeze({
   'QQ 服务没有返回扫码绑定进度': 'QQ did not return QR setup progress',
   'QQ 扫码服务没有返回有效的绑定任务': 'QQ did not return a valid setup attempt',
   'QQ WebSocket 长连接运行正常': 'QQ WebSocket connection is healthy',
+  'QQ 连接未就绪，插件会自动重试。': 'The QQ connection is not ready; the plugin will retry automatically.',
+  'QQ 连接未就绪，插件会自动重试': 'The QQ connection is not ready; the plugin will retry automatically',
+  'QQ 连接当前离线': 'The QQ connection is currently offline',
   'QQ 服务没有返回有效的机器人列表': 'QQ did not return a valid bot list',
   '尚未绑定 QQ 机器人': 'No QQ bot connected yet',
   '用于绑定 QQ 机器人的一次性二维码': 'One-time QR code for connecting a QQ bot',
@@ -453,6 +599,20 @@ const EN = Object.freeze({
   '微信绑定没有完成': 'WeChat setup did not complete',
   '微信连接正常': 'WeChat connection is healthy',
   '微信连接未就绪': 'WeChat connection is not ready',
+  '当前模型不支持图片，请用 /models 查看可用模型，再用 /model <序号> 切换后重发。': 'The current model does not support images. Use /models to list models, then /model <number> to switch and resend.',
+  '图片超过宿主允许的大小，请压缩后重试。': 'The image exceeds the Host size limit. Compress it and try again.',
+  '图片分辨率过高，请压缩后重试。': 'The image resolution is too high. Compress it and try again.',
+  '图片内容无效或格式不受支持，请重新发送。': 'The image is invalid or unsupported. Send it again.',
+  '未能读取图片内容，请重新发送。': 'The image could not be read. Send it again.',
+  '图片格式与实际内容不一致，请重新发送。': 'The declared image format does not match its content. Send it again.',
+  '一次发送的图片数量超过宿主限制，请减少后重试。': 'The message exceeds the Host image-count limit. Remove some images and try again.',
+  '图片总大小超过宿主限制，请减少图片或压缩后重试。': 'The images exceed the Host total-size limit. Remove or compress some images and try again.',
+  '图片下载地址发生了重定向，暂时无法读取。': 'The image download redirected and cannot be read.',
+  '图片超过 5 MB，请压缩后重试。': 'The image exceeds 5 MB. Compress it and try again.',
+  '一次发送的图片总大小过大，请减少图片数量或压缩后重试。': 'The images are too large in total. Remove or compress some images and try again.',
+  '图片下载失败，请重新发送后再试。': 'The image download failed. Send it again.',
+  '暂不支持该图片格式，请发送 JPEG、PNG、WebP 或 GIF 图片。': 'This image format is unsupported. Send a JPEG, PNG, WebP, or GIF image.',
+  '消息处理失败，请稍后重试。': 'Message processing failed. Try again later.',
   '微信服务没有返回有效的账号列表': 'WeChat did not return a valid account list',
   '尚未绑定微信': 'No WeChat account connected yet',
   '用于把微信机器人绑定到 DeepSeek Harness 的一次性二维码': 'One-time QR code for connecting a WeChat bot to DeepSeek Harness',
@@ -486,9 +646,7 @@ function channelName(value) {
 }
 
 function translateDynamic(text) {
-  let match = /^已连接 (\d+) · 未连接 (\d+) · 未配置 (\d+)$/.exec(text);
-  if (match) return `${match[1]} connected · ${match[2]} offline · ${match[3]} not configured`;
-  match = /^(\d+) \/ (\d+) 在线$/.exec(text);
+  let match = /^(\d+) \/ (\d+) 在线$/.exec(text);
   if (match) return `${match[1]}/${match[2]} online`;
   match = /^已接入 (\d+) 个机器人，其中 (\d+) 个在线$/.exec(text);
   if (match) return `${match[2]} of ${match[1]} bots online`;
@@ -508,16 +666,26 @@ function translateDynamic(text) {
   if (match) return `Remove “${match[1]}” from DeepSeek Harness?`;
   match = /^从 DeepSeek Harness 移除(.+)$/.exec(text);
   if (match) return `Remove ${match[1]} from DeepSeek Harness`;
-  match = /^用于修复(.+)卡片按钮的一次性授权二维码$/.exec(text);
-  if (match) return `One-time QR code for repairing card buttons for ${match[1]}`;
-  match = /^正在修复「(.+)」$/.exec(text);
-  if (match) return `Repairing “${match[1]}”`;
-  match = /^修复(.+)的卡片按钮$/.exec(text);
-  if (match) return `Repair card buttons for ${match[1]}`;
-  match = /^(.+)的修复二维码已生成，请使用飞书扫码。$/.exec(text);
-  if (match) return `Repair QR code generated for ${match[1]}. Scan it with Feishu.`;
-  match = /^(.+)的卡片按钮已修复。$/.exec(text);
-  if (match) return `Card buttons repaired for ${match[1]}.`;
+  match = /^(.+)的飞书授权流程$/.exec(text);
+  if (match) return `Feishu authorization flow for ${match[1]}`;
+  match = /^用于为(.+)补全权限与回调的一次性授权二维码$/.exec(text);
+  if (match) return `One-time QR code for completing permissions and the callback for ${match[1]}`;
+  match = /^用于为(.+)开通群消息权限的一次性授权二维码$/.exec(text);
+  if (match) return `One-time QR code for granting group-message permission to ${match[1]}`;
+  match = /^正在为「(.+)」补全权限与回调$/.exec(text);
+  if (match) return `Completing permissions and the callback for “${match[1]}”`;
+  match = /^正在为「(.+)」开通群消息权限$/.exec(text);
+  if (match) return `Granting group-message permission to “${match[1]}”`;
+  match = /^为(.+)补全权限与回调$/.exec(text);
+  if (match) return `Complete permissions and the callback for ${match[1]}`;
+  match = /^(.+)的权限补全二维码已生成，请使用飞书扫码。$/.exec(text);
+  if (match) return `Permission-completion QR code generated for ${match[1]}. Scan it with Feishu.`;
+  match = /^(.+)的群消息权限二维码已生成，请使用飞书确认。$/.exec(text);
+  if (match) return `Group-message permission QR code generated for ${match[1]}. Confirm it with Feishu.`;
+  match = /^(.+)的权限与回调已补全。$/.exec(text);
+  if (match) return `Permissions and the callback completed for ${match[1]}.`;
+  match = /^(.+)已开通群消息权限，并启用“响应所有群消息”。$/.exec(text);
+  if (match) return `${match[1]} now has group-message permission and “Respond to all group messages” is enabled.`;
   match = /^(检查连接|重试连接)(.+)$/.exec(text);
   if (match) return `${localizeText(match[1])} ${match[2]}`;
   match = /^移除(.+)$/.exec(text);
@@ -528,6 +696,12 @@ function translateDynamic(text) {
   }
   match = /^二维码剩余 (.+)$/.exec(text);
   if (match) return `QR code expires in ${match[1]}`;
+  match = /^最近一条消息处理失败：(.+)$/.exec(text);
+  if (match) return `Latest message failed: ${localizeText(match[1])}`;
+  match = /^图片下载失败（HTTP (.+)），请重新发送后再试。$/.exec(text);
+  if (match) return `The image download failed (HTTP ${match[1]}). Send it again.`;
+  match = /^一次最多只能处理 (\d+) 张图片。$/.exec(text);
+  if (match) return `A message can contain at most ${match[1]} images.`;
   match = /^状态刷新失败：(.+)$/.exec(text);
   if (match) return `Status refresh failed: ${match[1]}`;
   match = /^状态自动刷新失败：(.+)$/.exec(text);

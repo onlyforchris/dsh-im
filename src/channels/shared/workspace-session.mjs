@@ -87,7 +87,13 @@ function extractPlainText(text, content) {
 
 /**
  * Resolve, persist, and ask through a session that belongs to the bot's
- * current workspace. Runs optional `im/pre-ask` gate before Harness.
+ * current workspace. A concurrent workspace switch invalidates the scoped
+ * session and retries before any prompt is sent to the stale session.
+ *
+ * Fork personalization: runs the optional `im/pre-ask` gate before Harness
+ * and tags the prompt with the source channel label when provided. Both are
+ * no-ops when the caller does not supply `channelLabel` or a pre-ask runner,
+ * so upstream callers keep their original behavior.
  */
 export async function askInWorkspaceSession({
   harness,
@@ -148,9 +154,23 @@ export async function askInWorkspaceSession({
         return { sessionId, session };
       });
       if (!binding) continue;
+      const artifacts = [];
+      const originalOnArtifact = typeof askOptions === 'object'
+        && typeof askOptions?.onArtifact === 'function'
+        ? askOptions.onArtifact
+        : null;
+      const artifactOptions = typeof askOptions === 'number'
+        ? { timeoutMs: askOptions }
+        : { ...askOptions };
+      artifactOptions.onArtifact = async (artifact) => {
+        artifacts.push(artifact);
+        await originalOnArtifact?.(artifact);
+      };
+      const answer = await binding.session.ask(prompt.content ?? prompt.text, artifactOptions);
       return {
         sessionId: binding.sessionId,
-        answer: await binding.session.ask(prompt.content ?? prompt.text, askOptions),
+        answer,
+        ...(artifacts.length > 0 ? { artifacts } : {}),
       };
     } catch (error) {
       if (error?.code !== WORKSPACE_SESSION_STALE) throw error;

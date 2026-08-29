@@ -23,6 +23,17 @@ test('PluginConfigStore persists non-secret onboarding facts', async () => {
   assert.doesNotMatch(raw, /must-not-be-written/);
   assert.equal((await stat(path)).mode & 0o777, 0o600);
   assert.equal((await new PluginConfigStore(path).load()).get().appId, 'cli_test');
+  assert.equal(store.get().groupResponseMode, 'mention');
+  assert.equal(store.get().groupMessagePermissionGranted, false);
+
+  await store.save({
+    ...store.get(),
+    groupResponseMode: 'all',
+    groupMessagePermissionGranted: true,
+  });
+  const reloaded = (await new PluginConfigStore(path).load()).get();
+  assert.equal(reloaded.groupResponseMode, 'all');
+  assert.equal(reloaded.groupMessagePermissionGranted, true);
 
   await store.clear();
   assert.equal(store.get(), null);
@@ -66,6 +77,8 @@ test('PluginConfigStore migrates a v1 bot atomically without moving its credenti
   assert.deepEqual(migrated.bots[0].ownerOpenIds, ['ou_legacy']);
   assert.equal(store.get().ownerOpenId, 'ou_legacy');
   assert.equal(store.list()[0].appId, 'cli_legacy');
+  assert.equal(store.list()[0].groupResponseMode, 'mention');
+  assert.equal(store.list()[0].groupMessagePermissionGranted, false);
 });
 
 test('PluginConfigStore rejects an invalid or duplicate v2 document without dropping entries', async () => {

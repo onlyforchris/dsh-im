@@ -6,12 +6,16 @@
  * must never be returned by any endpoint on this channel.
  */
 
+import { normalizeAgentPresetCatalog, normalizeAgentPresetId } from "../../agent-preset.js";
+import { normalizeLastMessageError } from "../../last-message-error.js";
+
 export const FEISHU_RPC_CHANNEL = "/feishu";
 
 export const FEISHU_ENDPOINTS = Object.freeze({
   status: "connection.status",
   beginProvisioning: "provision.begin",
   beginCallbackRepair: "bot.callback-repair.begin",
+  beginGroupMessagePermission: "bot.group-message-permission.begin",
   pollProvisioning: "provision.poll",
   cancelProvisioning: "provision.cancel",
   bindCredentials: "bot.bind-credentials",
@@ -19,6 +23,8 @@ export const FEISHU_ENDPOINTS = Object.freeze({
   disconnectBot: "bot.disconnect",
   deleteBot: "bot.delete",
   setWorkspace: "bot.workspace.set",
+  setAgentPreset: "bot.preset.set",
+  setGroupResponseMode: "bot.group-response-mode.set",
   // Kept for rolling upgrades. The multi-bot UI never calls these endpoints.
   testConnection: "connection.test",
   disconnect: "connection.disconnect",
@@ -27,6 +33,7 @@ export const FEISHU_ENDPOINTS = Object.freeze({
 export const FEISHU_REGISTRATION_OPERATIONS = Object.freeze({
   PROVISION: "provision",
   CALLBACK_REPAIR: "callback_repair",
+  GROUP_MESSAGE_PERMISSION: "group_message_permission",
 });
 
 const CONNECTION_STATES = new Set([
@@ -67,6 +74,10 @@ function optionalTimestamp(value) {
   return undefined;
 }
 
+export function normalizeGroupResponseMode(value) {
+  return value === "all" ? "all" : "mention";
+}
+
 function clamp(value, min, max, fallback) {
   return typeof value === "number" && Number.isFinite(value)
     ? Math.min(max, Math.max(min, value))
@@ -74,9 +85,18 @@ function clamp(value, min, max, fallback) {
 }
 
 function normalizeRegistrationOperation(value) {
-  return value === FEISHU_REGISTRATION_OPERATIONS.CALLBACK_REPAIR
-    ? FEISHU_REGISTRATION_OPERATIONS.CALLBACK_REPAIR
-    : FEISHU_REGISTRATION_OPERATIONS.PROVISION;
+  if (value === FEISHU_REGISTRATION_OPERATIONS.CALLBACK_REPAIR) {
+    return FEISHU_REGISTRATION_OPERATIONS.CALLBACK_REPAIR;
+  }
+  if (value === FEISHU_REGISTRATION_OPERATIONS.GROUP_MESSAGE_PERMISSION) {
+    return FEISHU_REGISTRATION_OPERATIONS.GROUP_MESSAGE_PERMISSION;
+  }
+  return FEISHU_REGISTRATION_OPERATIONS.PROVISION;
+}
+
+function isTargetedAppUpdate(operation) {
+  return operation === FEISHU_REGISTRATION_OPERATIONS.CALLBACK_REPAIR
+    || operation === FEISHU_REGISTRATION_OPERATIONS.GROUP_MESSAGE_PERMISSION;
 }
 
 export function unwrapRpcResult(result) {
@@ -109,8 +129,8 @@ export function normalizeProvisioning(value, now = Date.now()) {
   const expireIn = clamp(source.expireIn, 1, 60 * 60, 5 * 60);
   const operation = normalizeRegistrationOperation(source.operation);
   const botId = optionalString(source.botId);
-  if (operation === FEISHU_REGISTRATION_OPERATIONS.CALLBACK_REPAIR && !botId) {
-    throw new Error("飞书服务返回的修复信息缺少 botId");
+  if (isTargetedAppUpdate(operation) && !botId) {
+    throw new Error("飞书服务返回的应用更新信息缺少 botId");
   }
   return {
     attemptId,
@@ -182,8 +202,12 @@ export function normalizeBotConnection(value, fallbackBotId) {
     connected,
     configured: value.configured !== false,
     workspace: optionalString(value.workspace)?.slice(0, 4_096) ?? "",
+    agentPreset: normalizeAgentPresetId(value.agentPreset),
+    groupResponseMode: normalizeGroupResponseMode(value.groupResponseMode),
+    groupMessagePermissionGranted: value.groupMessagePermissionGranted === true,
     bot: normalizeBot(value.bot),
     health: normalizeHealth(value.health, connected),
+    lastMessageError: normalizeLastMessageError(value.lastMessageError),
     error: normalizeError(value.error),
   };
 }
@@ -204,6 +228,7 @@ export function normalizeBotsSnapshot(value) {
       configured: true,
       bot: value.bot,
       health: value.health,
+      lastMessageError: value.lastMessageError,
       error: value.error,
     }];
   }
@@ -236,6 +261,7 @@ export function normalizeBotsSnapshot(value) {
       ? normalizeProvisioning(value.provisioning)
       : undefined,
     error: normalizeError(value.error),
+    agentPresetCatalog: normalizeAgentPresetCatalog(value.agentPresetCatalog),
   };
 }
 

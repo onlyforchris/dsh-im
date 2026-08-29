@@ -1,6 +1,8 @@
 import { RegistrationManager } from './registration-manager.mjs';
 
 export const CARD_ACTION_CALLBACK = 'card.action.trigger';
+export const FEISHU_MESSAGE_READ_SCOPE = 'im:message:readonly';
+export const FEISHU_RESOURCE_SCOPE = 'im:resource';
 export const CALLBACK_REPAIR_OPERATION = 'callback_repair';
 
 function accountsDomain(domain) {
@@ -17,12 +19,17 @@ function launcherDomain(domain) {
  * never fall back to the create-only flow. This catches regressions such as a
  * literal `{{client_id}}` before the broken URL reaches the browser.
  */
-export function assertCallbackRepairUrl(value, expectedAppId, domain = 'feishu') {
+export function assertTargetedAppUpdateUrl(
+  value,
+  expectedAppId,
+  domain = 'feishu',
+  operationLabel = 'Feishu app update',
+) {
   let url;
   try {
     url = new URL(value);
   } catch {
-    throw new Error('Feishu callback repair returned an invalid verification URL');
+    throw new Error(`${operationLabel} returned an invalid verification URL`);
   }
   const supportedDomain = domain === 'feishu' || domain === 'lark';
   const clientIds = url.searchParams.getAll('clientID');
@@ -49,16 +56,27 @@ export function assertCallbackRepairUrl(value, expectedAppId, domain = 'feishu')
     || addons.length !== 1
     || !addons[0]?.trim()
     || hasPlaceholder) {
-    throw new Error('Feishu callback repair returned an unsafe verification URL');
+    throw new Error(`${operationLabel} returned an unsafe verification URL`);
   }
   return url.toString();
+}
+
+export function assertCallbackRepairUrl(value, expectedAppId, domain = 'feishu') {
+  return assertTargetedAppUpdateUrl(
+    value,
+    expectedAppId,
+    domain,
+    'Feishu callback repair',
+  );
 }
 
 /**
  * One targeted update attempt for an existing Feishu app.  It intentionally
  * shares RegistrationManager's polling/state implementation while fixing the
- * update manifest in one place so callers cannot accidentally add scopes,
- * events, presets, or createOnly.
+ * update manifest in one place so callers can add only the card callback, the
+ * message-read scope needed to download user-sent media, and the resource
+ * scope needed to upload bot-sent images/files, without adding unrelated
+ * scopes, events, presets, or createOnly.
  */
 export class CallbackRepairManager {
   #manager;
@@ -92,6 +110,7 @@ export class CallbackRepairManager {
       appId: this.#appId,
       addons: {
         preset: false,
+        scopes: { tenant: [FEISHU_MESSAGE_READ_SCOPE, FEISHU_RESOURCE_SCOPE] },
         callbacks: { items: [CARD_ACTION_CALLBACK] },
       },
     });

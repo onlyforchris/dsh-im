@@ -9,6 +9,10 @@ import {
 } from 'node:fs/promises';
 import { dirname, isAbsolute, resolve } from 'node:path';
 
+import {
+  normalizeAgentPresetCatalog,
+  validateAgentPresetId,
+} from './agent-preset.mjs';
 import { CONNECTION_TEST_STATE_IDENTITY } from './connection-test.mjs';
 import { WORKSPACE_SESSION_STALE } from './workspace-session.mjs';
 
@@ -49,7 +53,22 @@ function normalizeDocument(value) {
       || typeof workspace !== 'string' || !isAbsolute(workspace)) return null;
     workspaces[botId] = resolve(workspace);
   }
-  return { version: 1, workspaces };
+  let agentPresets = {};
+  if (value.agentPresets !== undefined) {
+    if (!value.agentPresets || typeof value.agentPresets !== 'object'
+      || Array.isArray(value.agentPresets)) return null;
+    for (const [botId, agentPreset] of Object.entries(value.agentPresets)) {
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(botId)) return null;
+      try {
+        const normalized = validateAgentPresetId(agentPreset);
+        if (!normalized) return null;
+        agentPresets[botId] = normalized;
+      } catch {
+        return null;
+      }
+    }
+  }
+  return { version: 1, workspaces, agentPresets };
 }
 
 export async function validateWorkspacePath(value) {
@@ -79,6 +98,7 @@ export class BotWorkspaceStore {
   #path;
   #defaultWorkspace;
   #workspaces = {};
+  #agentPresets = {};
   #generations = new Map();
   #nextGeneration = 1;
   #incarnations = new Map();
@@ -100,9 +120,11 @@ export class BotWorkspaceStore {
       const normalized = normalizeDocument(JSON.parse(await readFile(this.#path, 'utf8')));
       if (!normalized) throw new Error('dsh-im workspace config is invalid');
       this.#workspaces = normalized.workspaces;
+      this.#agentPresets = normalized.agentPresets;
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
       this.#workspaces = {};
+      this.#agentPresets = {};
     }
     this.#generations.clear();
     this.#nextGeneration = 1;
@@ -130,6 +152,10 @@ export class BotWorkspaceStore {
     return this.#workspaces[botIdOf(botId)] ?? this.#defaultWorkspace;
   }
 
+  agentPresetFor(botId) {
+    return this.#agentPresets[botIdOf(botId)] ?? null;
+  }
+
   generationFor(botId) {
     return this.#generations.get(botIdOf(botId)) ?? null;
   }
@@ -148,18 +174,24 @@ export class BotWorkspaceStore {
     }
   }
 
-  async ensure(botId, { workspace = this.#defaultWorkspace } = {}) {
+  async ensure(botId, { workspace = this.#defaultWorkspace, defaultAgentPreset } = {}) {
     const id = botIdOf(botId);
     const initialWorkspace = resolve(workspace);
     return this.#enqueue(id, async () => {
       if (!this.#workspaces[id]) {
+        const agentPreset = validateAgentPresetId(defaultAgentPreset);
+        const hadAgentPreset = Object.hasOwn(this.#agentPresets, id);
+        const previousAgentPreset = this.#agentPresets[id];
         this.#workspaces[id] = initialWorkspace;
+        if (agentPreset) this.#agentPresets[id] = agentPreset;
         this.#generations.set(id, this.#freshGeneration());
         this.#incarnations.set(id, this.#freshIncarnation());
         try {
           await this.#persist();
         } catch (error) {
           delete this.#workspaces[id];
+          if (hadAgentPreset) this.#agentPresets[id] = previousAgentPreset;
+          else delete this.#agentPresets[id];
           this.#generations.delete(id);
           this.#incarnations.delete(id);
           throw error;
@@ -204,6 +236,37 @@ export class BotWorkspaceStore {
         throw error;
       }
       return workspace;
+    });
+  }
+
+  async setAgentPreset(botId, value, { incarnation } = {}) {
+    const id = botIdOf(botId);
+    if (!this.has(id)
+      || (incarnation !== undefined && incarnation !== this.incarnationFor(id))) {
+      const error = new Error('找不到要修改的机器人。');
+      error.code = 'workspace-bot-not-found';
+      throw error;
+    }
+    const agentPreset = validateAgentPresetId(value);
+    return this.#enqueue(id, async () => {
+      if (!this.has(id)
+        || (incarnation !== undefined && incarnation !== this.incarnationFor(id))) {
+        const error = new Error('找不到要修改的机器人。');
+        error.code = 'workspace-bot-not-found';
+        throw error;
+      }
+      const previous = this.#agentPresets[id] ?? null;
+      if (previous === agentPreset) return agentPreset;
+      if (agentPreset) this.#agentPresets[id] = agentPreset;
+      else delete this.#agentPresets[id];
+      try {
+        await this.#persist();
+      } catch (error) {
+        if (previous) this.#agentPresets[id] = previous;
+        else delete this.#agentPresets[id];
+        throw error;
+      }
+      return agentPreset;
     });
   }
 
@@ -353,7 +416,11 @@ export class BotWorkspaceStore {
 
   async reconcile(activeBotIds) {
     const active = new Set([...activeBotIds].map(botIdOf));
-    const candidates = new Set([...Object.keys(this.#workspaces), ...this.#dirtyRemovals]);
+    const candidates = new Set([
+      ...Object.keys(this.#workspaces),
+      ...Object.keys(this.#agentPresets),
+      ...this.#dirtyRemovals,
+    ]);
     for (const botId of candidates) {
       if (!active.has(botId)) await this.remove(botId);
     }
@@ -364,7 +431,11 @@ export class BotWorkspaceStore {
     return {
       ...status,
       bots: status.bots.map((bot) => bot?.botId
-        ? { ...bot, workspace: this.workspaceFor(bot.botId) }
+        ? {
+          ...bot,
+          workspace: this.workspaceFor(bot.botId),
+          agentPreset: this.agentPresetFor(bot.botId),
+        }
         : bot),
     };
   }
@@ -392,8 +463,10 @@ export class BotWorkspaceStore {
 
   async #retireCurrentIncarnation(id) {
     const hadWorkspace = Object.hasOwn(this.#workspaces, id);
-    const needsCleanup = hadWorkspace || this.#dirtyRemovals.has(id);
+    const hadPreset = Object.hasOwn(this.#agentPresets, id);
+    const needsCleanup = hadWorkspace || hadPreset || this.#dirtyRemovals.has(id);
     delete this.#workspaces[id];
+    delete this.#agentPresets[id];
     this.#generations.delete(id);
     this.#incarnations.delete(id);
     if (!needsCleanup) return {
@@ -425,6 +498,9 @@ export class BotWorkspaceStore {
 
   async #persist() {
     const document = { version: 1, workspaces: this.#workspaces };
+    if (Object.keys(this.#agentPresets).length > 0) {
+      document.agentPresets = this.#agentPresets;
+    }
     await mkdir(dirname(this.#path), { recursive: true, mode: 0o700 });
     const temporary = `${this.#path}.tmp`;
     await writeFile(temporary, `${JSON.stringify(document, null, 2)}\n`, {
@@ -436,7 +512,8 @@ export class BotWorkspaceStore {
   }
 
   async #persistCurrentDocument() {
-    if (Object.keys(this.#workspaces).length > 0) {
+    if (Object.keys(this.#workspaces).length > 0
+      || Object.keys(this.#agentPresets).length > 0) {
       await this.#persist();
       return;
     }
@@ -450,10 +527,42 @@ export class BotWorkspaceStore {
   }
 }
 
-function decorateResult(workspaces, result) {
+function resolveAgentPresetCatalog(catalog) {
+  if (!catalog) return null;
+  const value = typeof catalog === 'function' ? catalog() : catalog;
+  return value && typeof value.then === 'function'
+    ? value.then(normalizeAgentPresetCatalog)
+    : normalizeAgentPresetCatalog(value);
+}
+
+function unavailableAgentPreset() {
+  const error = new Error('Agent Preset 不存在或不可用。');
+  error.code = 'agent-preset-unavailable';
+  return error;
+}
+
+function assertCurrentBotScope(isCurrentScope) {
+  if (isCurrentScope()) return;
+  const error = new Error('找不到要修改的机器人。');
+  error.code = 'workspace-bot-not-found';
+  throw error;
+}
+
+function decorateResult(workspaces, result, catalog) {
+  const decorate = (value) => {
+    const decorated = workspaces.decorateStatus(value);
+    if (!catalog || !decorated || typeof decorated !== 'object') return decorated;
+    const attachCatalog = (agentPresetCatalog) => (
+      agentPresetCatalog ? { ...decorated, agentPresetCatalog } : decorated
+    );
+    const agentPresetCatalog = resolveAgentPresetCatalog(catalog);
+    return agentPresetCatalog && typeof agentPresetCatalog.then === 'function'
+      ? agentPresetCatalog.then(attachCatalog)
+      : attachCatalog(agentPresetCatalog);
+  };
   return result && typeof result.then === 'function'
-    ? result.then((value) => workspaces.decorateStatus(value))
-    : workspaces.decorateStatus(result);
+    ? result.then(decorate)
+    : decorate(result);
 }
 
 function targetStatus(controller) {
@@ -484,14 +593,74 @@ export function observeBotWorkspaceRemovals(
   });
 }
 
-export function createBotWorkspaceScope(harness, { botId, workspaces, state }) {
+export function createBotWorkspaceScope(
+  harness,
+  { botId, workspaces, state, agentPresetCatalog } = {},
+) {
   if (!harness || !workspaces || !state) throw new TypeError('harness, workspaces, and state are required');
   const incarnation = workspaces.incarnationFor(botId);
   const isCurrentScope = () => workspaces.has(botId)
     && workspaces.incarnationFor(botId) === incarnation;
+  const presetSettings = async (catalog = agentPresetCatalog) => {
+    let normalizedCatalog;
+    try {
+      normalizedCatalog = await resolveAgentPresetCatalog(catalog)
+        ?? normalizeAgentPresetCatalog(null);
+    } catch (error) {
+      assertCurrentBotScope(isCurrentScope);
+      throw error;
+    }
+    assertCurrentBotScope(isCurrentScope);
+    return {
+      agentPreset: workspaces.agentPresetFor(botId),
+      agentPresetCatalog: normalizedCatalog,
+    };
+  };
   const sessionGenerations = new Map();
   const scopedHarness = new Proxy(harness, {
     get(target, property) {
+      if (property === 'agentPresetSettings') {
+        return async (options = {}) => {
+          options?.signal?.throwIfAborted();
+          assertCurrentBotScope(isCurrentScope);
+          const settings = await presetSettings();
+          options?.signal?.throwIfAborted();
+          return settings;
+        };
+      }
+      if (property === 'updateAgentPreset') {
+        return async (value, options = {}) => {
+          options?.signal?.throwIfAborted();
+          assertCurrentBotScope(isCurrentScope);
+          const agentPreset = value === '--default' ? null : validateAgentPresetId(value);
+          let catalog = null;
+          if (agentPreset) {
+            ({ agentPresetCatalog: catalog } = await presetSettings());
+            options?.signal?.throwIfAborted();
+            if (!catalog.items.some((item) => item.id === agentPreset)) {
+              throw unavailableAgentPreset();
+            }
+          }
+          await workspaces.setAgentPreset(botId, agentPreset, { incarnation });
+          assertCurrentBotScope(isCurrentScope);
+          if (catalog) {
+            return {
+              agentPreset: workspaces.agentPresetFor(botId),
+              agentPresetCatalog: catalog,
+            };
+          }
+          try {
+            return await presetSettings();
+          } catch (error) {
+            if (error?.code === 'workspace-bot-not-found') throw error;
+            assertCurrentBotScope(isCurrentScope);
+            return {
+              agentPreset: workspaces.agentPresetFor(botId),
+              agentPresetCatalog: normalizeAgentPresetCatalog(null),
+            };
+          }
+        };
+      }
       if (property === 'currentWorkspace') {
         return () => {
           if (!isCurrentScope()) {
@@ -608,9 +777,11 @@ export function createBotWorkspaceScope(harness, { botId, workspaces, state }) {
             throw error;
           }
           const generation = workspaces.generationFor(botId);
+          const agentPreset = workspaces.agentPresetFor(botId);
           const sessionId = await target.createSession({
             ...options,
             workspace: workspaces.workspaceFor(botId),
+            ...(agentPreset == null ? {} : { agentPreset }),
           });
           sessionGenerations.set(sessionId, generation);
           return sessionId;
@@ -662,6 +833,9 @@ export function createBotWorkspaceScope(harness, { botId, workspaces, state }) {
             },
             models(...args) {
               return invokeCurrentSession('getSessionModels', args, 'model listing');
+            },
+            readHistory(...args) {
+              return invokeCurrentSession('readSessionHistory', args, 'history read');
             },
             selectModel(...args) {
               return invokeCurrentSession('selectSessionModel', args, 'model selection');
@@ -765,7 +939,7 @@ export function createBotScopedHarness(harness, options) {
   return createBotWorkspaceScope(harness, options).harness;
 }
 
-export function createWorkspaceAwareController(controller, { workspaces, stateFor }) {
+export function createWorkspaceAwareController(controller, { workspaces, stateFor, agentPresetCatalog } = {}) {
   if (!controller || !workspaces || typeof stateFor !== 'function') {
     throw new TypeError('controller, workspaces, and stateFor are required');
   }
@@ -778,6 +952,7 @@ export function createWorkspaceAwareController(controller, { workspaces, stateFo
       if (transitions.get(botId) === current) transitions.delete(botId);
     });
   };
+  const decorate = (value) => decorateResult(workspaces, value, agentPresetCatalog);
   const updateWorkspace = (botId, workspace) => {
     // Capture at API invocation, before even waiting for an older outer
     // transition. A queued request still belongs to the incarnation that the
@@ -795,7 +970,32 @@ export function createWorkspaceAwareController(controller, { workspaces, stateFo
         clearSessions: () => state.clearSessions(),
         incarnation,
       });
-      return workspaces.decorateStatus(await controller.status());
+      return decorate(await controller.status());
+    });
+  };
+  const updateAgentPreset = (botId, agentPreset) => {
+    const incarnation = workspaces.incarnationFor(botId);
+    const normalizedAgentPreset = validateAgentPresetId(agentPreset);
+    return withBotTransition(botId, async () => {
+      const snapshot = await controller.status();
+      if (!snapshot?.bots?.some((bot) => bot?.botId === botId)) {
+        const error = new Error('找不到要修改的机器人。');
+        error.code = 'workspace-bot-not-found';
+        throw error;
+      }
+      const catalog = normalizedAgentPreset && agentPresetCatalog
+        ? await resolveAgentPresetCatalog(agentPresetCatalog)
+        : null;
+      if (normalizedAgentPreset && agentPresetCatalog
+        && !catalog?.items.some((item) => item.id === normalizedAgentPreset)) {
+        throw unavailableAgentPreset();
+      }
+      await workspaces.setAgentPreset(botId, normalizedAgentPreset, { incarnation });
+      return decorateResult(
+        workspaces,
+        await controller.status(),
+        catalog ?? agentPresetCatalog,
+      );
     });
   };
   const deleteWithWorkspace = (botId, invokeDelete) => withBotTransition(botId, async () => {
@@ -822,7 +1022,7 @@ export function createWorkspaceAwareController(controller, { workspaces, stateFo
     try {
       const result = await invokeDelete();
       await workspaces.finishRemoval(removal);
-      return workspaces.decorateStatus(result);
+      return decorate(result);
     } catch (error) {
       const after = await targetStatus(controller).catch(() => null);
       const knownAbsent = Array.isArray(after?.bots)
@@ -836,6 +1036,7 @@ export function createWorkspaceAwareController(controller, { workspaces, stateFo
   return new Proxy(controller, {
     get(target, property) {
       if (property === 'updateWorkspace') return updateWorkspace;
+      if (property === 'updateAgentPreset') return updateAgentPreset;
       const value = Reflect.get(target, property, target);
       if (typeof value !== 'function') return value;
       if (property === 'deleteBot') {
@@ -848,11 +1049,11 @@ export function createWorkspaceAwareController(controller, { workspaces, stateFo
         return async (...args) => {
           const before = await target.status();
           const botId = before?.bots?.[0]?.botId;
-          if (!botId) return decorateResult(workspaces, value.apply(target, args));
+          if (!botId) return decorate(value.apply(target, args));
           return deleteWithWorkspace(botId, () => value.apply(target, args));
         };
       }
-      return (...args) => decorateResult(workspaces, value.apply(target, args));
+      return (...args) => decorate(value.apply(target, args));
     },
   });
 }

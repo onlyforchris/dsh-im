@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import test from 'node:test';
 
 import { WeixinApiError } from '../../../src/channels/weixin/weixin-api.mjs';
-import { WeixinRuntime } from '../../../src/channels/weixin/weixin-runtime.mjs';
+import {
+  orderWeixinMessages,
+  WeixinRuntime,
+} from '../../../src/channels/weixin/weixin-runtime.mjs';
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
@@ -53,7 +53,91 @@ function abortable(promise, signal) {
   });
 }
 
-test('runtime sends a connection test with the remembered Weixin reply context', async () => {
+test('Weixin orders one update batch by sequence instead of its unrelated message id', () => {
+  const first = { seq: 101, message_id: 900 };
+  const second = { seq: '102', message_id: 100 };
+  const third = { seq: 103, message_id: 500 };
+  assert.deepEqual(orderWeixinMessages([third, first, second]), [first, second, third]);
+
+  const earlier = { create_time_ms: 1_000 };
+  const later = { create_time_ms: 2_000 };
+  assert.deepEqual(orderWeixinMessages([later, earlier]), [earlier, later]);
+
+  const withoutOrder = { client_id: 'local-only' };
+  assert.deepEqual(orderWeixinMessages([third, withoutOrder, first]), [third, withoutOrder, first]);
+  assert.deepEqual(orderWeixinMessages(null), []);
+});
+
+test('runtime preserves rapid batch command order when getUpdates returns newest first', async () => {
+  const sends = [];
+  const seen = new Set();
+  let polls = 0;
+  const stopped = deferred();
+  const inbound = (seq, messageId, text) => ({
+    seq,
+    message_id: messageId,
+    message_type: 1,
+    from_user_id: 'owner',
+    context_token: `context-${messageId}`,
+    item_list: [{ type: 1, text_item: { text } }],
+  });
+  const runtime = new WeixinRuntime({
+    api: {
+      notifyStart: async () => {},
+      notifyStop: async () => {},
+      sendText: async ({ text }) => sends.push(text),
+      getUpdates: async ({ signal }) => {
+        polls += 1;
+        if (polls === 1) {
+          return {
+            ret: 0,
+            get_updates_buf: 'ordered-batch',
+            msgs: [
+              inbound(303, 200, '/cancel'),
+              inbound(302, 100, '这条内容必须被取消'),
+              inbound(301, 900, '/batch'),
+            ],
+          };
+        }
+        return abortable(stopped.promise, signal);
+      },
+    },
+    config: {
+      botId: 'wx_ordered_batch',
+      baseUrl: 'https://ilinkai.weixin.qq.com/',
+      ownerUserId: 'owner',
+    },
+    token: 'bot-token',
+    harness: {
+      ensureRunning: async () => true,
+      ask: async () => assert.fail('cancelled batch content must not reach Harness'),
+    },
+    state: {
+      getUpdatesBuf: () => '',
+      setGetUpdatesBuf: async () => {},
+      hasSeen: (id) => seen.has(id),
+      markSeen: async (id) => seen.add(id),
+      sessionFor: () => null,
+      setSession: async () => {},
+      clearSession: async () => {},
+    },
+    logger: { warn() {}, error() {} },
+  });
+
+  await runtime.start();
+  try {
+    await eventually(
+      () => sends.some((text) => /丢弃 1 条消息/.test(text)),
+      'the reversed provider batch should be processed in sequence order',
+    );
+    assert.equal(sends.some((text) => /仅支持文字|没有正在进行/.test(text)), false);
+  } finally {
+    await runtime.stop();
+    stopped.resolve({ ret: 0, msgs: [] });
+  }
+});
+
+test('runtime sends a connection test to the bound Weixin owner without reply context', async () => {
   const sends = [];
   const runtime = new WeixinRuntime({
     api: {
@@ -71,75 +155,98 @@ test('runtime sends a connection test with the remembered Weixin reply context',
     },
     token: 'bot-token',
     harness: { ensureRunning: async () => true },
-    state: {
-      getUpdatesBuf: () => '',
-      connectionTestTarget: () => ({
-        toUserId: 'owner-user', contextToken: 'context-owner', runId: 'run-owner',
-      }),
-    },
+    state: { getUpdatesBuf: () => '' },
   });
 
   await runtime.start();
-  assert.deepEqual(await runtime.sendConnectionTest('连接测试'), { sent: true, mode: 'text' });
+  assert.deepEqual(await runtime.sendConnectionTest('连接测试'), { sent: true });
   assert.equal(sends.length, 1);
   assert.equal(sends[0].toUserId, 'owner-user');
   assert.equal(sends[0].text, '连接测试');
-  assert.equal(sends[0].contextToken, 'context-owner');
-  assert.equal(sends[0].runId, 'run-owner');
+  assert.equal(sends[0].contextToken, undefined);
+  assert.equal(sends[0].runId, undefined);
   await runtime.stop();
 });
 
-test('runtime falls back to text for a local notification image', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-weixin-runtime-image-'));
-  const imagePath = join(dir, 'digest.png');
-  await writeFile(imagePath, Buffer.from('png'));
-  const sends = [];
+test('runtime cancels typing before notifying iLink that it stopped', async () => {
+  const events = [];
+  const seen = new Set();
+  let polls = 0;
   const runtime = new WeixinRuntime({
     api: {
-      notifyStart: async () => {},
-      notifyStop: async () => {},
-      sendImage: async () => assert.fail('known-broken image upload must stay disabled'),
-      sendText: async (request) => {
-        sends.push(request);
-        return { accepted: true, ret: 0, errcode: null };
+      notifyStart: async () => events.push({ type: 'notify-start' }),
+      notifyStop: async () => events.push({ type: 'notify-stop' }),
+      getConfig: async () => ({ typingTicket: 'typing-ticket' }),
+      sendTyping: async ({ status, signal }) => events.push({ type: 'typing', status, signal }),
+      sendText: async () => assert.fail('an aborted turn must not send a reply'),
+      getUpdates: async ({ signal }) => {
+        polls += 1;
+        if (polls === 1) {
+          return {
+            ret: 0,
+            msgs: [{
+              seq: 1,
+              message_id: 'runtime-typing-stop',
+              message_type: 1,
+              from_user_id: 'owner-user',
+              context_token: 'runtime-typing-context',
+              item_list: [{ type: 1, text_item: { text: '执行长任务' } }],
+            }],
+          };
+        }
+        return new Promise((_resolve, reject) => {
+          const onAbort = () => reject(signal.reason);
+          if (signal.aborted) onAbort();
+          else signal.addEventListener('abort', onAbort, { once: true });
+        });
       },
-      getUpdates: async ({ signal }) => new Promise((_resolve, reject) => {
-        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    },
+    config: {
+      botId: 'wx_typing_stop',
+      baseUrl: 'https://ilinkai.weixin.qq.com/',
+      ownerUserId: 'owner-user',
+    },
+    token: 'bot-token',
+    harness: {
+      ensureRunning: async () => true,
+      sessionExists: async () => true,
+      ask: async (_sessionId, _text, options) => new Promise((_resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
       }),
     },
-    config: { botId: 'wx_owner', baseUrl: 'https://ilinkai.weixin.qq.com/', ownerUserId: 'owner-user' },
-    token: 'bot-token',
-    harness: { ensureRunning: async () => true },
     state: {
       getUpdatesBuf: () => '',
-      connectionTestTarget: () => ({
-        toUserId: 'owner-user', contextToken: 'context-owner', runId: 'run-owner',
-      }),
+      setGetUpdatesBuf: async () => {},
+      hasSeen: (id) => seen.has(id),
+      markSeen: async (id) => seen.add(id),
+      sessionFor: () => 'session-runtime-typing-stop',
+      setSession: async () => {},
+      clearSession: async () => {},
     },
+    logger: { warn() {}, error() {} },
   });
-  try {
-    await runtime.start();
-    assert.deepEqual(
-      await runtime.sendNotification('招聘摘要', { type: 'image', path: imagePath }),
-      {
-        sent: true,
-        mode: 'text-fallback',
-        provider: { accepted: true, ret: 0, errcode: null },
-      },
-    );
-    assert.equal(sends[0].toUserId, 'owner-user');
-    assert.equal(sends[0].contextToken, 'context-owner');
-    assert.equal(sends[0].text, '招聘摘要');
-  } finally {
-    await runtime.stop();
-    await rm(dir, { recursive: true, force: true });
-  }
+
+  await runtime.start();
+  await eventually(
+    () => events.some((event) => event.type === 'typing' && event.status === 1),
+    'the runtime should start the typing indicator',
+  );
+  await runtime.stop();
+
+  const cancellationIndex = events.findIndex(
+    (event) => event.type === 'typing' && event.status === 2,
+  );
+  const stopIndex = events.findIndex((event) => event.type === 'notify-stop');
+  assert.ok(cancellationIndex > -1);
+  assert.ok(cancellationIndex < stopIndex);
+  assert.equal(events[cancellationIndex].signal.aborted, false);
 });
 
 test('runtime verifies the token, consumes getUpdates, replies, persists cursor, and aborts on stop', async () => {
   const calls = [];
   let pollCount = 0;
   let askSignal;
+  const answer = '答'.repeat(2_000);
   const stateData = { cursor: '', seen: new Set(), session: null };
   const api = {
     notifyStart: async (request) => calls.push(['start', request.token]),
@@ -188,7 +295,7 @@ test('runtime verifies the token, consumes getUpdates, replies, persists cursor,
       createSession: async () => 'session-1',
       ask: async (_sessionId, _text, options) => {
         askSignal = options.signal;
-        return '回答';
+        return answer;
       },
     },
     state,
@@ -200,10 +307,14 @@ test('runtime verifies the token, consumes getUpdates, replies, persists cursor,
   await flush();
   await flush();
   assert.equal(stateData.cursor, 'cursor-next');
-  assert.deepEqual(calls.slice(0, 2), [
-    ['start', 'bot-token'],
-    ['send', '回答', 'context-7'],
+  assert.equal(calls[0][0], 'start');
+  assert.deepEqual(calls.slice(1, 3).map((call) => call[1].length), [1_800, 200]);
+  assert.equal(calls.slice(1, 3).map((call) => call[1]).join(''), answer);
+  assert.deepEqual(calls.slice(1, 3).map((call) => call[2]), [
+    'context-7',
+    'context-7',
   ]);
+  assert.equal(runtime.status.messagesReplied, 1);
   assert.equal(askSignal.aborted, false);
   await runtime.stop();
   assert.equal(askSignal.aborted, true);
@@ -363,7 +474,7 @@ test('runtime refuses to report ready when notifyStart rejects the stored token'
   assert.equal(runtime.status.weixinConnectionState, 'failed');
 });
 
-test('runtime identifies a local Harness health failure without exposing its detail', async () => {
+test('runtime uses an explicit unknown code for an unclassified Harness health failure', async () => {
   const runtime = new WeixinRuntime({
     api: {
       notifyStart: async () => assert.fail('notifyStart must not run while Harness is unavailable'),
@@ -378,13 +489,49 @@ test('runtime identifies a local Harness health failure without exposing its det
   });
 
   await assert.rejects(runtime.start(), (error) => {
-    assert.equal(error.code, 'harness-unreachable');
+    assert.equal(error.code, 'harness-check-unknown-failed');
+    assert.notEqual(error.code, 'harness-unreachable');
     assert.doesNotMatch(error.message, /private loopback transport detail/);
     assert.match(error.cause?.message ?? '', /private loopback transport detail/);
     return true;
   });
   assert.equal(runtime.status.ready, false);
   assert.equal(runtime.status.weixinConnectionState, 'failed');
+});
+
+test('runtime preserves classified Harness health codes without exposing their causes', async () => {
+  for (const code of [
+    'harness-connect-failed',
+    'harness-timeout',
+    'harness-auth-required',
+    'harness-proxy-auth-required',
+    'harness-loopback-forbidden',
+    'harness-host-untrusted',
+    'harness-request-forbidden',
+    'harness-api-not-found',
+    'harness-http-failed',
+    'harness-response-invalid',
+    'harness-rpc-rejected',
+  ]) {
+    const healthError = Object.assign(new Error(`private detail for ${code}`), { code });
+    const runtime = new WeixinRuntime({
+      api: {
+        notifyStart: async () => assert.fail('notifyStart must not run after a failed health check'),
+        notifyStop: async () => {},
+      },
+      config: { botId: `wx_${code}`, baseUrl: 'https://ilinkai.weixin.qq.com/', ownerUserId: 'owner' },
+      token: 'bot-token',
+      harness: { ensureRunning: async () => { throw healthError; } },
+      state: {},
+    });
+
+    await assert.rejects(runtime.start(), (error) => {
+      assert.equal(error.code, code);
+      assert.equal(error.cause, healthError);
+      assert.doesNotMatch(error.message, /private detail/);
+      return true;
+    });
+  }
 });
 
 test('runtime retries a transient notifyStart failure before reporting the account offline', async () => {

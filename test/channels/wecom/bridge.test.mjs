@@ -1,17 +1,217 @@
 import assert from 'node:assert/strict';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 import {
+  createWecomBridgeStatus,
+  sendWecomImage,
   WecomHarnessBridge,
   wecomInboundMessage,
 } from '../../../src/channels/wecom/wecom-bridge.mjs';
 import { DEFAULT_IMAGE_PROMPT } from '../../../src/channels/shared/image-prompt.mjs';
 import { connectionTestTarget } from '../../../src/channels/shared/connection-test.mjs';
+import {
+  OUTBOUND_ARTIFACT_TOOL,
+  OutboundArtifactRegistry,
+  createOutboundArtifactTool,
+} from '../../../src/channels/shared/semantic/artifact.mjs';
 
 const PNG_1X1 = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
   'base64',
 );
+const INITIAL_THINKING_TEXT = '正在思考中…';
+const INITIAL_THINKING_STREAM = `<think>${INITIAL_THINKING_TEXT}`;
+
+function streamedAnswer(answer, thinking = INITIAL_THINKING_TEXT) {
+  return `<think>${thinking}</think>\n${answer}`;
+}
+
+test('Enterprise WeChat native image adapter uploads and sends an image media message', async () => {
+  const calls = [];
+  const result = { body: { msgid: 'wecom-image-1', errcode: 0 } };
+  const file = {
+    artifactId: 'image-artifact',
+    deliveryKey: 'image-delivery',
+    fileName: 'diagram.png',
+    mediaType: 'image/png',
+    bytes: PNG_1X1,
+  };
+  const returned = await sendWecomImage({
+    uploadMedia: async (bytes, options) => {
+      calls.push({ operation: 'upload', bytes: Buffer.from(bytes), options });
+      return { media_id: 'image-media-1' };
+    },
+    sendMediaMessage: async (chatId, type, mediaId) => {
+      calls.push({ operation: 'send', chatId, type, mediaId });
+      return result;
+    },
+  }, 'chat-1', file);
+
+  assert.equal(returned, result);
+  assert.deepEqual(calls, [{
+    operation: 'upload',
+    bytes: PNG_1X1,
+    options: { type: 'image', filename: 'diagram.png' },
+  }, {
+    operation: 'send',
+    chatId: 'chat-1',
+    type: 'image',
+    mediaId: 'image-media-1',
+  }]);
+});
+
+test('Enterprise WeChat native image adapter preserves definite upload errors', async () => {
+  let sends = 0;
+  await assert.rejects(sendWecomImage({
+    uploadMedia: async () => {
+      const error = new Error('forbidden');
+      error.httpStatus = 403;
+      throw error;
+    },
+    sendMediaMessage: async () => { sends += 1; },
+  }, 'chat-1', {
+    fileName: 'diagram.png',
+    bytes: PNG_1X1,
+  }), (error) => error.code === 'artifact-permission-required');
+  assert.equal(sends, 0);
+});
+
+test('Enterprise WeChat native image adapter marks an unacknowledged message as uncertain', async () => {
+  await assert.rejects(sendWecomImage({
+    uploadMedia: async () => ({ media_id: 'image-media-uncertain' }),
+    sendMediaMessage: async () => new Promise(() => {}),
+  }, 'chat-1', {
+    fileName: 'diagram.png',
+    bytes: PNG_1X1,
+  }, { timeoutMs: 20 }), (error) => error.code === 'artifact-delivery-uncertain');
+});
+
+test('Enterprise WeChat sends an image artifact as a native image message', async (t) => {
+  const artifact = await committedArtifact(t, 'native.png', PNG_1X1, 'native-image');
+  const uploads = [];
+  const messages = [];
+  const bridge = new WecomHarnessBridge({
+    client: {
+      replyStream: async (_source, _streamId, _content, finish) => (
+        finish ? { body: { msgid: 'wecom-text' } } : undefined
+      ),
+      replyStreamNonBlocking: async () => {},
+      sendMessage: async () => {},
+      uploadMedia: async (bytes, options) => {
+        uploads.push({ bytes: Buffer.from(bytes), options });
+        return { media_id: 'native-image-media' };
+      },
+      sendMediaMessage: async (chatId, type, mediaId) => {
+        messages.push({ chatId, type, mediaId });
+        return { body: { msgid: 'wecom-image', errcode: 0 } };
+      },
+    },
+    generateStreamId: () => 'native-image-stream',
+    harness: {
+      sessionExists: async () => true,
+      ask: async (_sessionId, _text, options) => {
+        await options.onArtifact(artifact);
+        return '图片已生成。';
+      },
+    },
+    state: state(),
+  });
+
+  const receipt = await bridge.accept(frame({ msgid: 'wecom-native-image' }));
+
+  assert.deepEqual(uploads, [{
+    bytes: PNG_1X1,
+    options: { type: 'image', filename: 'native.png' },
+  }]);
+  assert.deepEqual(messages, [{
+    chatId: 'member-1',
+    type: 'image',
+    mediaId: 'native-image-media',
+  }]);
+  assert.equal(receipt.artifacts[0].artifactId, artifact.artifactId);
+  assert.equal(receipt.artifacts[0].outcome, 'sent');
+  assert.equal(receipt.providerMessageIds.includes('wecom-image'), true);
+});
+
+test('Enterprise WeChat falls back to a file after a definite native-image rejection', async (t) => {
+  const artifact = await committedArtifact(t, 'fallback.png', PNG_1X1, 'image-fallback');
+  const uploads = [];
+  const messages = [];
+  const bridge = new WecomHarnessBridge({
+    client: {
+      replyStream: async () => {},
+      replyStreamNonBlocking: async () => {},
+      sendMessage: async () => {},
+      uploadMedia: async (_bytes, options) => {
+        uploads.push(options.type);
+        if (options.type === 'image') {
+          const error = new Error('image format rejected');
+          error.providerCode = 40014;
+          throw error;
+        }
+        return { media_id: 'fallback-file-media' };
+      },
+      sendMediaMessage: async (_chatId, type, mediaId) => {
+        messages.push({ type, mediaId });
+        return { body: { msgid: 'wecom-file', errcode: 0 } };
+      },
+    },
+    harness: {
+      sessionExists: async () => true,
+      ask: async (_sessionId, _text, options) => {
+        await options.onArtifact(artifact);
+        return '图片已生成。';
+      },
+    },
+    state: state(),
+  });
+
+  const receipt = await bridge.accept(frame({ msgid: 'wecom-image-fallback' }));
+
+  assert.deepEqual(uploads, ['image', 'file']);
+  assert.deepEqual(messages, [{ type: 'file', mediaId: 'fallback-file-media' }]);
+  assert.equal(receipt.artifacts[0].outcome, 'sent');
+});
+
+test('Enterprise WeChat does not file-fallback after an uncertain native image send', async (t) => {
+  const artifact = await committedArtifact(t, 'uncertain.png', PNG_1X1, 'image-uncertain');
+  const uploads = [];
+  const notices = [];
+  const bridge = new WecomHarnessBridge({
+    client: {
+      replyStream: async () => {},
+      replyStreamNonBlocking: async () => {},
+      sendMessage: async (_chatId, body) => {
+        notices.push(body.markdown.content);
+        return { body: { msgid: 'wecom-uncertain-notice' } };
+      },
+      uploadMedia: async (_bytes, options) => {
+        uploads.push(options.type);
+        return { media_id: 'uncertain-image-media' };
+      },
+      sendMediaMessage: async () => new Promise(() => {}),
+    },
+    harness: {
+      sessionExists: async () => true,
+      ask: async (_sessionId, _text, options) => {
+        await options.onArtifact(artifact);
+        return '图片已生成。';
+      },
+    },
+    state: state(),
+    fileUploadTimeoutMs: 20,
+    logger: { warn() {}, error() {} },
+  });
+
+  const receipt = await bridge.accept(frame({ msgid: 'wecom-image-uncertain' }));
+
+  assert.deepEqual(uploads, ['image']);
+  assert.match(notices[0], /发送结果未能确认.*不要立即重试/);
+  assert.equal(receipt.artifacts[0].outcome, 'unknown');
+});
 
 function frame(overrides = {}) {
   return {
@@ -75,6 +275,37 @@ function testClient() {
       sendMessage: async (chatId, body) => active.push({ chatId, body }),
     },
   };
+}
+
+async function committedArtifact(t, fileName, content, suffix) {
+  const workspace = await mkdtemp(join(tmpdir(), `dsh-im-wecom-artifact-${suffix}-`));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  let nextId = 0;
+  const registry = new OutboundArtifactRegistry({ uuid: () => `${suffix}-${++nextId}` });
+  t.after(() => registry.clear());
+  const rpcId = `rpc-${suffix}`;
+  const agent = {
+    session: {
+      header: { id: `session-${suffix}`, cwd: workspace },
+      events: [
+        { type: 'turn/start', data: { turn: 1 } },
+        { type: 'user/message', data: { turn: 1, source: { rpcId } } },
+      ],
+    },
+  };
+  const tool = createOutboundArtifactTool({ registry });
+  const exec = {
+    name: OUTBOUND_ARTIFACT_TOOL,
+    callId: `call-${suffix}`,
+    rootCallId: `call-${suffix}`,
+    token: Symbol(`call-${suffix}`),
+    agent,
+  };
+  await writeFile(join(workspace, fileName), content);
+  await tool.definition.execute({ path: fileName }, exec);
+  tool.onResult(exec, { isError: false });
+  const [artifact] = registry.take(agent.session.header.id, 1);
+  return artifact;
 }
 
 function questionInteraction({
@@ -153,12 +384,21 @@ test('Enterprise WeChat executes /compact for the bound Session without promptin
   assert.deepEqual(transport.active, []);
 });
 
-test('Enterprise WeChat lists models without prompting and help advertises all four commands', async () => {
+test('Enterprise WeChat lists models and presets without prompting and advertises fast commands', async () => {
   const store = state();
   store.sessionFor = () => null;
   const transport = testClient();
+  const presetUpdates = [];
+  let agentPreset = null;
   let asks = 0;
   let creates = 0;
+  const agentPresetCatalog = {
+    defaultId: 'preset-001',
+    items: Array.from({ length: 70 }, (_, index) => ({
+      id: `preset-${String(index + 1).padStart(3, '0')}`,
+      label: `WeCom Preset ${index + 1} ${'x'.repeat(64)}`,
+    })),
+  };
   const bridge = new WecomHarnessBridge({
     client: transport.client,
     generateStreamId: () => 'models-stream',
@@ -171,6 +411,12 @@ test('Enterprise WeChat lists models without prompting and help advertises all f
         }],
         failures: [],
       }),
+      agentPresetSettings: async () => ({ agentPreset, agentPresetCatalog }),
+      updateAgentPreset: async (value) => {
+        presetUpdates.push(value);
+        agentPreset = value;
+        return { agentPreset, agentPresetCatalog };
+      },
       createSession: async () => { creates += 1; return 'wecom-session'; },
       ask: async () => { asks += 1; return 'unexpected model reply'; },
     },
@@ -182,12 +428,56 @@ test('Enterprise WeChat lists models without prompting and help advertises all f
   assert.equal(asks, 0);
   assert.equal(creates, 0);
 
+  await bridge.accept(frame({ msgid: 'reasoning-wecom', text: { content: '/reasoninglist' } }));
+  assert.match(transport.streamed.at(-1).content, /还没有会话/);
+  assert.equal(asks, 0);
+  assert.equal(creates, 0);
+
+  const presetReplyStart = transport.streamed.length;
+  await bridge.accept(frame({ msgid: 'presets-wecom', text: { content: '/presetlist' } }));
+  const presetReplies = transport.streamed
+    .slice(presetReplyStart)
+    .map((entry) => entry.content);
+  assert.ok(presetReplies.length > 1);
+  assert.match(presetReplies.join('\n'), /preset-070/);
+  assert.equal(asks, 0);
+  assert.equal(creates, 0);
+
+  await bridge.accept(frame({ msgid: 'preset-current-wecom', text: { content: '/preset' } }));
+  assert.match(transport.streamed.at(-1).content, /跟随 Host 默认/);
+  assert.equal(asks, 0);
+  assert.equal(creates, 0);
+
+  const selectReplyStart = transport.streamed.length;
+  await bridge.accept(frame({ msgid: 'preset-select-wecom', text: { content: '/preset 2' } }));
+  assert.deepEqual(presetUpdates, ['preset-002']);
+  assert.equal(transport.streamed.length, selectReplyStart + 1);
+  assert.match(transport.streamed.at(-1).content, /preset-002/);
+  assert.equal(transport.streamed.at(-1).finish, true);
+
+  const defaultReplyStart = transport.streamed.length;
+  await bridge.accept(frame({ msgid: 'preset-default-wecom', text: { content: '/preset --default' } }));
+  assert.deepEqual(presetUpdates, ['preset-002', null]);
+  assert.equal(transport.streamed.length, defaultReplyStart + 1);
+  assert.match(transport.streamed.at(-1).content, /跟随 Host 默认/);
+  assert.equal(transport.streamed.at(-1).finish, true);
+  assert.equal(asks, 0);
+  assert.equal(creates, 0);
+
   await bridge.accept(frame({ msgid: 'help-models-wecom', text: { content: '/help' } }));
   const help = transport.streamed.at(-1).content;
-  for (const command of ['/models', '/model', '/stop', '/steer']) {
+  for (const command of [
+    '/models', '/model', '/reasoninglist', '/reasonings', '/reasoning',
+    '/presetlist', '/preset', '/preset --default', '/stop', '/steer',
+    '/version',
+    '/batch', '/send', '/cancel',
+  ]) {
     assert.equal(help.includes(command), true, command);
   }
-  assert.match(help, /\/model 2/);
+  assert.match(help, /\/model .*\[推理等级ID\]/);
+  assert.match(help, /示例：先发 \/models，再发 \/model 2 \[推理等级ID\]/);
+  assert.doesNotMatch(help, /\/model 2 high\b/);
+  assert.match(help, /\/preset id:<ID>/);
 });
 
 test('Enterprise WeChat messages stream Harness progress and finalize once', async () => {
@@ -207,6 +497,7 @@ test('Enterprise WeChat messages stream Harness progress and finalize once', asy
       ensureRunning: async () => true,
       ask: async (_session, _text, { onUpdate }) => {
         await onUpdate({ type: 'tool', name: '网页搜索' });
+        await onUpdate({ type: 'status', text: '正在整理结果…' });
         await onUpdate({ type: 'text', text: '回答中' });
         return '最终回答';
       },
@@ -216,14 +507,87 @@ test('Enterprise WeChat messages stream Harness progress and finalize once', asy
 
   await bridge.accept(frame());
   assert.deepEqual(replies, [
-    { streamId: 'stream-1', content: '正在思考中…', finish: false },
-    { streamId: 'stream-1', content: '正在使用网页搜索…', finish: false },
-    { streamId: 'stream-1', content: '回答中', finish: false },
-    { streamId: 'stream-1', content: '最终回答', finish: true },
+    { streamId: 'stream-1', content: INITIAL_THINKING_STREAM, finish: false },
+    { streamId: 'stream-1', content: '<think>正在使用网页搜索…', finish: false },
+    { streamId: 'stream-1', content: '<think>正在整理结果…', finish: false },
+    {
+      streamId: 'stream-1',
+      content: streamedAnswer('回答中', '正在整理结果…'),
+      finish: false,
+    },
+    {
+      streamId: 'stream-1',
+      content: streamedAnswer('最终回答', '正在整理结果…'),
+      finish: true,
+    },
   ]);
   assert.deepEqual(active, []);
   assert.equal(store.seen.has('msg-1'), true);
   assert.equal(bridge.status.messagesReplied, 1);
+});
+
+test('Enterprise WeChat keeps the thinking block closed when a long answer is split', async () => {
+  const replies = [];
+  const active = [];
+  const answer = '结'.repeat(7_000);
+  const bridge = new WecomHarnessBridge({
+    client: {
+      replyStream: async (_frame, streamId, content, finish) => {
+        replies.push({ streamId, content, finish });
+      },
+      replyStreamNonBlocking: async () => {},
+      sendMessage: async (chatId, body) => active.push({ chatId, body }),
+    },
+    generateStreamId: () => 'stream-long',
+    harness: {
+      sessionExists: async () => true,
+      ask: async () => answer,
+    },
+    state: state(),
+  });
+
+  await bridge.accept(frame({ msgid: 'wecom-long-answer' }));
+
+  const final = replies.find(({ finish }) => finish);
+  assert.ok(final);
+  assert.match(final.content, /^<think>正在思考中…<\/think>\n/);
+  assert.ok(Buffer.byteLength(final.content) <= 18_000);
+  assert.ok(active.length > 0);
+  assert.equal(
+    [final.content, ...active.map(({ body }) => body.markdown.content)].join(''),
+    streamedAnswer(answer),
+  );
+  assert.equal(active.every(({ body }) => Buffer.byteLength(body.markdown.content) <= 18_000), true);
+});
+
+test('Enterprise WeChat falls back to a plain active reply when the stream cannot start', async () => {
+  const active = [];
+  let streamAttempts = 0;
+  const bridge = new WecomHarnessBridge({
+    client: {
+      replyStream: async () => {
+        streamAttempts += 1;
+        throw new Error('stream unavailable');
+      },
+      replyStreamNonBlocking: async () => assert.fail('an unopened stream cannot be updated'),
+      sendMessage: async (chatId, body) => active.push({ chatId, body }),
+    },
+    generateStreamId: () => 'stream-unavailable',
+    harness: {
+      sessionExists: async () => true,
+      ask: async () => '最终回答',
+    },
+    state: state(),
+    logger: { warn() {} },
+  });
+
+  await bridge.accept(frame({ msgid: 'wecom-stream-unavailable' }));
+
+  assert.equal(streamAttempts, 1);
+  assert.deepEqual(active, [{
+    chatId: 'member-1',
+    body: { msgtype: 'markdown', markdown: { content: '最终回答' } },
+  }]);
 });
 
 test('Enterprise WeChat downloads an image with its AES key and submits structured content once', async () => {
@@ -272,7 +636,7 @@ test('Enterprise WeChat downloads an image with its AES key and submits structur
       },
     ],
   }]);
-  assert.equal(transport.streamed.at(-1).content, '图片识别完成');
+  assert.equal(transport.streamed.at(-1).content, streamedAnswer('图片识别完成'));
 });
 
 test('Enterprise WeChat preserves mixed-message text and image order', async () => {
@@ -309,6 +673,78 @@ test('Enterprise WeChat preserves mixed-message text and image order', async () 
     { type: 'image', mediaType: 'image/jpeg', data: jpeg.toString('base64') },
     { type: 'image', mediaType: 'image/gif', data: gif.toString('base64') },
   ]);
+});
+
+test('Enterprise WeChat exposes native file callbacks through the SDK downloader without file limits', async () => {
+  const calls = [];
+  const bytes = Buffer.from('wecom-native-file');
+  const message = wecomInboundMessage(frame({
+    msgtype: 'file',
+    text: undefined,
+    file: {
+      url: 'https://wecom.example/encrypted-file',
+      aeskey: 'file-specific-key',
+    },
+  }), {
+    downloadFile: async (url, aeskey) => {
+      calls.push({ url, aeskey });
+      return { buffer: bytes, filename: '企业微信报告.pdf' };
+    },
+  });
+
+  assert.equal(message.content, '');
+  assert.deepEqual(message.images, []);
+  assert.equal(message.files.length, 1);
+  assert.equal(message.files[0].name, 'file');
+  assert.equal(calls.length, 0, 'file download stays lazy at normalization time');
+  assert.deepEqual(await message.files[0].load({}), {
+    data: bytes,
+    name: '企业微信报告.pdf',
+  });
+  assert.deepEqual(calls, [{
+    url: 'https://wecom.example/encrypted-file',
+    aeskey: 'file-specific-key',
+  }]);
+});
+
+test('Enterprise WeChat bridge hands its prefetched native file to the current Harness turn', async () => {
+  const transport = testClient();
+  const bytes = Buffer.from('wecom-bridge-file');
+  const downloads = [];
+  const prompts = [];
+  transport.client.downloadFile = async (url, aeskey) => {
+    downloads.push({ url, aeskey });
+    return { buffer: bytes, filename: '企微报告.docx' };
+  };
+  const bridge = new WecomHarnessBridge({
+    client: transport.client,
+    generateStreamId: () => 'file-stream',
+    harness: {
+      sessionExists: async () => true,
+      ask: async (sessionId, prompt, options) => {
+        const loaded = await options.files[0].load({ signal: options.signal });
+        prompts.push({ sessionId, prompt, name: options.files[0].name, loaded });
+        return '文件已收到';
+      },
+    },
+    state: state(),
+  });
+
+  await bridge.accept(frame({
+    msgid: 'wecom-native-file',
+    msgtype: 'file',
+    text: undefined,
+    file: { url: 'https://wecom.example/file', aeskey: 'file-key' },
+  }));
+
+  assert.deepEqual(downloads, [{ url: 'https://wecom.example/file', aeskey: 'file-key' }]);
+  assert.deepEqual(prompts, [{
+    sessionId: 'session-existing',
+    prompt: '',
+    name: 'file',
+    loaded: { data: bytes, name: '企微报告.docx' },
+  }]);
+  assert.equal(transport.streamed.at(-1).content, streamedAnswer('文件已收到'));
 });
 
 test('Enterprise WeChat starts image download before an earlier conversation turn finishes', async () => {
@@ -410,7 +846,8 @@ test('Enterprise WeChat bounds prefetched image memory while a conversation is q
   assert.equal(downloads.length, 4);
   assert.equal(prompts.length, 5);
   assert.equal(transport.streamed.some(({ content }) => (
-    content === '当前待处理图片较多，请稍后重新发送。'
+    content.includes('当前待处理图片较多，请稍后重新发送。')
+      && /错误码：INPUT_INVALID；参考号：MF-[A-F0-9]{8}$/.test(content)
   )), true);
 });
 
@@ -461,11 +898,97 @@ test('Enterprise WeChat finalizes an existing progress stream when Harness fails
   });
 
   await bridge.accept(frame());
-  assert.deepEqual(replies, [
-    { streamId: 'stream-failure', content: '正在思考中…', finish: false },
-    { streamId: 'stream-failure', content: '消息处理失败，请稍后重试。', finish: true },
-  ]);
+  assert.deepEqual(replies[0], {
+    streamId: 'stream-failure', content: INITIAL_THINKING_STREAM, finish: false,
+  });
+  assert.equal(replies[1].streamId, 'stream-failure');
+  assert.equal(replies[1].finish, true);
+  assert.match(replies[1].content, /^<think>正在思考中…<\/think>\n/);
+  assert.match(replies[1].content, /任务未完成，暂时无法确定原因/);
+  assert.match(replies[1].content, /错误码：INTERNAL_UNKNOWN；参考号：MF-[A-F0-9]{8}$/);
   assert.equal(store.seen.has('msg-1'), true);
+});
+
+test('Enterprise WeChat exposes a structured model rate limit without changing connection state', async () => {
+  const transport = testClient();
+  const status = {
+    ...createWecomBridgeStatus(),
+    connected: true,
+    connectionState: 'connected',
+  };
+  const bridge = new WecomHarnessBridge({
+    client: transport.client,
+    generateStreamId: () => 'rate-limit-stream',
+    harness: {
+      sessionExists: async () => true,
+      ask: async () => {
+        const error = new Error('private Enterprise WeChat provider rate-limit detail');
+        error.code = 'harness-turn-failed';
+        error.providerCode = 'RATE_LIMIT';
+        throw error;
+      },
+    },
+    state: state(),
+    status,
+    logger: { error() {} },
+  });
+
+  await bridge.accept(frame({
+    msgid: 'wecom-rate-limit',
+    text: { content: '触发模型限流' },
+  }));
+
+  const failure = status.lastMessageError;
+  const visibleError = transport.streamed.at(-1).content;
+  assert.equal(failure.code, 'MODEL_RATE_LIMIT');
+  assert.equal(failure.reason, 'MODEL_RATE_LIMIT');
+  assert.match(failure.referenceId, /^MF-[A-F0-9]{8}$/);
+  assert.match(visibleError, /模型服务正在限流，本次任务未完成。请稍后重试。/);
+  assert.equal(visibleError.endsWith(`参考号：${failure.referenceId}`), true);
+  assert.doesNotMatch(visibleError, /private Enterprise WeChat provider rate-limit detail/);
+  assert.equal(status.connected, true);
+  assert.equal(status.connectionState, 'connected');
+});
+
+test('Enterprise WeChat does not resubmit a recorded prompt when the safe error reply fails', async () => {
+  const store = state();
+  let asks = 0;
+  let safeReplyAttempts = 0;
+  const bridge = new WecomHarnessBridge({
+    client: {
+      replyStream: async (_frame, _streamId, _content, finish) => {
+        if (!finish) return;
+        safeReplyAttempts += 1;
+        throw new Error('safe reply unavailable');
+      },
+      replyStreamNonBlocking: async () => {},
+      sendMessage: async () => {},
+    },
+    generateStreamId: () => 'safe-error-replay-stream',
+    harness: {
+      sessionExists: async () => true,
+      ask: async () => {
+        asks += 1;
+        const error = new Error('private provider failure');
+        error.code = 'harness-turn-failed';
+        error.providerCode = 'RATE_LIMIT';
+        throw error;
+      },
+    },
+    state: store,
+    logger: { error() {}, warn() {} },
+  });
+  const inbound = frame({
+    msgid: 'wecom-safe-error-replay',
+    text: { content: '请执行一次' },
+  });
+
+  await bridge.accept(inbound);
+  await bridge.accept(inbound);
+
+  assert.equal(asks, 1);
+  assert.equal(safeReplyAttempts, 1);
+  assert.equal(store.seen.has('wecom-safe-error-replay'), true);
 });
 
 test('an Enterprise WeChat answer bypasses the original conversation queue', async () => {
@@ -508,7 +1031,7 @@ test('an Enterprise WeChat answer bypasses the original conversation queue', asy
       answer: { answers: [{ id: 'environment', selected: ['测试环境'] }] },
     },
   }]);
-  assert.equal(transport.streamed.at(-1).content, '你选择了：测试环境');
+  assert.equal(transport.streamed.at(-1).content, streamedAnswer('你选择了：测试环境'));
   assert.equal(transport.streamed.at(-1).finish, true);
 });
 
@@ -576,7 +1099,7 @@ test('an answer waits for the first Enterprise WeChat question delivery acknowle
   assert.deepEqual(responses[0].value.answer.answers, [
     { id: 'environment', selected: ['测试环境'] },
   ]);
-  assert.equal(streamed.at(-1).content, '首问回答完成');
+  assert.equal(streamed.at(-1).content, streamedAnswer('首问回答完成'));
 });
 
 test('pending Enterprise WeChat questions stay isolated by conversation', async () => {
@@ -1171,4 +1694,511 @@ test('aborting Enterprise WeChat work cancels its pending question without a fai
   assert.equal(cancellations[0].result.error.code, 'cancelled');
   assert.equal(cancellations[0].responseOptions.signal.aborted, false);
   assert.equal(transport.streamed.some(({ content }) => content === '消息处理失败，请稍后重试。'), false);
+});
+
+test('Enterprise WeChat sends registered files after the final text and continues after one file fails', async (t) => {
+  const first = await committedArtifact(t, 'first.txt', 'first bytes', 'partial-first');
+  const second = await committedArtifact(t, 'second.html', '<h1>second</h1>', 'partial-second');
+  const order = [];
+  const uploads = [];
+  const active = [];
+  const status = {
+    messagesReceived: 0,
+    messagesReplied: 0,
+    messagesRejected: 0,
+    artifactsSent: 0,
+    artifactSendErrors: 0,
+    lastMessageAt: null,
+    lastReplyAt: null,
+    lastRejectedAt: null,
+    lastError: null,
+  };
+  const client = {
+    replyStream: async (_source, _streamId, content, finish) => {
+      if (finish) order.push(`text:${content}`);
+    },
+    replyStreamNonBlocking: async () => {},
+    sendMessage: async (chatId, body) => {
+      const content = body.markdown.content;
+      active.push({ chatId, content });
+      order.push(`notice:${content}`);
+      return { body: { msgid: `notice-${active.length}` } };
+    },
+    uploadMedia: async (bytes, options) => {
+      uploads.push({ bytes: Buffer.from(bytes), options });
+      order.push(`upload:${options.filename}`);
+      return { media_id: `media-${options.filename}` };
+    },
+    sendMediaMessage: async (chatId, type, mediaId) => {
+      order.push(`file:${mediaId}`);
+      if (mediaId === 'media-first.txt') {
+        const error = new Error('private provider detail');
+        error.code = 'artifact-provider-failed';
+        throw error;
+      }
+      return { body: { msgid: 'wecom-file-2' }, chatId, type };
+    },
+  };
+  const bridge = new WecomHarnessBridge({
+    client,
+    generateStreamId: () => 'artifact-stream',
+    harness: {
+      sessionExists: async () => true,
+      ask: async (_sessionId, _text, options) => {
+        await options.onArtifact(first);
+        await options.onArtifact(second);
+        return '文件处理完成。';
+      },
+    },
+    state: state(),
+    status,
+    logger: { warn() {}, error() {} },
+  });
+
+  await bridge.accept(frame({ msgid: 'wecom-artifact-partial' }));
+
+  assert.deepEqual(order.map((entry) => entry.split(':', 1)[0]), [
+    'text', 'upload', 'file', 'notice', 'upload', 'file',
+  ]);
+  assert.deepEqual(uploads.map(({ options }) => options), [
+    { type: 'file', filename: 'first.txt' },
+    { type: 'file', filename: 'second.html' },
+  ]);
+  assert.equal(uploads[0].bytes.toString(), 'first bytes');
+  assert.equal(uploads[1].bytes.toString(), '<h1>second</h1>');
+  assert.equal(active.length, 1);
+  assert.match(active[0].content, /first\.txt.*暂时未能/);
+  assert.equal(status.lastMessageError.code, 'CHANNEL_DELIVERY');
+  assert.equal(status.lastMessageError.reason, 'ARTIFACT_PROVIDER_FAILED');
+  assert.equal(active[0].content.endsWith(`参考号：${status.lastMessageError.referenceId}`), true);
+  assert.doesNotMatch(active[0].content, /private provider detail/);
+  assert.equal(status.artifactsSent, 1);
+  assert.equal(status.artifactSendErrors, 1);
+});
+
+test('Enterprise WeChat still delivers registered files when final text delivery fails', async (t) => {
+  const artifact = await committedArtifact(
+    t,
+    'survives-text-failure.txt',
+    'file bytes',
+    'text-failure',
+  );
+  const files = [];
+  let finalTextAttempts = 0;
+  let activeTextAttempts = 0;
+  const bridge = new WecomHarnessBridge({
+    client: {
+      replyStream: async (_source, _streamId, _content, finish) => {
+        if (finish) {
+          finalTextAttempts += 1;
+          throw new Error('stream finalization unavailable');
+        }
+      },
+      replyStreamNonBlocking: async () => {},
+      sendMessage: async () => {
+        activeTextAttempts += 1;
+        throw new Error('active text unavailable');
+      },
+      uploadMedia: async () => ({ media_id: 'media-after-text-failure' }),
+      sendMediaMessage: async (chatId, type, mediaId) => {
+        files.push({ chatId, type, mediaId });
+        return { body: { msgid: 'wecom-file-after-text-failure' } };
+      },
+    },
+    generateStreamId: () => 'text-failure-stream',
+    harness: {
+      sessionExists: async () => true,
+      ask: async (_sessionId, _text, options) => {
+        await options.onArtifact(artifact);
+        return '文字结果';
+      },
+    },
+    state: state(),
+    logger: { warn() {}, error() {} },
+  });
+
+  await bridge.accept(frame({ msgid: 'wecom-text-failure' }));
+
+  assert.deepEqual(files, [{
+    chatId: 'member-1',
+    type: 'file',
+    mediaId: 'media-after-text-failure',
+  }]);
+  assert.equal(finalTextAttempts, 1, 'must not append a generic retry stream after file success');
+  assert.equal(activeTextAttempts, 1);
+  assert.equal(bridge.status.lastMessageError.code, 'CHANNEL_DELIVERY_UNCERTAIN');
+  assert.match(bridge.status.lastMessageError.referenceId, /^MF-[A-F0-9]{8}$/);
+});
+
+test('Enterprise WeChat returns the authoritative receipt and one safe notice when text and file delivery fail', async (t) => {
+  const artifact = await committedArtifact(t, 'mismatch.txt', 'file bytes', 'all-fail');
+  const attemptedActiveTexts = [];
+  const visibleActiveTexts = [];
+  const finalStreamTexts = [];
+  const bridge = new WecomHarnessBridge({
+    client: {
+      replyStream: async (_source, _streamId, content, finish) => {
+        if (finish) {
+          finalStreamTexts.push(content);
+          throw new Error('stream finalization unavailable');
+        }
+      },
+      replyStreamNonBlocking: async () => {},
+      sendMessage: async (_chatId, body) => {
+        const text = body.markdown.content;
+        attemptedActiveTexts.push(text);
+        if (text === '文字结果') throw new Error('active text unavailable');
+        visibleActiveTexts.push(text);
+        return {};
+      },
+      uploadMedia: async () => {
+        const error = new Error('mismatched file signature');
+        error.code = 'artifact-invalid';
+        throw error;
+      },
+      sendMediaMessage: async () => assert.fail('a rejected upload must not be sent'),
+    },
+    generateStreamId: () => 'all-fail-stream',
+    harness: {
+      sessionExists: async () => true,
+      ask: async (_sessionId, _text, options) => {
+        await options.onArtifact(artifact);
+        return '文字结果';
+      },
+    },
+    state: state(),
+    logger: { warn() {}, error() {} },
+  });
+
+  const receipt = await bridge.accept(frame({ msgid: 'wecom-all-fail' }));
+
+  assert.deepEqual(finalStreamTexts, [streamedAnswer('文字结果')]);
+  assert.equal(attemptedActiveTexts.length, 2, 'must not append a generic error after the safe notice');
+  assert.equal(visibleActiveTexts.length, 1);
+  assert.match(visibleActiveTexts[0], /暂时无法读取或准备发送.*仍可访问/);
+  assert.deepEqual(receipt, {
+    schemaVersion: 1,
+    deliveryId: 'wecom-all-fail',
+    presentation: 'wecom-files',
+    providerMessageIds: [],
+    artifacts: [{
+      artifactId: artifact.artifactId,
+      outcome: 'rejected',
+      reason: 'artifact-invalid',
+    }],
+  });
+});
+
+test('Enterprise WeChat keeps the generic error when no answer or file failure notice is visible', async (t) => {
+  const artifact = await committedArtifact(t, 'unavailable.txt', 'file bytes', 'no-visible-failure');
+  const attemptedActiveTexts = [];
+  const finalStreamTexts = [];
+  const bridge = new WecomHarnessBridge({
+    client: {
+      replyStream: async (_source, _streamId, content, finish) => {
+        if (!finish) return;
+        finalStreamTexts.push(content);
+        if (finalStreamTexts.length === 1) throw new Error('stream finalization unavailable');
+      },
+      replyStreamNonBlocking: async () => {},
+      sendMessage: async (_chatId, body) => {
+        attemptedActiveTexts.push(body.markdown.content);
+        throw new Error('active text unavailable');
+      },
+      uploadMedia: async () => {
+        const error = new Error('file transport unavailable');
+        error.code = 'artifact-provider-failed';
+        throw error;
+      },
+      sendMediaMessage: async () => assert.fail('a rejected upload must not be sent'),
+    },
+    generateStreamId: () => 'no-visible-failure-stream',
+    harness: {
+      sessionExists: async () => true,
+      ask: async (_sessionId, _text, options) => {
+        await options.onArtifact(artifact);
+        return '文字结果';
+      },
+    },
+    state: state(),
+    logger: { warn() {}, error() {} },
+  });
+
+  await bridge.accept(frame({ msgid: 'wecom-no-visible-failure' }));
+
+  assert.equal(attemptedActiveTexts.length, 2);
+  assert.equal(finalStreamTexts[0], streamedAnswer('文字结果'));
+  assert.match(
+    finalStreamTexts[1],
+    /^<think>正在思考中…<\/think>\n回复发送结果未能确认/,
+  );
+  assert.match(finalStreamTexts[1], /错误码：CHANNEL_DELIVERY_UNCERTAIN；参考号：MF-[A-F0-9]{8}$/);
+});
+
+test('Enterprise WeChat reports an unacknowledged file message as uncertain', async (t) => {
+  const artifact = await committedArtifact(t, 'uncertain.txt', 'file bytes', 'uncertain');
+  const active = [];
+  const bridge = new WecomHarnessBridge({
+    client: {
+      replyStream: async () => {},
+      replyStreamNonBlocking: async () => {},
+      sendMessage: async (_chatId, body) => active.push(body.markdown.content),
+      uploadMedia: async () => ({ media_id: 'media-uncertain' }),
+      sendMediaMessage: async () => new Promise(() => {}),
+    },
+    harness: {
+      sessionExists: async () => true,
+      ask: async (_sessionId, _text, options) => {
+        await options.onArtifact(artifact);
+        return '文件已生成。';
+      },
+    },
+    state: state(),
+    fileUploadTimeoutMs: 20,
+    logger: { warn() {}, error() {} },
+  });
+
+  await bridge.accept(frame({ msgid: 'wecom-uncertain-file' }));
+
+  assert.match(active[0], /发送结果未能确认.*先检查聊天内是否已收到.*不要立即重试/);
+});
+
+test('Enterprise WeChat cancellation interrupts an in-flight file send and skips later files', async (t) => {
+  const first = await committedArtifact(t, 'first.txt', 'first', 'abort-first');
+  const second = await committedArtifact(t, 'second.txt', 'second', 'abort-second');
+  const started = deferred();
+  const controller = new AbortController();
+  const uploads = [];
+  const active = [];
+  const bridge = new WecomHarnessBridge({
+    client: {
+      replyStream: async () => {},
+      replyStreamNonBlocking: async () => {},
+      sendMessage: async (_chatId, body) => active.push(body.markdown.content),
+      uploadMedia: async (_bytes, options) => {
+        uploads.push(options.filename);
+        return { media_id: `media-${options.filename}` };
+      },
+      sendMediaMessage: async () => {
+        started.resolve();
+        return new Promise(() => {});
+      },
+    },
+    harness: {
+      sessionExists: async () => true,
+      ask: async (_sessionId, _text, options) => {
+        await options.onArtifact(first);
+        await options.onArtifact(second);
+        return '文件如下。';
+      },
+    },
+    state: state(),
+    signal: controller.signal,
+    logger: { warn() {}, error() {} },
+  });
+
+  const processing = bridge.accept(frame({ msgid: 'wecom-abort-file' }));
+  await started.promise;
+  controller.abort(new DOMException('runtime stopped', 'AbortError'));
+  await Promise.race([
+    processing,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('WeCom abort timed out')), 500)),
+  ]);
+
+  assert.deepEqual(uploads, ['first.txt']);
+  assert.equal(active.some((text) => text.includes('发送结果未能确认')), false);
+  assert.equal(active.some((text) => text === '消息处理失败，请稍后重试。'), false);
+});
+
+test('Enterprise WeChat uses a neutral final text for a file-only Turn', async (t) => {
+  const artifact = await committedArtifact(t, 'only.txt', 'only bytes', 'file-only');
+  const finalTexts = [];
+  const files = [];
+  const bridge = new WecomHarnessBridge({
+    client: {
+      replyStream: async (_source, _streamId, content, finish) => {
+        if (finish) finalTexts.push(content);
+      },
+      replyStreamNonBlocking: async () => {},
+      sendMessage: async () => {},
+      uploadMedia: async () => ({ media_id: 'media-only' }),
+      sendMediaMessage: async (chatId, type, mediaId) => {
+        files.push({ chatId, type, mediaId });
+        return {};
+      },
+    },
+    generateStreamId: () => 'file-only-stream',
+    harness: {
+      sessionExists: async () => true,
+      ask: async (_sessionId, _text, options) => {
+        await options.onArtifact(artifact);
+        return '';
+      },
+    },
+    state: state(),
+  });
+
+  await bridge.accept(frame({ msgid: 'wecom-file-only' }));
+
+  assert.deepEqual(finalTexts, [streamedAnswer('结果文件已生成。')]);
+  assert.deepEqual(files, [{ chatId: 'member-1', type: 'file', mediaId: 'media-only' }]);
+});
+
+test('Enterprise WeChat cancellation prevents SDK upload', async (t) => {
+  let uploads = 0;
+  const artifact = await committedArtifact(t, 'cancelled.txt', 'cancelled bytes', 'cancelled');
+  const controller = new AbortController();
+  const cancelledBridge = new WecomHarnessBridge({
+    client: {
+      replyStream: async () => {},
+      replyStreamNonBlocking: async () => {},
+      sendMessage: async () => {},
+      uploadMedia: async () => { uploads += 1; return { media_id: 'must-not-upload' }; },
+      sendMediaMessage: async () => {},
+    },
+    harness: {
+      sessionExists: async () => true,
+      ask: async (_sessionId, _text, options) => {
+        await options.onArtifact(artifact);
+        controller.abort(new DOMException('stopped', 'AbortError'));
+        return '停止前的回答';
+      },
+    },
+    state: state(),
+    signal: controller.signal,
+  });
+  await cancelledBridge.accept(frame({ msgid: 'wecom-artifact-cancelled' }));
+  assert.equal(uploads, 0);
+});
+
+test('Enterprise WeChat batch input collects ten texts and submits one ordered Harness turn', async () => {
+  const transport = testClient();
+  const prompts = [];
+  const bridge = new WecomHarnessBridge({
+    client: transport.client,
+    generateStreamId: () => 'batch-stream',
+    harness: {
+      sessionExists: async () => true,
+      ask: async (_sessionId, prompt) => {
+        prompts.push(prompt);
+        return '批量完成';
+      },
+    },
+    state: state(),
+  });
+
+  await bridge.accept(frame({ msgid: 'batch-start', text: { content: '/batch' } }));
+  for (let index = 1; index <= 10; index += 1) {
+    await bridge.accept(frame({
+      msgid: `batch-item-${index}`,
+      text: { content: `企微内容 ${index}` },
+    }));
+  }
+  await bridge.accept(frame({ msgid: 'batch-overflow', text: { content: '不会收录' } }));
+
+  assert.equal(prompts.length, 0);
+  assert.equal(transport.streamed.some(({ content }) => /10\/10.*已满/.test(content)), true);
+  assert.equal(transport.streamed.some(({ content }) => /这条消息未收录/.test(content)), true);
+
+  await bridge.accept(frame({ msgid: 'batch-send', text: { content: '/send' } }));
+  assert.equal(prompts.length, 1);
+  assert.match(prompts[0], /\[消息 1\]\n企微内容 1/);
+  assert.match(prompts[0], /\[消息 10\]\n企微内容 10/);
+  assert.doesNotMatch(prompts[0], /不会收录/);
+  assert.equal(transport.streamed.at(-1).content, streamedAnswer('批量完成'));
+});
+
+test('Enterprise WeChat rejects batch commands in groups without invoking Harness', async () => {
+  const transport = testClient();
+  let asks = 0;
+  const bridge = new WecomHarnessBridge({
+    client: transport.client,
+    harness: { ask: async () => { asks += 1; return 'unexpected'; } },
+    state: state(),
+  });
+
+  for (const [index, command] of ['/batch', '/send', '/cancel'].entries()) {
+    await bridge.accept(frame({
+      msgid: `group-batch-${index}`,
+      chattype: 'group',
+      chatid: 'group-batch',
+      text: { content: `@机器人 ${command}` },
+    }));
+  }
+
+  assert.equal(asks, 0);
+  assert.equal(transport.streamed.length, 3);
+  assert.equal(transport.streamed.every(({ content }) => /仅支持私聊/.test(content)), true);
+});
+
+test('Enterprise WeChat keeps a failed batch for retry and queues later ordinary messages normally', async () => {
+  const transport = testClient();
+  const firstBatch = deferred();
+  const prompts = [];
+  let failFirst = true;
+  const bridge = new WecomHarnessBridge({
+    client: transport.client,
+    generateStreamId: (() => { let index = 0; return () => `batch-retry-${++index}`; })(),
+    harness: {
+      sessionExists: async () => true,
+      ask: async (_sessionId, prompt) => {
+        prompts.push(prompt);
+        if (failFirst) {
+          failFirst = false;
+          throw new Error('temporary failure');
+        }
+        if (/\[消息 1\]/.test(prompt)) await firstBatch.promise;
+        return `完成：${prompt}`;
+      },
+    },
+    state: state(),
+    logger: { warn() {}, error() {} },
+  });
+
+  await bridge.accept(frame({ msgid: 'retry-start', text: { content: '/batch' } }));
+  await bridge.accept(frame({ msgid: 'retry-content', text: { content: '需要重试' } }));
+  await bridge.accept(frame({ msgid: 'retry-send-1', text: { content: '/send' } }));
+  assert.match(transport.streamed.at(-1).content, /错误码：INTERNAL_UNKNOWN.*已保留 1 条消息/s);
+
+  const retry = bridge.accept(frame({ msgid: 'retry-send-2', text: { content: '/send' } }));
+  await eventually(() => prompts.length === 2);
+  const ordinary = bridge.accept(frame({
+    msgid: 'ordinary-after-send',
+    text: { content: '提交期间的普通消息' },
+  }));
+  assert.equal(prompts.length, 2);
+
+  firstBatch.resolve();
+  await Promise.all([retry, ordinary]);
+  assert.equal(prompts.length, 3);
+  assert.equal(prompts[2], '提交期间的普通消息');
+
+  await bridge.accept(frame({ msgid: 'cancel-start', text: { content: '/batch' } }));
+  await bridge.accept(frame({ msgid: 'cancel-content', text: { content: '丢弃' } }));
+  await bridge.accept(frame({ msgid: 'cancel-command', text: { content: '/cancel' } }));
+  assert.match(transport.streamed.at(-1).content, /已取消批量输入.*丢弃 1 条消息/s);
+});
+
+test('Enterprise WeChat clears a submitted batch when the Harness turn is stopped', async () => {
+  const transport = testClient();
+  const bridge = new WecomHarnessBridge({
+    client: transport.client,
+    harness: {
+      sessionExists: async () => true,
+      ask: async () => {
+        const error = new Error('turn stopped');
+        error.code = 'turn-stopped';
+        throw error;
+      },
+    },
+    state: state(),
+  });
+
+  await bridge.accept(frame({ msgid: 'stopped-start', text: { content: '/batch' } }));
+  await bridge.accept(frame({ msgid: 'stopped-content', text: { content: '不要重试' } }));
+  await bridge.accept(frame({ msgid: 'stopped-send', text: { content: '/send' } }));
+  assert.equal(transport.streamed.some(({ content }) => /已保留/.test(content)), false);
+
+  await bridge.accept(frame({ msgid: 'stopped-cancel', text: { content: '/cancel' } }));
+  assert.match(transport.streamed.at(-1).content, /没有正在进行的批量输入/);
 });

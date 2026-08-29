@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -41,9 +41,10 @@ test('production assembly keeps secrets in credentials and creates per-bot runti
     async close() { seen.supervisorClosed = true; },
   };
   const credentials = {};
+  const apiProxy = {};
   const production = await createProductionController({
     credentials,
-    webServer: { port: 3080 },
+    apiProxy,
     logger: () => console,
   }, { dataDir: directory }, {
     ConfigStore,
@@ -56,7 +57,8 @@ test('production assembly keeps secrets in credentials and creates per-bot runti
   });
 
   assert.equal(seen.controllerOptions.credentials, credentials);
-  assert.equal(seen.harnessOptions.baseUrl.href, 'http://127.0.0.1:3080/');
+  assert.equal(seen.harnessOptions.apiProxy, apiProxy);
+  assert.equal(Object.hasOwn(seen.harnessOptions, 'baseUrl'), false);
   assert.equal(seen.harnessOptions.autostart, false);
   assert.equal(Object.hasOwn(seen.harnessOptions, 'agentPreset'), false);
   const runtime = await seen.controllerOptions.createRuntime({
@@ -66,7 +68,14 @@ test('production assembly keeps secrets in credentials and creates per-bot runti
   });
   assert.ok(runtime instanceof Runtime);
   assert.equal(seen.runtimeOptions.clientSecret, 'host-only-secret');
+  assert.equal(Object.hasOwn(seen.runtimeOptions, 'outboundArtifactsEnabled'), false);
   assert.match(seen.statePath, /dt_abc\/state\.json$/);
+  await seen.controllerOptions.createRuntime({
+    botId: 'dt_disabled',
+    config: { botId: 'dt_disabled', clientId: 'dingdisabled' },
+    clientSecret: 'host-only-secret',
+  });
+  assert.equal(Object.hasOwn(seen.runtimeOptions, 'outboundArtifactsEnabled'), false);
 
   await production.close();
   assert.equal(seen.supervisorClosed, true);
@@ -75,7 +84,7 @@ test('production assembly keeps secrets in credentials and creates per-bot runti
 
   const productionWithPreset = await createProductionController({
     credentials,
-    webServer: { port: 3080 },
+    apiProxy,
     logger: () => console,
   }, { dataDir: directory, agentPreset: 'router-standard' }, {
     ConfigStore,
@@ -87,6 +96,15 @@ test('production assembly keeps secrets in credentials and creates per-bot runti
     createConnectionSupervisor: () => supervisor,
   });
 
-  assert.equal(seen.harnessOptions.agentPreset, 'router-standard');
+  assert.equal(Object.hasOwn(seen.harnessOptions, 'agentPreset'), false);
+  await seen.controllerOptions.createRuntime({
+    botId: 'dt_new',
+    config: { botId: 'dt_new', clientId: 'dingnew' },
+    clientSecret: 'host-only-secret',
+  });
+  assert.equal(Object.hasOwn(seen.runtimeOptions, 'outboundArtifactsEnabled'), false);
+  const stored = JSON.parse(await readFile(join(directory, 'workspaces.json'), 'utf8'));
+  assert.equal(stored.agentPresets.dt_new, 'router-standard');
+  assert.equal(Object.hasOwn(stored.agentPresets, 'dt_abc'), false);
   await productionWithPreset.close();
 });

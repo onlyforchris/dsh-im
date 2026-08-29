@@ -1,0 +1,18 @@
+commit 9bd3b8417fa34dc23dec5c2d9d191c7244fddce5
+Author: Chris <zhangjim117@163.com>
+Date:   Thu Aug 27 13:02:26 2026 +0800
+
+    release: prepare @onlyforchris/dsh-im 0.16.6
+
+diff --git a/package.json b/package.json
+index e5768f1..395b394 100644
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "@onlyforchris/dsh-im",
+-  "version": "0.16.5",
++  "version": "0.16.6",
+   "description": "把九种 IM 机器人和公网 AI Office 接入本机 DeepSeek Harness。 Connect nine IM channels and a public AI Office to a local DeepSeek Harness.",
+   "keywords": [
+     "deepseek-harness",

@@ -3,11 +3,8 @@ import {
   createDingtalkBridgeStatus,
   DingtalkHarnessBridge,
 } from './dingtalk-bridge.mjs';
-import {
-  connectionTestTarget,
-  latestBoundConversation,
-  sendRememberedConnectionTest,
-} from '../shared/connection-test.mjs';
+import { sendRememberedConnectionTest } from '../shared/connection-test.mjs';
+import { t } from '../shared/i18n.mjs';
 
 function nonEmptyString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
@@ -138,7 +135,6 @@ export class DingtalkRuntime {
   #connectPollIntervalMs;
   #api;
   #streamFactory;
-  #sourceChannelLabel;
   #status;
   #client = null;
   #bridge = null;
@@ -160,7 +156,6 @@ export class DingtalkRuntime {
     connectPollIntervalMs = 25,
     api = createDingtalkApi(),
     streamFactory = defaultStreamFactory,
-    sourceChannelLabel,
   }) {
     if (!config || !nonEmptyString(config.clientId) || !nonEmptyString(clientSecret)) {
       throw new TypeError('DingtalkRuntime requires app credentials');
@@ -178,7 +173,6 @@ export class DingtalkRuntime {
     this.#connectPollIntervalMs = connectPollIntervalMs;
     this.#api = api;
     this.#streamFactory = streamFactory;
-    this.#sourceChannelLabel = sourceChannelLabel;
     this.#status = createDingtalkRuntimeStatus({
       pendingSenders: this.#pendingSenders(),
       approvedSenders: approvedSenderCount(config),
@@ -243,7 +237,6 @@ export class DingtalkRuntime {
         logger: this.#logger,
         replyTimeoutMs: this.#replyTimeoutMs,
         maxMessageChars: this.#maxMessageChars,
-        sourceChannelLabel: this.#sourceChannelLabel,
         signal,
       });
 
@@ -283,7 +276,7 @@ export class DingtalkRuntime {
               ? JSON.parse(response.data)
               : response?.data;
           } catch {
-            this.#status.lastError = '钉钉消息格式无效。';
+            this.#status.lastError = t('钉钉消息格式无效。');
             this.#logger.warn?.('[dsh-dingtalk] ignored an invalid callback payload');
             return;
           }
@@ -292,7 +285,7 @@ export class DingtalkRuntime {
           await bridge.accept(message);
         }).catch(() => {
           if (signal.aborted || this.#bridge !== bridge) return;
-          this.#status.lastError = '钉钉消息处理失败。';
+          this.#status.lastError = t('钉钉消息处理失败。');
           this.#logger.error?.('[dsh-dingtalk] callback processing failed');
         }).finally(() => this.#callbackTasks.delete(task));
         this.#callbackTasks.add(task);
@@ -357,33 +350,10 @@ export class DingtalkRuntime {
   }
 
   async sendConnectionTest(text) {
-    const userId = connectionTestTarget(this.#state)?.userId
-      ?? latestBoundConversation(this.#state, 'p2p:')?.id;
-    if (userId && typeof this.#api.createAiCard === 'function'
-      && typeof this.#api.finishAiCard === 'function') {
-      if (!this.#status.ready || !this.#abortController) {
-        throw new Error('DingTalk runtime is not connected');
-      }
-      const card = await this.#api.createAiCard({
-        clientId: this.#config.clientId,
-        clientSecret: this.#clientSecret,
-        target: { type: 'user', userId },
-        initialText: text,
-        signal: this.#abortController.signal,
-      });
-      await this.#api.finishAiCard({
-        clientId: this.#config.clientId,
-        clientSecret: this.#clientSecret,
-        cardInstanceId: card.cardInstanceId,
-        text,
-        signal: this.#abortController.signal,
-      });
-      return { sent: true };
-    }
     return sendRememberedConnectionTest({
       state: this.#state,
       text,
-      channelLabel: '钉钉机器人',
+      channelLabel: t('钉钉机器人'),
       send: async ({ sessionWebhook }, content) => {
         if (!this.#status.ready || !this.#abortController) {
           throw new Error('DingTalk runtime is not connected');

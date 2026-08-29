@@ -1,4 +1,5 @@
 import * as React from 'react';
+import manifest from '../../package.json' with { type: 'json' };
 
 import {
   DingtalkLogoGlyph,
@@ -42,18 +43,23 @@ import { WHATSAPP_RPC_CHANNEL } from './channels/whatsapp/api.js';
 import { WhatsappSettingsTab } from './channels/whatsapp/index.js';
 import { installWhatsappStyles } from './channels/whatsapp/styles.js';
 import { en, h, IM_LOCALE_NAMESPACE, setImTranslator, zh } from './i18n.js';
+import {
+  createLoopbackAwareRpcCalls,
+  replacePageLocation,
+} from './loopback-recovery.js';
 import { installImStyles } from './styles.js';
+import { UpdatePanel, UPDATE_RPC_CHANNEL } from './update-panel.js';
 import { WorkspaceDirectoryPickerContext } from './workspace-editor.js';
 
 export const name = 'im-settings';
 export const inject = ['slots', 'connection', 'locale', 'workspaces'];
+export const IM_PLUGIN_VERSION = manifest.version;
 
-// 个人 fork 调整：按实际使用频率排序（飞书/钉钉/企微为主力渠道）。
 const CHANNELS = Object.freeze([
+  { id: 'weixin', label: '微信' },
   { id: 'feishu', label: '飞书' },
   { id: 'dingtalk', label: '钉钉' },
   { id: 'wecom', label: '企业微信' },
-  { id: 'weixin', label: '微信' },
   { id: 'qq', label: 'QQ' },
   { id: 'slack', label: 'Slack' },
   { id: 'telegram', label: 'Telegram' },
@@ -61,67 +67,6 @@ const CHANNELS = Object.freeze([
   { id: 'whatsapp', label: 'WhatsApp' },
   { id: 'office', label: 'AI Office', note: '（实验功能）' },
 ]);
-
-const CHANNEL_STATUS_LABELS = Object.freeze({
-  connected: '已连接',
-  offline: '已配置，未连接',
-  unconfigured: '未配置',
-  unknown: '状态未知',
-});
-
-function unwrapStatusValue(result) {
-  if (result && typeof result === 'object' && result.ok === true) return result.value;
-  return result;
-}
-
-function channelStatusFromSnapshot(value) {
-  const bots = Array.isArray(value?.bots) ? value.bots : [];
-  if (bots.length > 0) {
-    return bots.some((bot) => bot?.connected === true) ? 'connected' : 'offline';
-  }
-  if (value?.configured === true) return value?.connected === true ? 'connected' : 'offline';
-  return 'unconfigured';
-}
-
-// 轮询全部渠道的 connection.status，驱动左栏状态点与头部汇总。
-function useChannelStatuses(rpcCalls) {
-  const [statuses, setStatuses] = React.useState({});
-  React.useEffect(() => {
-    let disposed = false;
-    const fetchAll = async () => {
-      const entries = await Promise.all(CHANNELS.map(async (channel) => {
-        const rpcCall = rpcCalls[channel.id];
-        if (typeof rpcCall !== 'function') return [channel.id, 'unknown'];
-        try {
-          const snapshot = unwrapStatusValue(await rpcCall('connection.status', {}));
-          return [channel.id, channelStatusFromSnapshot(snapshot)];
-        } catch {
-          return [channel.id, 'unknown'];
-        }
-      }));
-      if (!disposed) setStatuses(Object.fromEntries(entries));
-    };
-    void fetchAll();
-    const timer = setInterval(fetchAll, 15_000);
-    return () => {
-      disposed = true;
-      clearInterval(timer);
-    };
-    // rpcCalls 在 apply 中创建一次，引用稳定。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-  return statuses;
-}
-
-function ChannelStatusDot({ state }) {
-  const tone = CHANNEL_STATUS_LABELS[state] ? state : 'unknown';
-  return h('span', {
-    className: `dim-channelStatus dim-channelStatus-${tone}`,
-    title: CHANNEL_STATUS_LABELS[tone],
-    'aria-label': CHANNEL_STATUS_LABELS[tone],
-    role: 'status',
-  });
-}
 
 function WeixinLogo() {
   return h('span', { className: 'dim-logo dim-logoWeixin', 'aria-hidden': 'true' },
@@ -184,6 +129,22 @@ function ChannelLogo({ channel }) {
   return h(OfficeLogo);
 }
 
+export function LoopbackRecoveryNotice({ recovery, onNavigate = replacePageLocation }) {
+  return h('div', {
+    className: 'dim-loopbackRecovery',
+    role: 'alert',
+  },
+  h('div', { className: 'dim-loopbackRecoveryCopy' },
+    h('strong', null, '请改用 localhost 重新打开'),
+    h('p', null, '页面会在当前端口重新打开，机器人配置不会改变。'),
+    h('code', null, recovery.origin)),
+  h('button', {
+    type: 'button',
+    className: 'dim-loopbackRecoveryAction',
+    onClick: () => onNavigate(recovery.url),
+  }, '使用 localhost 重新打开'));
+}
+
 export function IMSettingsTab({
   dingtalkRpcCall,
   discordRpcCall,
@@ -195,38 +156,66 @@ export function IMSettingsTab({
   weixinRpcCall,
   whatsappRpcCall,
   officeRpcCall,
+  updateRpcCall,
   workspaceDirectoryPicker,
+  browserLocation = globalThis.location,
+  navigateToRecoveryUrl = replacePageLocation,
 }) {
-  const [selected, setSelected] = React.useState('feishu');
+  const [selected, setSelected] = React.useState('weixin');
+  const [loopbackRecovery, setLoopbackRecovery] = React.useState(null);
+  const [runningVersion, setRunningVersion] = React.useState(IM_PLUGIN_VERSION);
   const githubTooltipId = React.useId();
-  const statuses = useChannelStatuses({
-    dingtalk: dingtalkRpcCall,
-    discord: discordRpcCall,
-    feishu: feishuRpcCall,
-    qq: qqRpcCall,
-    slack: slackRpcCall,
-    telegram: telegramRpcCall,
-    wecom: wecomRpcCall,
-    weixin: weixinRpcCall,
-    whatsapp: whatsappRpcCall,
-    office: officeRpcCall,
-  });
-  const statusCounts = CHANNELS.reduce((counts, channel) => {
-    const state = statuses[channel.id];
-    if (state === 'connected') counts.connected += 1;
-    else if (state === 'offline') counts.offline += 1;
-    return counts;
-  }, { connected: 0, offline: 0 });
-  const unconfigured = CHANNELS.length - statusCounts.connected - statusCounts.offline;
   const active = CHANNELS.find((channel) => channel.id === selected) ?? CHANNELS[0];
+  const reportLoopbackRecovery = React.useCallback((recovery) => {
+    setLoopbackRecovery((current) => current?.url === recovery.url ? current : recovery);
+  }, []);
+  const reportUpdateStatus = React.useCallback((snapshot) => {
+    setRunningVersion(snapshot.runningVersion);
+  }, []);
+  const rpcCalls = React.useMemo(() => createLoopbackAwareRpcCalls({
+    dingtalkRpcCall,
+    discordRpcCall,
+    feishuRpcCall,
+    qqRpcCall,
+    slackRpcCall,
+    telegramRpcCall,
+    wecomRpcCall,
+    weixinRpcCall,
+    whatsappRpcCall,
+    officeRpcCall,
+    updateRpcCall,
+  }, {
+    location: browserLocation,
+    onRecovery: reportLoopbackRecovery,
+  }), [
+    browserLocation,
+    dingtalkRpcCall,
+    discordRpcCall,
+    feishuRpcCall,
+    officeRpcCall,
+    qqRpcCall,
+    reportLoopbackRecovery,
+    slackRpcCall,
+    telegramRpcCall,
+    updateRpcCall,
+    wecomRpcCall,
+    weixinRpcCall,
+    whatsappRpcCall,
+  ]);
   return h(WorkspaceDirectoryPickerContext.Provider, { value: workspaceDirectoryPicker },
     h('section', { className: 'dim-page', 'aria-label': 'IM机器人设置' },
     h('header', { className: 'dim-title' },
       h('div', { className: 'dim-brand' },
-        h('strong', { className: 'dim-brandName' }, 'DSH-IM'),
-        h('p', null, '让 DeepSeek Harness 触手可及'),
-        h('p', { className: 'dim-channelSummary', role: 'status' },
-          `已连接 ${statusCounts.connected} · 未连接 ${statusCounts.offline} · 未配置 ${unconfigured}`)),
+        h('div', { className: 'dim-brandHeading' },
+          h('strong', { className: 'dim-brandName' }, 'DSH-IM'),
+          h('span', { className: 'dim-brandVersion' }, `v${runningVersion}`)),
+        h('p', null, '让 DeepSeek Harness 触手可及')),
+      h('div', { className: 'dim-titleActions' },
+        h(UpdatePanel, {
+          rpcCall: rpcCalls.updateRpcCall,
+          clientVersion: IM_PLUGIN_VERSION,
+          onStatus: reportUpdateStatus,
+        }),
       h('span', { className: 'dim-githubAction' },
         h('a', {
           className: 'dim-githubLink',
@@ -242,7 +231,7 @@ export function IMSettingsTab({
           id: githubTooltipId,
           className: 'dim-githubTooltip',
           role: 'tooltip',
-        }, '帮助与反馈 · 前往 GitHub')),
+        }, '帮助与反馈 · 前往 GitHub'))),
     ),
     h('div', { className: 'dim-layout' },
       h('nav', { className: 'dim-rail', role: 'tablist', 'aria-label': 'IM 渠道' },
@@ -260,33 +249,39 @@ export function IMSettingsTab({
         h('span', { className: 'dim-channelCopy' },
           h('strong', null, channel.label),
           channel.note ? h('small', { className: 'dim-channelNote' }, channel.note) : null,
-        ),
-        h(ChannelStatusDot, { state: statuses[channel.id] })))),
+        )))),
       h('div', { className: 'dim-divider', 'aria-hidden': 'true' }),
       h('main', {
         className: 'dim-panel',
         role: 'tabpanel',
         id: `dim-panel-${active.id}`,
         'aria-labelledby': `dim-tab-${active.id}`,
-      }, active.id === 'weixin'
-        ? h(WeixinSettingsTab, { rpcCall: weixinRpcCall })
+      },
+      loopbackRecovery
+        ? h(LoopbackRecoveryNotice, {
+            recovery: loopbackRecovery,
+            onNavigate: navigateToRecoveryUrl,
+          })
+        : null,
+      active.id === 'weixin'
+        ? h(WeixinSettingsTab, { rpcCall: rpcCalls.weixinRpcCall })
         : active.id === 'feishu'
-          ? h(FeishuSettingsTab, { rpcCall: feishuRpcCall })
+          ? h(FeishuSettingsTab, { rpcCall: rpcCalls.feishuRpcCall })
           : active.id === 'dingtalk'
-            ? h(DingtalkSettingsTab, { rpcCall: dingtalkRpcCall })
+            ? h(DingtalkSettingsTab, { rpcCall: rpcCalls.dingtalkRpcCall })
             : active.id === 'wecom'
-              ? h(WecomSettingsTab, { rpcCall: wecomRpcCall })
+              ? h(WecomSettingsTab, { rpcCall: rpcCalls.wecomRpcCall })
               : active.id === 'qq'
-                ? h(QqSettingsTab, { rpcCall: qqRpcCall })
+                ? h(QqSettingsTab, { rpcCall: rpcCalls.qqRpcCall })
                 : active.id === 'slack'
-                  ? h(SlackSettingsTab, { rpcCall: slackRpcCall })
+                  ? h(SlackSettingsTab, { rpcCall: rpcCalls.slackRpcCall })
                 : active.id === 'telegram'
-                  ? h(TelegramSettingsTab, { rpcCall: telegramRpcCall })
+                  ? h(TelegramSettingsTab, { rpcCall: rpcCalls.telegramRpcCall })
                   : active.id === 'discord'
-                    ? h(DiscordSettingsTab, { rpcCall: discordRpcCall })
+                    ? h(DiscordSettingsTab, { rpcCall: rpcCalls.discordRpcCall })
                     : active.id === 'whatsapp'
-                      ? h(WhatsappSettingsTab, { rpcCall: whatsappRpcCall })
-                      : h(OfficeSettingsTab, { rpcCall: officeRpcCall })),
+                      ? h(WhatsappSettingsTab, { rpcCall: rpcCalls.whatsappRpcCall })
+                      : h(OfficeSettingsTab, { rpcCall: rpcCalls.officeRpcCall })),
     ),
   ));
 }
@@ -337,16 +332,17 @@ export function apply(ctx) {
     ctx.connection.rpc.call(SLACK_RPC_CHANNEL, endpoint, payload, signal);
   const officeRpcCall = (endpoint, payload, signal) =>
     ctx.connection.rpc.call(OFFICE_RPC_CHANNEL, endpoint, payload, signal);
+  const updateRpcCall = (endpoint, payload, signal) =>
+    ctx.connection.rpc.call(UPDATE_RPC_CHANNEL, endpoint, payload, signal);
   const workspaceDirectoryPicker = Object.freeze({
     listDirectory: (path, signal) => ctx.workspaces.listDirectory(path, signal),
     pickDirectory: () => ctx.workspaces.pickDirectory(),
   });
 
-  // 个人 fork 调整：从「设置 → 插件」子标签提升为设置页一级菜单（顶部导航可见）。
   ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section',
-    id: 'im',
-    order: 20,
+    id: 'onlyforchris-dsh-im',
+    order: 21,
     label: () => t('IM机器人'),
     locale: IM_LOCALE_NAMESPACE,
     inject: () => ({
@@ -360,6 +356,7 @@ export function apply(ctx) {
       weixinRpcCall,
       whatsappRpcCall,
       officeRpcCall,
+      updateRpcCall,
       workspaceDirectoryPicker,
     }),
   }, IMSettingsTab));

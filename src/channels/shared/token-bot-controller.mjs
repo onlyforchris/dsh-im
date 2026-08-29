@@ -1,4 +1,6 @@
 import { connectionTestMessage } from './connection-test.mjs';
+import { t } from './i18n.mjs';
+import { publicMessageFailure } from './message-failure.mjs';
 
 function cleanString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
@@ -70,7 +72,9 @@ export class TokenBotController {
         if (!token) {
           this.#errors.set(config.botId, safeError(
             'missing-token',
-            `${this.#descriptor.label}机器人凭据缺失，请移除后重新接入。`,
+            t('{label}机器人凭据缺失，请移除后重新接入。', {
+              label: this.#descriptor.label,
+            }),
           ));
           return;
         }
@@ -80,7 +84,9 @@ export class TokenBotController {
         } catch (error) {
           this.#errors.set(config.botId, safeError(
             'connection-failed',
-            `${this.#descriptor.label}连接未就绪，插件会自动重试。`,
+            t('{label}连接未就绪，插件会自动重试。', {
+              label: this.#descriptor.label,
+            }),
           ));
           this.#logger.warn?.(
             `[dsh-im:${this.#descriptor.key}] bot ${config.botId} failed to initialize:`,
@@ -129,7 +135,9 @@ export class TokenBotController {
       } catch (error) {
         this.#errors.set(identity.botId, safeError(
           'connection-failed',
-          `${this.#descriptor.label}机器人已接入，消息连接暂未就绪。`,
+          t('{label}机器人已接入，消息连接暂未就绪。', {
+            label: this.#descriptor.label,
+          }),
         ));
         this.#logger.warn?.(
           `[dsh-im:${this.#descriptor.key}] bot ${identity.botId} credential connection failed:`,
@@ -153,7 +161,9 @@ export class TokenBotController {
       } catch (error) {
         this.#errors.set(botId, safeError(
           'connection-failed',
-          `${this.#descriptor.label}连接仍未就绪，请稍后重试。`,
+          t('{label}连接仍未就绪，请稍后重试。', {
+            label: this.#descriptor.label,
+          }),
         ));
         throw error;
       } finally {
@@ -181,7 +191,9 @@ export class TokenBotController {
       } catch (error) {
         this.#errors.set(botId, safeError(
           'connection-failed',
-          `${this.#descriptor.label}连接仍未就绪，请稍后重试。`,
+          t('{label}连接仍未就绪，请稍后重试。', {
+            label: this.#descriptor.label,
+          }),
         ));
         throw error;
       } finally {
@@ -197,14 +209,19 @@ export class TokenBotController {
     return this.#withBotTransition(botId, async () => {
       const runtime = this.#runtimes.get(botId);
       if (!runtime?.status?.ready || typeof runtime.sendConnectionTest !== 'function') {
-        const error = new Error(`${this.#descriptor.label}机器人尚未连接`);
+        const error = new Error(t('{label}机器人尚未连接', {
+          label: this.#descriptor.label,
+        }));
         error.code = 'test-target-unavailable';
         throw error;
       }
-      const cardLabel = `${config.name}（${this.#maskPlatformId(config.platformId)}）`;
+      const cardLabel = t('{name}（{id}）', {
+        name: config.name,
+        id: this.#maskPlatformId(config.platformId),
+      });
       await runtime.sendConnectionTest(connectionTestMessage(
         cardLabel,
-        `${this.#descriptor.label}机器人`,
+        t('{label}机器人', { label: this.#descriptor.label }),
       ));
       return { sent: true };
     });
@@ -260,9 +277,14 @@ export class TokenBotController {
         },
         health: {
           status: connected ? 'healthy' : state === 'error' ? 'error' : 'offline',
-          summary: connected ? `${this.#descriptor.label}${this.#descriptor.connectionLabel}运行正常`
-            : state === 'error' ? `${this.#descriptor.label}连接未就绪，插件会自动重试`
-              : `${this.#descriptor.label}连接当前离线`,
+          summary: connected ? t('{label}{connectionLabel}运行正常', {
+            label: this.#descriptor.label,
+            connectionLabel: t(this.#descriptor.connectionLabel),
+          })
+            : state === 'error' ? t('{label}连接未就绪，插件会自动重试', {
+              label: this.#descriptor.label,
+            })
+              : t('{label}连接当前离线', { label: this.#descriptor.label }),
           lastCheckedAt: runtimeStatus?.lastCheckedAt ?? null,
           lastConnectedAt: runtimeStatus?.lastConnectedAt ?? null,
         },
@@ -270,6 +292,7 @@ export class TokenBotController {
           messagesReceived: runtimeStatus?.messagesReceived ?? 0,
           messagesReplied: runtimeStatus?.messagesReplied ?? 0,
         },
+        lastMessageError: publicMessageFailure(runtimeStatus?.lastMessageError),
         error: structuredClone(this.#errors.get(config.botId) ?? null),
       };
     });

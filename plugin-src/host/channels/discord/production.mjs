@@ -13,6 +13,5 @@ export function createProductionController(ctx, config = {}, internals = {}) {
     HarnessClient: DiscordHarnessClient,
     Controller: DiscordController,
     Runtime: DiscordRuntime,
-    runtimeOptions: () => ({ sourceChannelLabel: 'Discord' }),
   });
 }

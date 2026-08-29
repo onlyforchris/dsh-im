@@ -1,15 +1,15 @@
 import { WSAuthFailureError, WSClient, WSReconnectExhaustedError } from '@wecom/aibot-node-sdk';
 
-import { createWecomBridgeStatus, WecomHarnessBridge } from './wecom-bridge.mjs';
+import { createWecomBridgeStatus, WecomHarnessBridge, sendWecomImage } from './wecom-bridge.mjs';
 import {
   connectionTestTarget,
   connectionTestTargetUnavailable,
-  latestBoundConversation,
+  sendRememberedConnectionTest,
 } from '../shared/connection-test.mjs';
+import { t } from '../shared/i18n.mjs';
 
-function nonEmptyString(value) {
-  return typeof value === 'string' && value.trim() ? value.trim() : null;
-}
+// 通知图片上传超时；独立于回复链路的 replyTimeoutMs。
+const NOTIFICATION_FILE_UPLOAD_TIMEOUT_MS = 30_000;
 
 function timeoutError() {
   const error = new Error('Enterprise WeChat WebSocket authentication timed out');
@@ -51,13 +51,13 @@ export class WecomRuntime {
   constructor({
     config,
     secret,
+    sourceChannelLabel,
     harness,
     state,
     logger = console,
     replyTimeoutMs = 600_000,
     connectTimeoutMs = 20_000,
     maxReconnectAttempts = 10,
-    sourceChannelLabel,
     createClient = (options) => new WSClient(options),
   }) {
     if (!config || !secret || !harness || !state) {
@@ -71,8 +71,8 @@ export class WecomRuntime {
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#connectTimeoutMs = connectTimeoutMs;
     this.#maxReconnectAttempts = maxReconnectAttempts;
-    this.#sourceChannelLabel = sourceChannelLabel;
     this.#createClient = createClient;
+    this.#sourceChannelLabel = sourceChannelLabel;
   }
 
   get status() {
@@ -211,22 +211,53 @@ export class WecomRuntime {
   }
 
   async sendConnectionTest(text) {
-    return this.sendNotification(text);
+    const result = await sendRememberedConnectionTest({
+      state: this.#state,
+      text,
+      channelLabel: t('企业微信机器人'),
+      send: async ({ chatId }, content) => {
+        if (!this.#status.ready || !this.#client) {
+          throw new Error('Enterprise WeChat runtime is not connected');
+        }
+        await this.#client.sendMessage(chatId, {
+          msgtype: 'markdown',
+          markdown: { content },
+        });
+        return { mode: 'text' };
+      },
+    });
+    return { ...result, mode: 'text' };
   }
 
+  /**
+   * 发送主动通知（S5 outbox 消费路径，04_13 P0-B）。
+   * 目标固定为已绑定机器人后记住的私聊 target（outbox 事件按契约不携带收件人）。
+   * 图片不可用时退化为纯文本（text-fallback），通知事实不因表现层失败而丢失；
+   * 无记住目标或连接未就绪时抛错，由 outbox 保留事件等待重试（fail-closed）。
+   */
   async sendNotification(text, media) {
-    const remembered = connectionTestTarget(this.#state);
-    const chatId = nonEmptyString(remembered?.chatId)
-      ?? latestBoundConversation(this.#state, 'direct:')?.id;
-    if (!chatId) throw connectionTestTargetUnavailable('企业微信机器人');
+    const target = connectionTestTarget(this.#state);
+    if (!target) throw connectionTestTargetUnavailable(t('企业微信机器人'));
     if (!this.#status.ready || !this.#client) {
       throw new Error('Enterprise WeChat runtime is not connected');
+    }
+    const chatId = target.chatId;
+    let mode = 'text';
+    if (media?.type === 'image') {
+      try {
+        await sendWecomImage(this.#client, chatId, media.path, {
+          timeoutMs: NOTIFICATION_FILE_UPLOAD_TIMEOUT_MS,
+        });
+        mode = 'image';
+      } catch {
+        mode = 'text-fallback';
+      }
     }
     await this.#client.sendMessage(chatId, {
       msgtype: 'markdown',
       markdown: { content: text },
     });
-    return { sent: true, mode: media ? 'text-fallback' : 'text' };
+    return { sent: true, mode };
   }
 
   async #stopActive() {

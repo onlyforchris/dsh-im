@@ -1,0 +1,582 @@
+commit fe7293f7dbbef749ee5ae8916791689007aeecd0
+Author: Chris <zhangjim117@163.com>
+Date:   Thu Aug 27 13:01:43 2026 +0800
+
+    fix(weixin): relax notification outbox contract and add outbound image support
+    
+    - notification outbox: accept any well-formed event type (dot/hyphen style,
+      up to 128 chars) instead of the hardcoded recruiting.score_ready whitelist;
+      schema_version, event_id, text and media validation unchanged. The type
+      field is never consumed by the delivery path, so the whitelist only
+      rejected new producer events into failed/ without adding safety.
+    - weixin api: sendImage via trusted CDN upload endpoint (AES-128-ECB, 10MB cap)
+    - production assembly: forward media from the outbox to sendNotification
+
+diff --git a/plugin-src/host/channels/weixin/production.mjs b/plugin-src/host/channels/weixin/production.mjs
+index 0b02bad..a42628b 100644
+--- a/plugin-src/host/channels/weixin/production.mjs
++++ b/plugin-src/host/channels/weixin/production.mjs
+@@ -141,7 +141,7 @@ export async function createProductionController(ctx, config = {}, internals = {
+         dir: config.notificationOutboxDir,
+         pollIntervalMs: config.notificationPollIntervalMs ?? 5_000,
+         logger,
+-        send: (text) => controller.sendNotification(config.notificationBotId, text),
++        send: (text, media) => controller.sendNotification(config.notificationBotId, text, media),
+       })
+     : null;
+   const supervisor = createSupervisor({
+diff --git a/src/channels/weixin/notification-outbox.mjs b/src/channels/weixin/notification-outbox.mjs
+index 4809234..9a57e9d 100644
+--- a/src/channels/weixin/notification-outbox.mjs
++++ b/src/channels/weixin/notification-outbox.mjs
+@@ -1,5 +1,5 @@
+-import { mkdir, readdir, readFile, rename } from 'node:fs/promises';
+-import { join, resolve } from 'node:path';
++import { mkdir, readdir, readFile, realpath, rename, stat, writeFile } from 'node:fs/promises';
++import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+ 
+ class InvalidNotification extends Error {}
+ 
+@@ -8,16 +8,18 @@ export class NotificationOutbox {
+   #send;
+   #logger;
+   #pollIntervalMs;
++  #mediaDir;
+   #timer = null;
+   #running = null;
+ 
+-  constructor({ dir, send, logger = console, pollIntervalMs = 5_000 }) {
++  constructor({ dir, send, logger = console, pollIntervalMs = 5_000, mediaDir }) {
+     if (!dir) throw new TypeError('notification outbox dir is required');
+     if (typeof send !== 'function') throw new TypeError('notification send function is required');
+     this.#dir = resolve(dir);
+     this.#send = send;
+     this.#logger = logger;
+     this.#pollIntervalMs = pollIntervalMs;
++    this.#mediaDir = resolve(mediaDir ?? join(this.#dir, '..', 'dsh_media'));
+   }
+ 
+   async start() {
+@@ -67,7 +69,12 @@ export class NotificationOutbox {
+     try {
+       const event = JSON.parse(await readFile(processing, 'utf8'));
+       this.#validate(event);
+-      await this.#send(event.text);
++      const media = await this.#validatedMedia(event.media);
++      const delivery = await this.#send(event.text, media);
++      if (delivery?.mode === 'image' || delivery?.mode === 'text' || delivery?.mode === 'text-fallback') {
++        event.delivery = { mode: delivery.mode, delivered_at: new Date().toISOString() };
++        await writeFile(processing, `${JSON.stringify(event, null, 2)}\n`, 'utf8');
++      }
+       await rename(processing, join(this.#dir, 'sent', name));
+     } catch (error) {
+       if (error instanceof InvalidNotification || error instanceof SyntaxError) {
+@@ -83,10 +90,39 @@ export class NotificationOutbox {
+ 
+   #validate(event) {
+     if (!event || event.schema_version !== 1) throw new InvalidNotification('unsupported schema_version');
+-    if (event.type !== 'recruiting.score_ready') throw new InvalidNotification('unsupported event type');
++    // type 仅要求非空且为点分/连字符风格的事件名；具体取值由生产方自行定义，
++    // 消费方不消费该字段，这里只做防垃圾校验，不做业务白名单。
++    if (typeof event.type !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,127}$/i.test(event.type)) {
++      throw new InvalidNotification('invalid event type');
++    }
+     if (!/^[a-z0-9][a-z0-9-]{0,127}$/i.test(event.event_id ?? '')) throw new InvalidNotification('invalid event_id');
+     if (typeof event.text !== 'string' || !event.text.trim() || event.text.length > 12_000) {
+       throw new InvalidNotification('invalid text');
+     }
+   }
++
++  async #validatedMedia(media) {
++    if (media === undefined) return undefined;
++    if (media?.type !== 'image' || typeof media.path !== 'string' || !isAbsolute(media.path)) {
++      throw new InvalidNotification('invalid media');
++    }
++    if (!['.png', '.jpg', '.jpeg'].includes(extname(media.path).toLowerCase())) {
++      throw new InvalidNotification('unsupported media type');
++    }
++    try {
++      const [root, file] = await Promise.all([realpath(this.#mediaDir), realpath(media.path)]);
++      const rel = relative(root, file);
++      if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
++        throw new InvalidNotification('media path is outside notification media directory');
++      }
++      const info = await stat(file);
++      if (!info.isFile() || info.size === 0 || info.size > 10 * 1024 * 1024) {
++        throw new InvalidNotification('invalid media file');
++      }
++      return { type: 'image', path: file };
++    } catch (error) {
++      if (error instanceof InvalidNotification) throw error;
++      throw new InvalidNotification('media file is unavailable');
++    }
++  }
+ }
+diff --git a/src/channels/weixin/weixin-api.mjs b/src/channels/weixin/weixin-api.mjs
+index a1429a8..efc9982 100644
+--- a/src/channels/weixin/weixin-api.mjs
++++ b/src/channels/weixin/weixin-api.mjs
+@@ -1,4 +1,11 @@
+-import { createDecipheriv, randomBytes, randomUUID } from 'node:crypto';
++import {
++  createCipheriv,
++  createDecipheriv,
++  createHash,
++  randomBytes,
++  randomUUID,
++} from 'node:crypto';
++import { request as httpsRequest } from 'node:https';
+ 
+ import { fetchImageBuffer } from '../shared/image-prompt.mjs';
+ 
+@@ -8,6 +15,7 @@ export const DEFAULT_BOT_TYPE = '3';
+ export const WEIXIN_CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
+ 
+ const WEIXIN_CDN_HOST = 'novac2c.cdn.weixin.qq.com';
++const MAX_OUTBOUND_IMAGE_BYTES = 10 * 1024 * 1024;
+ 
+ const ILINK_APP_ID = 'bot';
+ const ILINK_CLIENT_VERSION = (2 << 16) | (4 << 8) | 6;
+@@ -43,6 +51,58 @@ function strictBase64(value) {
+   return Buffer.from(text, 'base64');
+ }
+ 
++function encryptWeixinImage(plaintext, key) {
++  const cipher = createCipheriv('aes-128-ecb', key, null);
++  return Buffer.concat([cipher.update(plaintext), cipher.final()]);
++}
++
++function trustedCdnUploadUrl(value) {
++  let url;
++  try {
++    url = new URL(value);
++  } catch {
++    throw new WeixinApiError('invalid-upload-url', '微信图片上传地址无效。');
++  }
++  if (url.protocol !== 'https:' || url.hostname !== WEIXIN_CDN_HOST
++    || (url.port && url.port !== '443') || !url.pathname.startsWith('/c2c/upload')) {
++    throw new WeixinApiError('untrusted-upload-url', '微信图片上传地址不受信任。');
++  }
++  return url;
++}
++
++function headerValue(headers, name) {
++  const value = headers?.[name];
++  return Array.isArray(value) ? value[0] : value;
++}
++
++function postWeixinCdn(url, body, { signal } = {}) {
++  const target = trustedCdnUploadUrl(url);
++  return new Promise((resolve, reject) => {
++    if (signal?.aborted) {
++      reject(abortError(signal));
++      return;
++    }
++    const request = httpsRequest(target, {
++      method: 'POST',
++      headers: {
++        'content-type': 'application/octet-stream',
++        'content-length': String(body.length),
++      },
++    }, (response) => {
++      response.resume();
++      response.on('end', () => resolve({
++        status: response.statusCode ?? 0,
++        headers: response.headers,
++      }));
++    });
++    const onAbort = () => request.destroy(abortError(signal));
++    signal?.addEventListener('abort', onAbort, { once: true });
++    request.on('error', reject);
++    request.on('close', () => signal?.removeEventListener('abort', onAbort));
++    request.end(body);
++  });
++}
++
+ /** Parse the two AES key encodings used by Weixin iLink image messages. */
+ export function parseWeixinImageAesKey(imageItem) {
+   const directHex = nonEmptyString(imageItem?.aeskey);
+@@ -258,8 +318,9 @@ function validateLoginResponse(value) {
+   return value;
+ }
+ 
+-export function createWeixinApi({ fetchImpl = fetch } = {}) {
++export function createWeixinApi({ fetchImpl = fetch, cdnPostImpl = postWeixinCdn } = {}) {
+   if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function');
++  if (typeof cdnPostImpl !== 'function') throw new TypeError('cdnPostImpl must be a function');
+ 
+   return Object.freeze({
+     inboundImages(message) {
+@@ -349,6 +410,85 @@ export function createWeixinApi({ fetchImpl = fetch } = {}) {
+       return true;
+     },
+ 
++    async sendImage({ baseUrl, token, toUserId, data, contextToken, runId, signal }) {
++      const recipient = nonEmptyString(toUserId);
++      const plaintext = Buffer.from(data ?? []);
++      if (!recipient || plaintext.length === 0 || plaintext.length > MAX_OUTBOUND_IMAGE_BYTES) {
++        throw new TypeError('toUserId and an image up to 10 MB are required');
++      }
++      const filekey = randomBytes(16).toString('hex');
++      const aesKey = randomBytes(16);
++      const ciphertext = encryptWeixinImage(plaintext, aesKey);
++      const upload = await requestJson(fetchImpl, {
++        method: 'POST',
++        baseUrl,
++        endpoint: 'ilink/bot/getuploadurl',
++        token,
++        signal,
++        body: {
++          filekey,
++          media_type: 1,
++          to_user_id: recipient,
++          rawsize: plaintext.length,
++          rawfilemd5: createHash('md5').update(plaintext).digest('hex'),
++          filesize: ciphertext.length,
++          no_need_thumb: true,
++          aeskey: aesKey.toString('hex'),
++          base_info: baseInfo(),
++        },
++      });
++      if (upload?.ret !== undefined && upload.ret !== 0) {
++        throw new WeixinApiError('upload-url-rejected', '微信服务拒绝了图片上传请求。');
++      }
++      const uploadUrl = nonEmptyString(upload?.upload_full_url)
++        ?? (nonEmptyString(upload?.upload_param)
++          ? `${WEIXIN_CDN_BASE_URL}/upload?encrypted_query_param=${encodeURIComponent(upload.upload_param)}&filekey=${encodeURIComponent(filekey)}`
++          : null);
++      if (!uploadUrl) throw new WeixinApiError('missing-upload-url', '微信服务没有返回图片上传地址。');
++      const uploaded = await cdnPostImpl(uploadUrl, ciphertext, { signal });
++      if (uploaded?.status !== 200) {
++        throw new WeixinApiError('cdn-upload-failed', `微信图片上传失败（HTTP ${uploaded?.status ?? 0}）。`);
++      }
++      const downloadParam = nonEmptyString(headerValue(uploaded.headers, 'x-encrypted-param'));
++      if (!downloadParam) {
++        throw new WeixinApiError('missing-download-param', '微信图片上传未返回下载参数。');
++      }
++      const response = await requestJson(fetchImpl, {
++        method: 'POST',
++        baseUrl,
++        endpoint: 'ilink/bot/sendmessage',
++        token,
++        signal,
++        body: {
++          msg: {
++            from_user_id: '',
++            to_user_id: recipient,
++            client_id: `dsh-weixin-${randomUUID()}`,
++            message_type: 2,
++            message_state: 2,
++            item_list: [{
++              type: 2,
++              image_item: {
++                media: {
++                  encrypt_query_param: downloadParam,
++                  aes_key: Buffer.from(aesKey.toString('hex'), 'ascii').toString('base64'),
++                  encrypt_type: 1,
++                },
++                mid_size: ciphertext.length,
++              },
++            }],
++            ...(nonEmptyString(contextToken) ? { context_token: contextToken.trim() } : {}),
++            ...(nonEmptyString(runId) ? { run_id: runId.trim() } : {}),
++          },
++          base_info: baseInfo(),
++        },
++      });
++      if (response?.ret !== undefined && response.ret !== 0) {
++        throw new WeixinApiError('send-rejected', '微信服务拒绝了图片消息。');
++      }
++      return true;
++    },
++
+     async notifyStart({ baseUrl, token, signal }) {
+       const response = await requestJson(fetchImpl, {
+         method: 'POST',
+diff --git a/src/channels/weixin/weixin-controller.mjs b/src/channels/weixin/weixin-controller.mjs
+index ddc7a5d..af96cad 100644
+--- a/src/channels/weixin/weixin-controller.mjs
++++ b/src/channels/weixin/weixin-controller.mjs
+@@ -286,7 +286,7 @@ export class WeixinController {
+     });
+   }
+ 
+-  async sendNotification(botId, text) {
++  async sendNotification(botId, text, media) {
+     const config = this.#configStore.get(botId);
+     if (!config) throw new Error('Unknown Weixin account');
+     return this.#withBotTransition(botId, async () => {
+@@ -294,7 +294,7 @@ export class WeixinController {
+       if (!runtime?.status?.ready || typeof runtime.sendNotification !== 'function') {
+         throw new Error('Weixin runtime is not connected');
+       }
+-      return runtime.sendNotification(text);
++      return runtime.sendNotification(text, media);
+     });
+   }
+ 
+diff --git a/src/channels/weixin/weixin-runtime.mjs b/src/channels/weixin/weixin-runtime.mjs
+index 4a4ca8a..a5f0100 100644
+--- a/src/channels/weixin/weixin-runtime.mjs
++++ b/src/channels/weixin/weixin-runtime.mjs
+@@ -1,3 +1,5 @@
++import { readFile } from 'node:fs/promises';
++
+ import { WeixinApiError } from './weixin-api.mjs';
+ import { createWeixinBridgeStatus, WeixinHarnessBridge } from './weixin-bridge.mjs';
+ import {
+@@ -275,7 +277,7 @@ export class WeixinRuntime {
+     return this.status;
+   }
+ 
+-  async sendNotification(text) {
++  async sendNotification(text, media) {
+     const remembered = connectionTestTarget(this.#state);
+     const toUserId = typeof remembered?.toUserId === 'string' && remembered.toUserId.trim()
+       ? remembered.toUserId.trim()
+@@ -286,6 +288,28 @@ export class WeixinRuntime {
+     if (!this.#status.ready || !this.#abortController) {
+       throw new Error('Weixin runtime is not connected');
+     }
++    if (media?.type === 'image') {
++      try {
++        await this.#api.sendImage({
++          baseUrl: this.#config.baseUrl,
++          token: this.#token,
++          toUserId,
++          data: await readFile(media.path),
++          signal: this.#abortController.signal,
++        });
++        return { sent: true, mode: 'image' };
++      } catch (error) {
++        this.#logger.warn?.('[dsh-weixin] image notification failed; sending text fallback:', error);
++        await this.#api.sendText({
++          baseUrl: this.#config.baseUrl,
++          token: this.#token,
++          toUserId,
++          text,
++          signal: this.#abortController.signal,
++        });
++        return { sent: true, mode: 'text-fallback' };
++      }
++    }
+     await this.#api.sendText({
+       baseUrl: this.#config.baseUrl,
+       token: this.#token,
+@@ -293,7 +317,7 @@ export class WeixinRuntime {
+       text,
+       signal: this.#abortController.signal,
+     });
+-    return { sent: true };
++    return { sent: true, mode: 'text' };
+   }
+ 
+   async sendConnectionTest(text) {
+diff --git a/test/channels/weixin/notification-outbox.test.mjs b/test/channels/weixin/notification-outbox.test.mjs
+index 520ea2a..0441aee 100644
+--- a/test/channels/weixin/notification-outbox.test.mjs
++++ b/test/channels/weixin/notification-outbox.test.mjs
+@@ -1,5 +1,5 @@
+ import assert from 'node:assert/strict';
+-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
++import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+ import { tmpdir } from 'node:os';
+ import { join } from 'node:path';
+ import test from 'node:test';
+@@ -38,3 +38,89 @@ test('notification outbox retries once then archives the sent event', async () =
+     await rm(dir, { recursive: true, force: true });
+   }
+ });
++
++test('notification outbox accepts any well-formed event type', async () => {
++  const dir = await mkdtemp(join(tmpdir(), 'dsh-im-outbox-type-'));
++  await writeFile(join(dir, 'lead-contact.json'), JSON.stringify({
++    schema_version: 1,
++    event_id: 'lead-contact-test',
++    type: 'recruiting.lead_contact_acquired',
++    text: '新联系人通知',
++  }));
++  const sent = [];
++  const outbox = new NotificationOutbox({
++    dir,
++    pollIntervalMs: 60_000,
++    logger: { warn() {} },
++    send: async (text) => { sent.push(text); },
++  });
++  try {
++    await outbox.start();
++    await outbox.scan();
++    assert.deepEqual(sent, ['新联系人通知']);
++    assert.equal(JSON.parse(await readFile(join(dir, 'sent', 'lead-contact.json'))).type, 'recruiting.lead_contact_acquired');
++  } finally {
++    await outbox.close();
++    await rm(dir, { recursive: true, force: true });
++  }
++});
++
++test('notification outbox rejects malformed event types', async () => {
++  const dir = await mkdtemp(join(tmpdir(), 'dsh-im-outbox-badtype-'));
++  await writeFile(join(dir, 'bad-type.json'), JSON.stringify({
++    schema_version: 1,
++    event_id: 'bad-type-test',
++    type: '',
++    text: '空类型',
++  }));
++  const outbox = new NotificationOutbox({
++    dir,
++    pollIntervalMs: 60_000,
++    logger: { warn() {} },
++    send: async () => { throw new Error('should not be called'); },
++  });
++  try {
++    await outbox.start();
++    await outbox.scan();
++    assert.ok(await readFile(join(dir, 'failed', 'bad-type.json')));
++  } finally {
++    await outbox.close();
++    await rm(dir, { recursive: true, force: true });
++  }
++});
++
++test('notification outbox sends only images from its controlled media directory', async () => {
++  const root = await mkdtemp(join(tmpdir(), 'dsh-im-media-outbox-'));
++  const dir = join(root, 'dsh_outbox');
++  const mediaDir = join(root, 'dsh_media');
++  await Promise.all([mkdir(dir, { recursive: true }), mkdir(mediaDir, { recursive: true })]);
++  const image = join(mediaDir, 'digest.png');
++  await writeFile(image, Buffer.from('png'));
++  await writeFile(join(dir, 'digest.json'), JSON.stringify({
++    schema_version: 1,
++    event_id: 'digest-test',
++    type: 'recruiting.score_ready',
++    text: '招聘摘要',
++    media: { type: 'image', path: image },
++  }));
++  const sent = [];
++  const outbox = new NotificationOutbox({
++    dir,
++    mediaDir,
++    pollIntervalMs: 60_000,
++    send: async (text, media) => {
++      sent.push({ text, media });
++      return { sent: true, mode: 'image' };
++    },
++  });
++  try {
++    await outbox.start();
++    assert.equal(sent[0].text, '招聘摘要');
++    assert.equal(sent[0].media.path, image);
++    const archived = JSON.parse(await readFile(join(dir, 'sent', 'digest.json'), 'utf8'));
++    assert.equal(archived.delivery.mode, 'image');
++  } finally {
++    await outbox.close();
++    await rm(root, { recursive: true, force: true });
++  }
++});
+diff --git a/test/channels/weixin/weixin-api.test.mjs b/test/channels/weixin/weixin-api.test.mjs
+index 71a6664..26d486b 100644
+--- a/test/channels/weixin/weixin-api.test.mjs
++++ b/test/channels/weixin/weixin-api.test.mjs
+@@ -171,6 +171,40 @@ test('sendText emits the iLink message envelope without reflecting the token in
+   assert.doesNotMatch(calls[0].init.body, /host-only-token/);
+ });
+ 
++test('sendImage uploads encrypted PNG bytes and emits an iLink image item', async () => {
++  const calls = [];
++  const uploads = [];
++  const api = createWeixinApi({
++    fetchImpl: async (url, init) => {
++      calls.push({ url: url.toString(), init });
++      return jsonResponse(calls.length === 1 ? { ret: 0, upload_param: 'upload-token' } : { ret: 0 });
++    },
++    cdnPostImpl: async (url, body) => {
++      uploads.push({ url: url.toString(), body: Buffer.from(body) });
++      return { status: 200, headers: { 'x-encrypted-param': 'download-token' } };
++    },
++  });
++  await api.sendImage({
++    baseUrl: 'https://ilinkai.weixin.qq.com',
++    token: 'host-only-token',
++    toUserId: 'wx-user',
++    data: Buffer.from('png bytes'),
++  });
++
++  const uploadRequest = JSON.parse(calls[0].init.body);
++  assert.equal(uploadRequest.media_type, 1);
++  assert.equal(uploadRequest.no_need_thumb, true);
++  assert.match(uploadRequest.aeskey, /^[0-9a-f]{32}$/);
++  assert.match(uploads[0].url, /^https:\/\/novac2c\.cdn\.weixin\.qq\.com\/c2c\/upload\?/);
++  assert.equal(uploads[0].body.length % 16, 0);
++  const sent = JSON.parse(calls[1].init.body);
++  const image = sent.msg.item_list[0];
++  assert.equal(image.type, 2);
++  assert.equal(image.image_item.media.encrypt_query_param, 'download-token');
++  assert.match(Buffer.from(image.image_item.media.aes_key, 'base64').toString('ascii'), /^[0-9a-f]{32}$/);
++  assert.equal(image.image_item.mid_size, uploads[0].body.length);
++});
++
+ test('getUpdates converts its own long-poll timeout into an empty successful poll', async () => {
+   const api = createWeixinApi({
+     fetchImpl: async (_url, init) => new Promise((_resolve, reject) => {
+diff --git a/test/channels/weixin/weixin-runtime.test.mjs b/test/channels/weixin/weixin-runtime.test.mjs
+index 2eb69df..e57ca5d 100644
+--- a/test/channels/weixin/weixin-runtime.test.mjs
++++ b/test/channels/weixin/weixin-runtime.test.mjs
+@@ -1,4 +1,7 @@
+ import assert from 'node:assert/strict';
++import { mkdtemp, rm, writeFile } from 'node:fs/promises';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
+ import test from 'node:test';
+ 
+ import { WeixinApiError } from '../../../src/channels/weixin/weixin-api.mjs';
+@@ -72,7 +75,7 @@ test('runtime sends a connection test to the bound Weixin owner without reply co
+   });
+ 
+   await runtime.start();
+-  assert.deepEqual(await runtime.sendConnectionTest('连接测试'), { sent: true });
++  assert.deepEqual(await runtime.sendConnectionTest('连接测试'), { sent: true, mode: 'text' });
+   assert.equal(sends.length, 1);
+   assert.equal(sends[0].toUserId, 'owner-user');
+   assert.equal(sends[0].text, '连接测试');
+@@ -81,6 +84,40 @@ test('runtime sends a connection test to the bound Weixin owner without reply co
+   await runtime.stop();
+ });
+ 
++test('runtime sends a local notification image to the bound owner', async () => {
++  const dir = await mkdtemp(join(tmpdir(), 'dsh-weixin-runtime-image-'));
++  const imagePath = join(dir, 'digest.png');
++  await writeFile(imagePath, Buffer.from('png'));
++  const sends = [];
++  const runtime = new WeixinRuntime({
++    api: {
++      notifyStart: async () => {},
++      notifyStop: async () => {},
++      sendImage: async (request) => sends.push(request),
++      sendText: async () => assert.fail('image success must not use text fallback'),
++      getUpdates: async ({ signal }) => new Promise((_resolve, reject) => {
++        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
++      }),
++    },
++    config: { botId: 'wx_owner', baseUrl: 'https://ilinkai.weixin.qq.com/', ownerUserId: 'owner-user' },
++    token: 'bot-token',
++    harness: { ensureRunning: async () => true },
++    state: { getUpdatesBuf: () => '' },
++  });
++  try {
++    await runtime.start();
++    assert.deepEqual(
++      await runtime.sendNotification('招聘摘要', { type: 'image', path: imagePath }),
++      { sent: true, mode: 'image' },
++    );
++    assert.equal(sends[0].toUserId, 'owner-user');
++    assert.equal(Buffer.from(sends[0].data).toString(), 'png');
++  } finally {
++    await runtime.stop();
++    await rm(dir, { recursive: true, force: true });
++  }
++});
++
+ test('runtime verifies the token, consumes getUpdates, replies, persists cursor, and aborts on stop', async () => {
+   const calls = [];
+   let pollCount = 0;

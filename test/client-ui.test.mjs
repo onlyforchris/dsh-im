@@ -2,15 +2,18 @@ import assert from 'node:assert/strict';
 import { readFile, readdir } from 'node:fs/promises';
 import test from 'node:test';
 
+import { transform } from 'esbuild';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
 import {
   apply as applyClient,
+  IM_PLUGIN_VERSION,
   IMSettingsTab,
   inject as clientInject,
 } from '../plugin-src/client/index.js';
 import { CredentialBindingPanel } from '../plugin-src/client/credential-binding.js';
+import { ChannelListHeading } from '../plugin-src/client/channel-card-meta.js';
 import { DINGTALK_ENDPOINTS } from '../plugin-src/client/channels/dingtalk/api.js';
 import {
   AccountCard as DingtalkAccountCard,
@@ -97,6 +100,10 @@ const QQ_SOURCE_URL = new URL(
 );
 
 test('IM settings renders nine IM channels plus the AI Office connector', async () => {
+  const { default: packageMetadata } = await import('../package.json', {
+    with: { type: 'json' },
+  });
+  const { version: packageVersion } = packageMetadata;
   const styles = await readFile(STYLES_URL, 'utf8');
   const markup = renderToStaticMarkup(React.createElement(IMSettingsTab, {
     feishuRpcCall: async () => ({ ok: true, value: {} }),
@@ -114,21 +121,30 @@ test('IM settings renders nine IM channels plus the AI Office connector', async 
   assert.match(markup, /IM机器人/);
   assert.match(markup, /让 DeepSeek Harness 触手可及/);
   assert.match(markup, /class="dim-brand"/);
-  assert.match(markup, /<strong class="dim-brandName">DSH-IM<\/strong>/);
+  assert.equal(IM_PLUGIN_VERSION, packageVersion);
+  assert.match(markup, new RegExp(
+    `<div class="dim-brandHeading"><strong class="dim-brandName">DSH-IM<\\/strong><span class="dim-brandVersion">v${packageVersion.replaceAll('.', '\\.')}<\\/span><\\/div>`,
+  ));
+  assert.doesNotMatch(markup, /dim-versionTooltip|当前版本/);
   assert.doesNotMatch(markup, /dim-brandLogo|<img/);
   assert.match(markup, /href="https:\/\/github\.com\/onlyforchris\/dsh-im"/);
   assert.match(markup, /target="_blank"/);
   assert.match(markup, /rel="noopener noreferrer"/);
   assert.match(markup, /aria-label="dsh-im GitHub"/);
+  assert.match(markup, /dim-updateTrigger[^>]*aria-haspopup="dialog"[^>]*>检查更新</);
+  assert.ok(markup.indexOf('dim-updateTrigger') < markup.indexOf('dim-githubAction'));
   assert.match(markup, /aria-describedby="[^"]+"/);
   assert.match(markup, /role="tooltip"[^>]*>帮助与反馈 · 前往 GitHub</);
   assert.match(styles, /\.dim-title \{[^}]*margin: 0 0 18px;/);
   assert.match(styles, /\.dim-title p \{[^}]*color: var\(--dsw-alias-label-secondary, #646a73\);[^}]*font-size: 12px;[^}]*font-weight: 500;/);
   assert.match(styles, /\.dim-brand \{[^}]*display: flex;[^}]*flex-direction: column;[^}]*align-items: flex-start;[^}]*gap: 1px;/);
+  assert.match(styles, /\.dim-brandHeading \{[^}]*display: flex;[^}]*align-items: baseline;[^}]*gap: 8px;[^}]*white-space: nowrap;/);
   assert.match(styles, /\.dim-brandName \{[^}]*font-size: 20px;[^}]*font-weight: 800;[^}]*letter-spacing: \.04em;/);
+  assert.match(styles, /\.dim-brandVersion \{[^}]*color: var\(--dsw-alias-label-tertiary, #8f959e\);[^}]*font: 500 10px\/16px[^}]*letter-spacing: 0;/);
+  assert.doesNotMatch(styles, /dim-versionTooltip|\.dim-brand:focus-visible/);
   assert.doesNotMatch(styles, /\.dim-brandLogo/);
   assert.match(styles, /\.dim-githubLink \{[^}]*border: 1px solid var\(--dsw-alias-border-l2, #dfe1e5\);[^}]*text-decoration: none;/);
-  assert.match(styles, /\.dim-githubTooltip \{[^}]*bottom: calc\(100% \+ 8px\);[^}]*transform: translateY\(3px\);/);
+  assert.match(styles, /\.dim-githubTooltip \{[^}]*top: calc\(100% \+ 8px\);[^}]*transform: translateY\(-3px\);/);
   assert.match(styles, /\.dim-githubAction:hover \.dim-githubTooltip, \.dim-githubAction:focus-within \.dim-githubTooltip \{[^}]*opacity: 1;[^}]*visibility: visible;/);
   assert.doesNotMatch(markup, /\d+ 个渠道|dim-channelCount/);
   assert.match(markup, />微信</);
@@ -154,8 +170,6 @@ test('IM settings renders nine IM channels plus the AI Office connector', async 
   assert.match(styles, /\.dim-logoFeishu svg \{ width: 28px; height: 28px; \}/);
   assert.equal((markup.match(/role="tab"/g) ?? []).length, 10);
   assert.equal((markup.match(/aria-selected="true"/g) ?? []).length, 1);
-  assert.equal((markup.match(/dim-channelStatus dim-channelStatus-/g) ?? []).length, 10);
-  assert.match(markup, /已连接 0 · 未连接 0 · 未配置 10/);
   assert.doesNotMatch(markup, /role="switch"|type="checkbox"/);
   assert.doesNotMatch(markup, /dim-chevron|扫码绑定<\/small>|扫码接入<\/small>/);
   assert.doesNotMatch(markup, />INSTANT MESSAGING<|>Channel<|>微信设置</);
@@ -232,15 +246,19 @@ test('Feishu bot cards place the application identifier under the bot name', asy
   assert.match(markup, /class="bxf-card bxf-botCard dim-botCard"/);
   assert.match(markup, /class="bxf-healthPill dim-botHealth"/);
   assert.match(markup, /<button[^>]*aria-label="检查连接今天是牢梁"[^>]*><span>检查连接<\/span><\/button>/);
+  assert.match(markup, /class="bxf-repairAction"[^]*role="tooltip"/);
+  assert.match(markup, /card\.action\.trigger[^]*im:message:readonly[^]*im:resource/);
   assert.match(markup, /class="bxf-connectedFooter dim-cardFooter"/);
   assert.doesNotMatch(markup, /dim-cardSummary|长连接运行正常/);
   assert.equal((markup.match(/dim-cardAction(?: |")/g) ?? []).length, 3);
   assert.doesNotMatch(markup, /连接状态：|bxf-divider/);
   assert.doesNotMatch(markup, /custom-bot-avatar/);
-  assert.equal((markup.match(/class="bxf-metric dim-botMetric"/g) ?? []).length, 2);
-  assert.match(markup, />消息通道<[^]*>最近检查</);
+  assert.match(markup, /class="dim-botHealthGroup"[^]*class="dim-lastChecked"><span>最近检查<\/span>/);
+  assert.doesNotMatch(markup, /消息通道|dim-botMetric/);
+  assert.match(markup, /class="dim-presetSelect"/);
   assert.doesNotMatch(markup, />应用标识<|>飞书机器人</);
-  assert.match(styles, /\.bxf-statusGrid \{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\)/);
+  assert.doesNotMatch(styles, /\.bxf-statusGrid|\.bxf-metric/);
+  assert.match(styles, /\.bxf-repairAction:hover \.bxf-repairTooltip,[^]*\.bxf-repairAction:focus-within \.bxf-repairTooltip \{[^}]*visibility: visible;/);
 });
 
 test('Feishu keeps its heading controls on one row without a plus icon', async () => {
@@ -370,7 +388,22 @@ test('bot list headings omit the total already shown by the online badge', async
 
   for (const source of sources) {
     assert.doesNotMatch(source, /length} 个/);
+    assert.match(source, /ChannelListHeading/);
   }
+});
+
+test('channel connection details live in an accessible heading tooltip', async () => {
+  const styles = await readFile(STYLES_URL, 'utf8');
+  const markup = renderToStaticMarkup(React.createElement(ChannelListHeading, {
+    className: 'dxw-listHeading',
+    title: '已接入的微信账号',
+    connectionLabel: 'iLink 长轮询',
+  }));
+
+  assert.match(markup, /<h3>已接入的微信账号<\/h3>/);
+  assert.match(markup, /aria-label="查看消息通道说明"/);
+  assert.match(markup, /role="tooltip"><span>消息通道<\/span><strong>iLink 长轮询<\/strong>/);
+  assert.match(styles, /\.dim-panel \.dim-channelHelp:hover \.dim-channelTooltip, \.dim-panel \.dim-channelHelp:focus-within \.dim-channelTooltip \{[^}]*opacity: 1;[^}]*visibility: visible;/);
 });
 
 test('all channel settings states use the DingTalk page treatment', async () => {
@@ -399,7 +432,6 @@ test('all channel settings states use the DingTalk page treatment', async () => 
       'dim-emptyView',
       'dim-qrLayout',
       'dim-inlineError',
-      'dim-listHeading',
       'dim-confirm',
     ]) {
       assert.match(source, new RegExp(className));
@@ -447,9 +479,11 @@ test('bot cards reuse the same channel brand logos as the channel rail', () => {
   assert.match(accountMarkup, /class="dxw-avatar dim-botAvatar"[^]*data-im-channel-logo="weixin"/);
   assert.match(accountMarkup, /class="dxw-health dim-botHealth"/);
   assert.match(accountMarkup, /class="dxw-accountFooter dim-cardFooter"/);
+  assert.match(accountMarkup, /class="dim-presetSelect"/);
   assert.doesNotMatch(accountMarkup, /dim-cardSummary|微信消息长轮询运行正常/);
   assert.equal((accountMarkup.match(/dim-cardAction(?: |")/g) ?? []).length, 2);
-  assert.equal((accountMarkup.match(/class="dxw-metric dim-botMetric"/g) ?? []).length, 2);
+  assert.match(accountMarkup, /class="dim-botHealthGroup"[^]*class="dim-lastChecked"><span>最近检查<\/span>/);
+  assert.doesNotMatch(accountMarkup, /消息通道|dim-botMetric/);
   assert.doesNotMatch(accountMarkup, /收到 \/ 回复/);
 });
 
@@ -464,7 +498,8 @@ test('Enterprise WeChat cards reuse the rail logo and compact action treatment',
   }));
   assert.match(markup, /data-im-channel-logo="wecom"/);
   assert.equal((markup.match(/dim-cardAction(?: |")/g) ?? []).length, 2);
-  assert.equal((markup.match(/class="ddt-metric dim-botMetric"/g) ?? []).length, 2);
+  assert.match(markup, /class="dim-lastChecked"><span>最近检查<\/span>/);
+  assert.doesNotMatch(markup, /消息通道|dim-botMetric/);
 });
 
 test('DingTalk bot cards omit the redundant received and replied metric', () => {
@@ -485,15 +520,15 @@ test('DingTalk bot cards omit the redundant received and replied metric', () => 
 
   assert.match(markup, /class="ddt-card dim-botCard"/);
   assert.match(markup, /class="ddt-health dim-botHealth"/);
-  assert.equal((markup.match(/class="ddt-metric dim-botMetric"/g) ?? []).length, 2);
+  assert.match(markup, /class="dim-lastChecked"><span>最近检查<\/span>/);
   assert.match(markup, /class="ddt-accountFooter dim-cardFooter"/);
   assert.doesNotMatch(markup, /dim-cardSummary|Stream 长连接运行正常/);
   assert.equal((markup.match(/dim-cardAction(?: |")/g) ?? []).length, 2);
-  assert.match(markup, />消息通道<[^]*>最近检查</);
+  assert.doesNotMatch(markup, /消息通道|dim-botMetric/);
   assert.doesNotMatch(markup, /收到 \/ 回复/);
 });
 
-test('all channel card action buttons stay on one row', async () => {
+test('all IM channel cards keep localized actions visible above full-width feedback', async () => {
   const [imStyles, feishuStyles, weixinStyles, dingtalkStyles] = await Promise.all([
     readFile(STYLES_URL, 'utf8'),
     readFile(FEISHU_STYLES_URL, 'utf8'),
@@ -501,15 +536,58 @@ test('all channel card action buttons stay on one row', async () => {
     readFile(DINGTALK_STYLES_URL, 'utf8'),
   ]);
 
-  assert.match(feishuStyles, /\.bxf-botActions \{[^}]*flex-wrap: nowrap;/);
+  assert.match(feishuStyles, /\.bxf-botActions \{[^}]*width: 100%;[^}]*flex-wrap: wrap;/);
   assert.match(weixinStyles, /\.dxw-accountFooter \.dxw-actions \{[^}]*flex-wrap: nowrap;/);
   assert.match(dingtalkStyles, /\.ddt-accountFooter \.ddt-actions \{[^}]*flex-wrap: nowrap;/);
   assert.match(imStyles, /\.dim-panel \.dim-cardFooter \{[^}]*gap: 12px;[^}]*padding-top: 6px;[^}]*border-top: 1px solid/);
+  assert.match(imStyles, /\.dim-panel \.dim-cardFooterLayout \{[^}]*width: 100%;[^}]*flex-direction: column;[^}]*align-items: stretch;/);
+  assert.match(imStyles, /\.dim-panel \.dim-cardFooterLayout > \.dim-cardActions \{[^}]*align-self: stretch;/);
+  assert.match(imStyles, /\.dim-panel \.dim-cardActions \{[^}]*width: 100%;[^}]*justify-content: flex-end;[^}]*flex-wrap: wrap;/);
+  assert.match(imStyles, /\.dim-panel \.dim-cardFeedback \{[^}]*width: 100%;[^}]*overflow-wrap: anywhere;[^}]*white-space: normal;/);
   assert.match(imStyles, /\.dim-panel \.dim-cardActions \.dim-cardAction \{[^}]*min-height: 32px;[^}]*border-radius: 8px;[^}]*font-size: 13px;/);
   assert.match(imStyles, /\.dim-panel \.dim-cardActions \.dim-cardAction\[data-kind="danger"\] \{[^}]*#d54941/);
-  assert.doesNotMatch(feishuStyles, /\.bxf-connectedFooter \{[^}]*flex-direction: column/);
-  assert.doesNotMatch(weixinStyles, /\.dxw-accountFooter \{[^}]*flex-direction: column/);
-  assert.doesNotMatch(dingtalkStyles, /\.ddt-accountFooter \{[^}]*flex-direction: column/);
+
+  const account = {
+    botId: 'footer-layout-bot',
+    connected: true,
+    configured: true,
+    state: 'connected',
+    groupResponseMode: 'mention',
+    bot: {
+      name: '布局测试机器人',
+      username: 'layout_bot',
+      appIdMasked: 'cli_test••••1234',
+      accountIdMasked: 'wx_test••••1234',
+      clientIdMasked: 'ding_test••••1234',
+      idMasked: 'bot_test••••1234',
+    },
+    health: { summary: '连接运行正常', lastCheckedAt: Date.now() },
+    error: null,
+  };
+  const callbacks = {
+    onReconnect() {},
+    onRequestRemove() {},
+    onConfirmRemove() {},
+    onCancelRemove() {},
+  };
+  const notice = '测试消息已发送，请到对应机器人会话中确认。';
+  const cards = [
+    ['飞书', FeishuBotCard, { connection: account, testNotice: notice }],
+    ['微信', WeixinAccountCard, { account, feedback: notice }],
+    ['钉钉', DingtalkAccountCard, { account, feedback: notice }],
+    ['企业微信', WecomAccountCard, { account, feedback: notice }],
+    ['QQ', QqAccountCard, { account, feedback: notice }],
+    ['Slack', SlackAccountCard, { account, testNotice: notice }],
+    ['Telegram', TelegramAccountCard, { account, testNotice: notice }],
+    ['Discord', DiscordAccountCard, { account, testNotice: notice }],
+    ['WhatsApp', WhatsappAccountCard, { account, testNotice: notice }],
+  ];
+
+  for (const [channel, Card, props] of cards) {
+    const markup = renderToStaticMarkup(React.createElement(Card, { ...callbacks, ...props }));
+    assert.match(markup, /class="dim-cardFooterLayout"><div class="[^"]*dim-cardActions[^"]*">[^]*?<\/div><div class="[^"]*dim-cardFeedback[^"]*" role="status"/, channel);
+    assert.ok(markup.indexOf('dim-cardActions') < markup.indexOf('dim-cardFeedback'), channel);
+  }
 });
 
 test('all channel bot cards use the DingTalk card treatment', async () => {
@@ -520,20 +598,44 @@ test('all channel bot cards use the DingTalk card treatment', async () => {
   assert.match(styles, /\.dim-panel \.dim-botCardTop \{[^}]*align-items: flex-start;[^}]*gap: 12px;/);
   assert.match(styles, /\.dim-panel \.dim-botAvatar \{[^}]*width: 38px;[^}]*height: 38px;[^}]*border-radius: 11px;/);
   assert.match(styles, /\.dim-panel \.dim-botName h3 \{[^}]*font-size: 15px;/);
+  assert.match(styles, /\.dim-panel \.dim-botHealthGroup \{[^}]*display: grid;[^}]*justify-items: end;[^}]*gap: 5px;/);
   assert.match(styles, /\.dim-panel \.dim-botCard \.dim-botHealth \{[^}]*background: transparent;[^}]*font-size: 12px;[^}]*font-weight: 400;/);
-  assert.match(styles, /\.dim-panel \.dim-botMetrics \{[^}]*grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);[^}]*gap: 8px;[^}]*margin: 6px 0;/);
-  assert.match(styles, /\.dim-panel \.dim-botMetric \{[^}]*padding: 6px 8px;[^}]*border: 0;[^}]*border-radius: 9px;/);
-  assert.match(styles, /\.dim-panel \.dim-botMetric dd \{[^}]*margin: 3px 0 0;[^}]*font-size: 12px;[^}]*font-weight: 400;/);
+  assert.match(styles, /\.dim-panel \.dim-lastChecked \{[^}]*display: inline-flex;[^}]*font-size: 11px;[^}]*white-space: nowrap;/);
+  assert.doesNotMatch(styles, /\.dim-panel \.dim-botMetrics|\.dim-panel \.dim-botMetric/);
 });
 
-test('bot cards keep the full workspace path on its own single line', async () => {
+test('bot card status stays in the top-right corner at every responsive breakpoint', async () => {
+  const styles = await readFile(STYLES_URL, 'utf8');
+
+  assert.match(styles, /\.dim-panel \.dim-botCardTop \{[^}]*display: flex;[^}]*align-items: flex-start;[^}]*justify-content: space-between;/);
+  assert.match(styles, /\.dim-panel \.dim-botIdentity \{[^}]*min-width: 0;[^}]*flex: 1 1 0;/);
+  assert.match(styles, /\.dim-panel \.dim-botHealthGroup \{[^}]*flex: none;[^}]*justify-items: end;/);
+  assert.doesNotMatch(styles, /\.dim-panel \.dim-botCardTop \{ flex-direction: column;/);
+  assert.doesNotMatch(styles, /\.dim-panel \.dim-botHealthGroup \{ justify-items: start;/);
+});
+
+test('bot cards wrap full workspace paths without horizontal scrolling', async () => {
   const styles = await readFile(STYLES_URL, 'utf8');
 
   assert.match(styles, /\.dim-panel \.dim-workspace \{[^}]*grid-template-columns: minmax\(0, 1fr\) max-content;[^}]*row-gap: 4px;[^}]*margin-top: 6px;[^}]*padding: 6px 10px;/);
   assert.match(styles, /\.dim-panel \.dim-workspaceHeader \{[^}]*display: contents;/);
-  assert.match(styles, /\.dim-panel \.dim-workspacePath \{[^}]*grid-column: 1 \/ -1;[^}]*grid-row: 2;[^}]*overflow-x: auto;[^}]*white-space: nowrap;/);
-  assert.doesNotMatch(styles, /\.dim-panel \.dim-workspacePath \{[^}]*text-overflow: ellipsis;/);
+  assert.match(styles, /\.dim-panel \.dim-workspacePath \{[^}]*grid-column: 1 \/ -1;[^}]*grid-row: 2;[^}]*overflow: hidden;[^}]*overflow-wrap: anywhere;[^}]*white-space: normal;/);
+  assert.doesNotMatch(styles, /\.dim-panel \.dim-workspacePath \{[^}]*overflow-x: auto;/);
   assert.match(styles, /\.dim-panel \.dim-workspaceEdit \{[^}]*grid-column: 2;[^}]*grid-row: 1;[^}]*white-space: nowrap;/);
+});
+
+test('bot cards keep Agent Preset guidance in a keyboard-accessible help tooltip', async () => {
+  const styles = await readFile(STYLES_URL, 'utf8');
+
+  assert.match(styles, /\.dim-panel \.dim-preset \{[^}]*grid-template-columns: minmax\(0, 1fr\) max-content;[^}]*margin-top: 6px;[^}]*padding: 6px 10px;/);
+  assert.match(styles, /\.dim-panel \.dim-presetHeader \{[^}]*position: relative;[^}]*grid-column: 1 \/ -1;[^}]*display: flex;[^}]*justify-content: space-between;/);
+  assert.match(styles, /\.dim-panel \.dim-presetTitle \{[^}]*display: inline-flex;[^}]*gap: 5px;[^}]*white-space: nowrap;/);
+  assert.match(styles, /\.dim-panel \.dim-presetHelpButton:focus-visible \{[^}]*box-shadow:/);
+  assert.match(styles, /\.dim-panel \.dim-presetTooltip \{[^}]*position: absolute;[^}]*width: min\(320px, 100%\);[^}]*white-space: normal;[^}]*opacity: 0;[^}]*visibility: hidden;[^}]*pointer-events: none;/);
+  assert.match(styles, /\.dim-panel \.dim-presetHelp:hover \.dim-presetTooltip, \.dim-panel \.dim-presetHelp:focus-within \.dim-presetTooltip \{[^}]*opacity: 1;[^}]*visibility: visible;/);
+  assert.match(styles, /\.dim-panel \.dim-presetSelect \{[^}]*grid-column: 1 \/ -1;[^}]*grid-row: 2;/);
+  assert.match(styles, /\.dim-panel \.dim-presetError \{[^}]*grid-column: 1 \/ -1;[^}]*grid-row: 3;/);
+  assert.doesNotMatch(styles, /\.dim-panel \.dim-presetHelp \{[^}]*grid-row: 3;/);
 });
 
 test('the bundled DingTalk channel has no local sender approval workflow', async () => {
@@ -549,6 +651,12 @@ test('the bundled DingTalk channel has no local sender approval workflow', async
     bundle,
     /bot\.sender\.approve|bot\.sender\.revoke|允许使用机器人的钉钉账号|批准使用/,
   );
+});
+
+test('the bilingual dictionary has no duplicate object keys', async () => {
+  const source = await readFile(new URL('../plugin-src/client/i18n.js', import.meta.url), 'utf8');
+  const { warnings } = await transform(source, { loader: 'js', logLevel: 'silent' });
+  assert.deepEqual(warnings.filter((warning) => warning.id === 'duplicate-object-key'), []);
 });
 
 test('every shipped Chinese client string has an English projection', async () => {
@@ -574,12 +682,30 @@ test('every shipped Chinese client string has an English projection', async () =
   }
 });
 
-test('client registers a live bilingual locale seat and directory picker for the IM settings tab', async () => {
+test('client source contains no legacy Plugins-tab settings registrations', async () => {
+  const paths = (await readdir(CLIENT_SOURCE_DIRECTORY_URL, { recursive: true }))
+    .filter((path) => path.endsWith('.js'));
+  const sources = await Promise.all(paths.map(async (path) => ({
+    path,
+    source: await readFile(new URL(path, CLIENT_SOURCE_DIRECTORY_URL), 'utf8'),
+  })));
+  const legacy = sources
+    .filter(({ source }) => source.includes('settings.plugins.tab'))
+    .map(({ path }) => path);
+
+  assert.deepEqual(legacy, []);
+});
+
+test('client registers one top-level bilingual IM settings section with a directory picker', async () => {
   const effects = [];
   const registrations = [];
   const dictionaries = [];
   const directoryCalls = [];
-  const rpcCall = async () => ({ ok: true, value: {} });
+  const rpcCalls = [];
+  const rpcCall = async (...args) => {
+    rpcCalls.push(args);
+    return { ok: true, value: {} };
+  };
   const ctx = {
     effect(install, label) {
       effects.push({ install, label });
@@ -627,11 +753,17 @@ test('client registers a live bilingual locale seat and directory picker for the
     assert.equal(dictionaries[0].namespace, IM_LOCALE_NAMESPACE);
     assert.deepEqual(Object.keys(dictionaries[0].value.en).sort(), Object.keys(dictionaries[0].value.zh).sort());
     assert.equal(registrations.length, 1);
+    assert.equal(registrations[0].options.name, 'settings.section');
+    assert.equal(registrations[0].options.id, 'onlyforchris-dsh-im');
+    assert.equal(registrations[0].options.order, 21);
     assert.equal(registrations[0].options.locale, IM_LOCALE_NAMESPACE);
     assert.equal(registrations[0].options.label(), 'IM bots');
+    assert.equal(registrations[0].component, IMSettingsTab);
 
     const injected = registrations[0].options.inject();
     const signal = new AbortController().signal;
+    await injected.updateRpcCall('update.status', {}, signal);
+    assert.deepEqual(rpcCalls, [['/dsh-im', 'update.status', {}, signal]]);
     assert.deepEqual(
       await injected.workspaceDirectoryPicker.listDirectory('/workspace/current', signal),
       { path: '/workspace/current', entries: [] },
@@ -646,7 +778,10 @@ test('client registers a live bilingual locale seat and directory picker for the
       registrations[0].component,
       injected,
     ));
-    assert.match(markup, /DeepSeek Harness, always within reach/);
+    assert.match(markup, /Connecting DeepSeek Harness/);
+    assert.match(markup, new RegExp(
+      `class="dim-brandVersion">v${IM_PLUGIN_VERSION.replaceAll('.', '\\.')}<\\/span>`,
+    ));
     assert.match(markup, /Help &amp; feedback · Open GitHub/);
     assert.match(markup, />WeChat<|>Feishu<|>DingTalk<|>WeCom</);
     assert.match(markup, />QQ<[^]*>Slack<[^]*>Telegram<[^]*>Discord<[^]*>WhatsApp</);
@@ -723,11 +858,27 @@ test('all nine channel settings and connected cards render English copy', () => 
     ];
     const cardMarkup = cards.map(renderToStaticMarkup).join('\n');
     assert.match(cardMarkup, /Connected/);
-    assert.match(cardMarkup, /Message channel/);
+    assert.doesNotMatch(cardMarkup, /Message channel/);
     assert.match(cardMarkup, /Last checked/);
     assert.match(cardMarkup, /Check connection/);
     assert.match(cardMarkup, /Remove connection/);
     assert.doesNotMatch(cardMarkup, /[\p{Script=Han}]/u);
+
+    const qqRetryMarkup = renderToStaticMarkup(React.createElement(QqAccountCard, {
+      ...sharedCardProps,
+      removing: false,
+      account: {
+        ...account,
+        state: 'error',
+        connected: false,
+        error: {
+          code: 'connection-failed',
+          message: 'QQ 连接未就绪，插件会自动重试。',
+        },
+      },
+    }));
+    assert.match(qqRetryMarkup, /The QQ connection is not ready; the plugin will retry automatically\./);
+    assert.doesNotMatch(qqRetryMarkup, /[\p{Script=Han}]/u);
   } finally {
     setImTranslator(null);
   }

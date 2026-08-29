@@ -81,41 +81,6 @@ test('runtime sends a DingTalk connection test only through the remembered priva
   await runtime.stop();
 });
 
-test('runtime restores a DingTalk push target from the persisted Session binding', async () => {
-  const state = stateFixture();
-  state.snapshot = () => ({ sessions: { 'p2p:staff-saved': 'session-saved' } });
-  const calls = [];
-  const client = {
-    connected: true,
-    socket: { readyState: 1 },
-    registerCallbackListener() {},
-    async connect() {},
-    socketCallBackResponse() {},
-    disconnect() {},
-  };
-  const runtime = new DingtalkRuntime({
-    config: { clientId: 'ding-client', approvedSenders: [] },
-    clientSecret: 'host-secret',
-    harness: { ensureRunning: async () => true },
-    state,
-    api: {
-      sendText: async () => {},
-      createAiCard: async (request) => {
-        calls.push(['create', request]);
-        return { cardInstanceId: 'card-saved' };
-      },
-      finishAiCard: async (request) => calls.push(['finish', request]),
-    },
-    streamFactory: async () => ({ client, topic: 'robot-topic' }),
-  });
-
-  await runtime.start();
-  assert.deepEqual(await runtime.sendConnectionTest('持久化测试'), { sent: true });
-  assert.deepEqual(calls[0][1].target, { type: 'user', userId: 'staff-saved' });
-  assert.equal(calls[1][1].cardInstanceId, 'card-saved');
-  await runtime.stop();
-});
-
 test('runtime owns one DWClient, waits for socket OPEN, acknowledges first, and disconnects on stop', async () => {
   const order = [];
   const state = stateFixture();

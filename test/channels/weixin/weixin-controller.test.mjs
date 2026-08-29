@@ -47,7 +47,7 @@ function configFixture() {
   };
 }
 
-function runtimeFactory({ failStart = false, startError } = {}) {
+function runtimeFactory({ failStart = false, startError, lastMessageError = null } = {}) {
   const runtimes = [];
   const connectionTests = [];
   const createRuntime = async ({ config, token }) => {
@@ -61,6 +61,7 @@ function runtimeFactory({ failStart = false, startError } = {}) {
           weixinConnectionState: ready ? 'connected' : 'idle',
           harnessReachable: ready,
           lastCheckedAt: ready ? 100 : null,
+          lastMessageError,
         };
       },
       async start() {
@@ -80,7 +81,16 @@ function runtimeFactory({ failStart = false, startError } = {}) {
 test('confirmed QR login stores bot_token only in credentials and starts a redacted account', async () => {
   const credentials = credentialsFixture();
   const configs = configFixture();
-  const runtimes = runtimeFactory();
+  const runtimes = runtimeFactory({
+    lastMessageError: {
+      code: 'attachment-error',
+      reason: 'MODEL_DOES_NOT_SUPPORT_IMAGES',
+      message: '当前模型不支持图片。',
+      referenceId: 'MF-WX123456',
+      at: 123,
+      providerDetail: 'must-not-cross-controller-boundary',
+    },
+  });
   const controller = new WeixinController({
     api: {
       beginLogin: async ({ localTokens }) => {
@@ -116,6 +126,14 @@ test('confirmed QR login stores bot_token only in credentials and starts a redac
   const publicJson = JSON.stringify(controller.status());
   assert.doesNotMatch(publicJson, /private-bot-token|owner-user|account@im\.bot|tokenRef/);
   assert.equal(controller.status().totals.connected, 1);
+  assert.deepEqual(controller.status().bots[0].lastMessageError, {
+    code: 'attachment-error',
+    reason: 'MODEL_DOES_NOT_SUPPORT_IMAGES',
+    message: '当前模型不支持图片。',
+    referenceId: 'MF-WX123456',
+    at: 123,
+  });
+  assert.doesNotMatch(publicJson, /must-not-cross-controller-boundary/);
 
   await controller.sendConnectionTest(completed.botId);
   assert.equal(runtimes.connectionTests[0].botId, completed.botId);
@@ -331,40 +349,49 @@ test('account config write and runtime preparation failures have distinct safe c
 });
 
 test('known runtime activation codes cross the provisioning boundary unchanged', async () => {
-  const credentials = credentialsFixture();
-  const configs = configFixture();
-  const runtimes = runtimeFactory({
-    startError: Object.assign(new Error('loopback transport host-only detail'), {
-      code: 'harness-unreachable',
-    }),
-  });
-  const controller = new WeixinController({
-    api: {
-      beginLogin: async () => ({ qrcode: 'qr-secret', qrcodeUrl: 'https://liteapp.weixin.qq.com/q/test' }),
-      pollLogin: async () => ({
-        status: 'confirmed',
-        bot_token: 'must-be-rolled-back',
-        ilink_bot_id: 'harness-failure@im.bot',
-        ilink_user_id: 'owner',
-        baseurl: 'https://ilinkai.weixin.qq.com',
-      }),
-    },
-    credentials: credentials.provider,
-    configStore: configs.store,
-    createRuntime: runtimes.createRuntime,
-    logger: { error() {}, warn() {} },
-  });
+  for (const scenario of [
+    ['harness-auth-required', /需要身份认证/],
+    ['harness-proxy-auth-required', /NO_PROXY/],
+    ['harness-loopback-forbidden', /回环地址/],
+    ['harness-host-untrusted', /Host 信任检查/],
+    ['harness-request-forbidden', /代理或网关配置/],
+    ['harness-api-not-found', /找不到 Harness 健康检查接口/],
+  ]) {
+    const [code, publicMessage] = scenario;
+    const credentials = credentialsFixture();
+    const configs = configFixture();
+    const runtimes = runtimeFactory({
+      startError: Object.assign(new Error(`host-only detail for ${code}`), { code }),
+    });
+    const controller = new WeixinController({
+      api: {
+        beginLogin: async () => ({ qrcode: 'qr-secret', qrcodeUrl: 'https://liteapp.weixin.qq.com/q/test' }),
+        pollLogin: async () => ({
+          status: 'confirmed',
+          bot_token: 'must-be-rolled-back',
+          ilink_bot_id: `${code}@im.bot`,
+          ilink_user_id: 'owner',
+          baseurl: 'https://ilinkai.weixin.qq.com',
+        }),
+      },
+      credentials: credentials.provider,
+      configStore: configs.store,
+      createRuntime: runtimes.createRuntime,
+      logger: { error() {}, warn() {} },
+    });
 
-  const begun = await controller.startProvisioning();
-  const failed = await waitFor(
-    () => controller.registrationStatus(begun.attemptId),
-    (value) => value.status === 'failed',
-  );
+    const begun = await controller.startProvisioning();
+    const failed = await waitFor(
+      () => controller.registrationStatus(begun.attemptId),
+      (value) => value.status === 'failed',
+    );
 
-  assert.equal(failed.error.code, 'harness-unreachable');
-  assert.match(failed.error.message, /无法连接本机 Harness/);
-  assert.doesNotMatch(JSON.stringify(failed), /host-only detail|must-be-rolled-back/);
-  await controller.close();
+    assert.equal(failed.error.code, code);
+    assert.notEqual(failed.error.code, 'harness-unreachable');
+    assert.match(failed.error.message, publicMessage);
+    assert.doesNotMatch(JSON.stringify(failed), /host-only detail|must-be-rolled-back/);
+    await controller.close();
+  }
 });
 
 test('an unclassified activation error uses the explicit unknown fallback code', async () => {
