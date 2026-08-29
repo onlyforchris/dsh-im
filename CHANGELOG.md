@@ -6,6 +6,20 @@ This file records the notable changes in each dsh-im release. Its format follows
 
 ## [Unreleased]
 
+## [3.1.3] - 2026-08-29
+
+### Fixed / 修复
+
+- 同步 package、lockfile 与构建产物中的版本号，确保 Git tag、Release 压缩包和 `/version` 返回一致。
+  Synchronized the package, lockfile, and generated bundle version so the Git tag, release archive, and `/version` output agree.
+
+## [3.1.2] - 2026-08-29
+
+### Fixed / 修复
+
+- 将企微 NotificationOutbox 接入生产 controller，并为图片发送失败保留文字回退；失败事件保持可重试，非法事件进入失败队列。
+  Wired the WeCom NotificationOutbox into the production controller, retained text fallback for failed image sends, kept retryable events pending, and moved invalid events to the failed queue.
+
 ## [3.1.1] - 2026-08-28
 
 ### Fixed / 修复
