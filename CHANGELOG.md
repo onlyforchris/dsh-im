@@ -6,6 +6,19 @@ This file records the notable changes in each dsh-im release. Its format follows
 
 ## [Unreleased]
 
+## [3.1.5] - 2026-08-31
+
+### Fixed / 修复
+
+- 修复 `dsh web` CLI 模式下插件树无法激活：上游 f0b6b38 将各插件 inject 硬依赖从 `webServer` 换成 `apiProxy`，而已发布的 Host（含 0.1.2-alpha.2）不提供该服务，导致 dsh-im 永远 pending、boot 失败。现恢复 `webServer` 为 inject 依赖，并在 `harnessConnection` 中实现三级回退：显式 `harnessBaseUrl` → Host 进程内 `apiProxy`（DSH Desktop）→ `webServer.port` 回环 HTTP/WebSocket（`dsh web`）。
+  Restored `webServer` as the injected service and made `harnessConnection` fall back from the in-process Host `apiProxy` (DSH Desktop only) to the loopback HTTP/WebSocket harness on published Hosts, fixing the "plugin tree failed to load" boot failure in `dsh web` CLI mode.
+- cordis context proxy 对未提供的服务读取会抛 `cannot get property ... without inject`（可选链无法绕过），探测改用容错读取 `peekService`。
+  cordis throws on reads of unprovided services even through optional chaining; probing now uses a fault-tolerant `peekService` helper.
+
+### Changed / 变更
+
+- 版本号 3.1.4 → 3.1.5，重新构建 `lib/` 产物。
+
 ## [3.1.3] - 2026-08-29
 
 ### Fixed / 修复

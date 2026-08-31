@@ -30,20 +30,26 @@ test('an explicit Harness URL preserves HTTP transport and never reads the Host 
   assert.throws(() => harnessConnection(ctx, { harnessBaseUrl: 'not a URL' }), TypeError);
 });
 
-test('a missing Host apiProxy fails clearly instead of silently falling back to localhost', () => {
+test('a missing Host apiProxy falls back to the webServer loopback origin', () => {
+  const connection = harnessConnection({ webServer: { port: 3080 } });
+  assert.equal(connection.baseUrl.href, 'http://127.0.0.1:3080/');
+  assert.deepEqual(Object.keys(connection), ['baseUrl']);
+});
+
+test('without apiProxy or webServer the failure names every supported option', () => {
   assert.throws(
-    () => harnessConnection({ webServer: { port: 3080 } }),
-    /requires the Host apiProxy service/,
+    () => harnessConnection({}),
+    /requires the Host apiProxy service, a webServer port, or an explicit harnessBaseUrl/,
   );
 });
 
-test('Host and all IM channel plugins wait for apiProxy rather than a webServer', async () => {
-  assert.ok(hostInject.includes('apiProxy'));
-  assert.equal(hostInject.includes('webServer'), false);
+test('Host and all IM channel plugins wait for the webServer rather than an in-process apiProxy', async () => {
+  assert.ok(hostInject.includes('webServer'));
+  assert.equal(hostInject.includes('apiProxy'), false);
   for (const channel of IM_CHANNELS) {
     const { inject } = await import(`../plugin-src/host/channels/${channel}/index.mjs`);
-    assert.ok(inject.includes('apiProxy'), channel);
-    assert.equal(inject.includes('webServer'), false, channel);
+    assert.ok(inject.includes('webServer'), channel);
+    assert.equal(inject.includes('apiProxy'), false, channel);
   }
 });
 
