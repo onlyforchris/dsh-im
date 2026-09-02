@@ -1,0 +1,103 @@
+﻿commit 85951589fcb08be55542f0973ae3819f8cc43e71
+Author: Chris <122779653+onlyforchris@users.noreply.github.com>
+Date:   Wed Sep 2 12:38:29 2026 +0800
+
+    fix: pass full event to outbox send for needs_human audit routing (闃舵A)
+
+diff --git a/plugin-src/host/channels/wecom/notification-outbox-wiring.mjs b/plugin-src/host/channels/wecom/notification-outbox-wiring.mjs
+index 18f5a9e..f0333e7 100644
+--- a/plugin-src/host/channels/wecom/notification-outbox-wiring.mjs
++++ b/plugin-src/host/channels/wecom/notification-outbox-wiring.mjs
+@@ -11,6 +11,10 @@ import { NotificationOutbox } from '../../../../src/channels/weixin/notification
+  * 濂戠害锛氫簨浠朵笉鎼哄甫鏀朵欢浜猴紱鍙戦€佺洰鏍囩敱 WecomRuntime.sendNotification 浣跨敤璁颁綇鐨?  * 绉佽亰 target 瑙ｆ瀽銆傚彂閫佸け璐?鐩爣鏈煡鏃朵簨浠剁暀鍦?outbox 閲嶈瘯锛坒ail-closed锛夈€?  * 浠呭湪 class 瀛樺湪鑰屼笉鐢辫繍琛屽叆鍙ｅ疄渚嬪寲涓嶇畻鎺ラ€?鈥斺€?鏈嚱鏁板嵆鍞竴瀹炰緥鍖栫偣銆?+ *
++ * 闃舵A鎵╁睍锛?026-08-31锛夛細recruiting.needs_human 涓庢棦鏈?score_ready 绛夎蛋鍚屼竴
++ * 娑堣垂璺緞锛圢otificationOutbox 涓嶅仛 type 鐧藉悕鍗曪級锛泂end 绗笁鍙傛嬁鍒?event 鍚庯紝
++ * 瀵?notification_kind=needs_human 鍗曠嫭鎵撳璁℃棩蹇楋紝纭繚銆屽疄闄呴€氱煡璐熻矗浜恒€嶅彲褰掑洜銆?  */
+ export async function startNotificationOutbox({ config = {}, controller, logger = console }) {
+   const dir = config.notificationOutboxDir;
+@@ -23,7 +27,12 @@ export async function startNotificationOutbox({ config = {}, controller, logger
+     dir,
+     pollIntervalMs: config.notificationPollIntervalMs ?? 5_000,
+     logger,
+-    send: (text, media) => controller.sendNotification(botId, text, media),
++    send: (text, media, event) => {
++      if (event?.meta?.notification_kind === 'needs_human') {
++        logger.info?.(`[dsh-wecom] needs_human 寰呬汉宸ュ鐞嗗凡閫氱煡璐熻矗浜? source_event_id=${event.meta?.source_event_id ?? event.event_id}`);
++      }
++      return controller.sendNotification(botId, text, media);
++    },
+   });
+   await outbox.start();
+   return outbox;
+diff --git a/src/channels/weixin/notification-outbox.mjs b/src/channels/weixin/notification-outbox.mjs
+index 40dfb61..aa4eb08 100644
+--- a/src/channels/weixin/notification-outbox.mjs
++++ b/src/channels/weixin/notification-outbox.mjs
+@@ -70,7 +70,8 @@ export class NotificationOutbox {
+       const event = JSON.parse(await readFile(processing, 'utf8'));
+       this.#validate(event);
+       const media = await this.#validatedMedia(event.media);
+-      const delivery = await this.#send(event.text, media);
++      // send 绗笁鍙傞€忎紶 event锛堝彧璇伙紝渚?wiring 鎸夐€氱煡绫诲瀷瀹¤/璺敱锛涘悜鍚庡吋瀹癸級
++      const delivery = await this.#send(event.text, media, event);
+       if (delivery?.mode === 'image' || delivery?.mode === 'text' || delivery?.mode === 'text-fallback') {
+         event.delivery = {
+           mode: delivery.mode,
+diff --git a/test/channels/weixin/notification-outbox.test.mjs b/test/channels/weixin/notification-outbox.test.mjs
+index ebcd7d0..8362e9c 100644
+--- a/test/channels/weixin/notification-outbox.test.mjs
++++ b/test/channels/weixin/notification-outbox.test.mjs
+@@ -68,6 +68,54 @@ test('notification outbox accepts any well-formed event type', async () => {
+   }
+ });
+ 
++test('notification outbox delivers recruiting.needs_human to owner (闃舵A)', async () => {
++  const dir = await mkdtemp(join(tmpdir(), 'dsh-im-outbox-human-'));
++  // 涓?event_router._emit_outbox_needs_human 鍐欏嚭鐨勫畬鏁?payload 褰㈢姸涓€鑷达細
++  // 杩炲瓧绗?event_id + type=recruiting.needs_human + meta.notification_kind/source_event_id
++  const event = {
++    schema_version: 1,
++    event_id: 'recruiting-needs-human-zljd-20260831-0042-7',
++    type: 'recruiting.needs_human',
++    tenant_id: 'test-tenant',
++    created_at: '2026-08-31T20:00:00+08:00',
++    text: '鈿狅笍 鎷涜仒鑷姩鍖栭渶浜哄伐澶勭悊锛歾l_jd_post 杩炵画 3 娆″け璐ワ紙鍐欐搷浣滃け璐?rc=1锛屽壇浣滅敤涓嶇‘瀹氾紝绂佹鑷姩閲嶈瘯锛夈€備簨浠?evt-42 宸叉殏鍋滐紝璇锋煡鐪嬪苟鍐冲畾涓嬩竴姝ャ€?,
++    meta: {
++      notification_kind: 'needs_human',
++      channel: 'wecom',
++      target_alias: 'owner',
++      source_event_id: 'evt-42',
++    },
++  };
++  await writeFile(join(dir, `${event.event_id}.json`), JSON.stringify(event));
++  const sent = [];
++  const outbox = new NotificationOutbox({
++    dir,
++    pollIntervalMs: 60_000,
++    logger: { warn() {} },
++    send: async (text, media, e) => {
++      sent.push({ text, media, event: e });
++      return { mode: 'text', provider: { accepted: true, ret: 0, errcode: null } };
++    },
++  });
++  try {
++    await outbox.start();
++    await outbox.scan();
++    assert.equal(sent.length, 1);
++    assert.equal(sent[0].text, event.text);
++    // send 绗笁鍙傞€忎紶瀹屾暣浜嬩欢锛坵iring 闈?meta.notification_kind 鎵?needs_human 瀹¤鏃ュ織锛?+    assert.equal(sent[0].event.type, 'recruiting.needs_human');
++    assert.equal(sent[0].event.meta.notification_kind, 'needs_human');
++    assert.equal(sent[0].event.meta.source_event_id, 'evt-42');
++    const archived = JSON.parse(await readFile(join(dir, 'sent', `${event.event_id}.json`), 'utf8'));
++    assert.equal(archived.event_id, event.event_id);
++    assert.equal(archived.delivery.mode, 'text');
++    assert.equal(archived.meta.source_event_id, 'evt-42');
++  } finally {
++    await outbox.close();
++    await rm(dir, { recursive: true, force: true });
++  }
++});
++
+ test('notification outbox rejects malformed event types', async () => {
+   const dir = await mkdtemp(join(tmpdir(), 'dsh-im-outbox-badtype-'));
+   await writeFile(join(dir, 'bad-type.json'), JSON.stringify({
