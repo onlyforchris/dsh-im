@@ -70,7 +70,8 @@ export class NotificationOutbox {
       const event = JSON.parse(await readFile(processing, 'utf8'));
       this.#validate(event);
       const media = await this.#validatedMedia(event.media);
-      const delivery = await this.#send(event.text, media);
+      // send 第三参透传 event（只读，供 wiring 按通知类型审计/路由；向后兼容）
+      const delivery = await this.#send(event.text, media, event);
       if (delivery?.mode === 'image' || delivery?.mode === 'text' || delivery?.mode === 'text-fallback') {
         event.delivery = {
           mode: delivery.mode,

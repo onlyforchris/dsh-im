@@ -68,6 +68,54 @@ test('notification outbox accepts any well-formed event type', async () => {
   }
 });
 
+test('notification outbox delivers recruiting.needs_human to owner (阶段A)', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-im-outbox-human-'));
+  // 与 event_router._emit_outbox_needs_human 写出的完整 payload 形状一致：
+  // 连字符 event_id + type=recruiting.needs_human + meta.notification_kind/source_event_id
+  const event = {
+    schema_version: 1,
+    event_id: 'recruiting-needs-human-zljd-20260831-0042-7',
+    type: 'recruiting.needs_human',
+    tenant_id: 'test-tenant',
+    created_at: '2026-08-31T20:00:00+08:00',
+    text: '⚠️ 招聘自动化需人工处理：zl_jd_post 连续 3 次失败（写操作失败 rc=1，副作用不确定，禁止自动重试）。事件 evt-42 已暂停，请查看并决定下一步。',
+    meta: {
+      notification_kind: 'needs_human',
+      channel: 'wecom',
+      target_alias: 'owner',
+      source_event_id: 'evt-42',
+    },
+  };
+  await writeFile(join(dir, `${event.event_id}.json`), JSON.stringify(event));
+  const sent = [];
+  const outbox = new NotificationOutbox({
+    dir,
+    pollIntervalMs: 60_000,
+    logger: { warn() {} },
+    send: async (text, media, e) => {
+      sent.push({ text, media, event: e });
+      return { mode: 'text', provider: { accepted: true, ret: 0, errcode: null } };
+    },
+  });
+  try {
+    await outbox.start();
+    await outbox.scan();
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].text, event.text);
+    // send 第三参透传完整事件（wiring 靠 meta.notification_kind 打 needs_human 审计日志）
+    assert.equal(sent[0].event.type, 'recruiting.needs_human');
+    assert.equal(sent[0].event.meta.notification_kind, 'needs_human');
+    assert.equal(sent[0].event.meta.source_event_id, 'evt-42');
+    const archived = JSON.parse(await readFile(join(dir, 'sent', `${event.event_id}.json`), 'utf8'));
+    assert.equal(archived.event_id, event.event_id);
+    assert.equal(archived.delivery.mode, 'text');
+    assert.equal(archived.meta.source_event_id, 'evt-42');
+  } finally {
+    await outbox.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('notification outbox rejects malformed event types', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-im-outbox-badtype-'));
   await writeFile(join(dir, 'bad-type.json'), JSON.stringify({
