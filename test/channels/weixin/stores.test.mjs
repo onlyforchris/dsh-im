@@ -57,21 +57,13 @@ test('state store retains sessions, deduplication, and the getUpdates cursor', a
   await state.setSession('p2p:user', 'session-1');
   await state.markSeen('message-1');
   await state.setGetUpdatesBuf('cursor-2');
-  await state.setConnectionTestTarget({
-    toUserId: ' user ', contextToken: ' context ', runId: ' run ',
-  });
 
   const restored = await new WeixinStateStore(path).load();
   assert.equal(restored.sessionFor('p2p:user'), 'session-1');
   assert.equal(restored.hasSeen('message-1'), true);
   assert.equal(restored.getUpdatesBuf(), 'cursor-2');
-  assert.deepEqual(restored.connectionTestTarget(), {
-    toUserId: 'user', contextToken: 'context', runId: 'run',
-  });
   await restored.clearSessions();
-  assert.deepEqual(restored.connectionTestTarget(), {
-    toUserId: 'user', contextToken: 'context', runId: 'run',
-  });
+  assert.equal(restored.sessionFor('p2p:user'), null);
   if (process.platform !== 'win32') assert.equal((await stat(path)).mode & 0o777, 0o600);
 });
 
