@@ -13,6 +13,14 @@ import {
   observeBotWorkspaceRemovals,
 } from '../../../../src/channels/shared/bot-workspace-store.mjs';
 import { listAgentPresetCatalog } from '../../../../src/channels/shared/agent-preset.mjs';
+import {
+  createDeliveryAdapter,
+  supportsDeliveryChannel,
+} from '../../delivery-adapter.mjs';
+import {
+  accessPolicyProvider,
+  initialAccessPolicyFor,
+} from './access-policy-production.mjs';
 
 export function pluginPaths(config, channel) {
   const dshHome = resolve(config.dshHome ?? process.env.DSH_HOME ?? join(homedir(), '.dsh'));
@@ -42,6 +50,11 @@ export async function createTokenProductionController(ctx, config, internals, de
     throw new TypeError(`dsh-im ${channel} runtimeOptions must return an object`);
   }
   const createSupervisor = internals.createConnectionSupervisor ?? createTokenConnectionSupervisor;
+  const seedAccessPolicy = typeof definitions.initialAccessPolicyForBot === 'function'
+    ? definitions.initialAccessPolicyForBot
+    // Telegram is the only token channel with a legacy access model. Other
+    // current token channels preserve their fully-open baseline.
+    : (bot) => initialAccessPolicyFor(channel === 'telegram' ? 'telegram' : 'discord', bot);
   const logger = typeof ctx.logger === 'function'
     ? ctx.logger(`dsh-im:${channel}`) : (ctx.logger ?? console);
   const agentPresetCatalog = () => listAgentPresetCatalog(ctx);
@@ -55,6 +68,7 @@ export async function createTokenProductionController(ctx, config, internals, de
   await workspaces.reconcile(configuredBots.map((bot) => bot.botId));
   await Promise.all(configuredBots.map((bot) => workspaces.ensure(bot.botId, {
     defaultAgentPreset: config.agentPreset,
+    initialAccessPolicy: seedAccessPolicy(bot),
   })));
   const observedConfigStore = typeof configStore.remove === 'function'
     ? observeBotWorkspaceRemovals(configStore, { workspaces })
@@ -92,7 +106,10 @@ export async function createTokenProductionController(ctx, config, internals, de
     ...(internals.inspectToken ? { inspectToken: internals.inspectToken } : {}),
     createRuntime: async ({ botId, config: botConfig, token }) => {
       const state = await stateFor(botId);
-      await workspaces.ensure(botId, { defaultAgentPreset: config.agentPreset });
+      await workspaces.ensure(botId, {
+        defaultAgentPreset: config.agentPreset,
+        initialAccessPolicy: seedAccessPolicy(botConfig),
+      });
       const workspaceScope = createBotWorkspaceScope(harness, {
         botId, workspaces, state, agentPresetCatalog,
       });
@@ -102,6 +119,8 @@ export async function createTokenProductionController(ctx, config, internals, de
         token,
         harness: workspaceScope.harness,
         state: workspaceScope.state,
+        contextEnhancement: { botId, getSettings: () => workspaces.contextEnhancementFor(botId) },
+        accessPolicy: accessPolicyProvider(workspaces, botId, { channel, config: botConfig }),
         replyTimeoutMs: config.replyTimeoutMs ?? 600_000,
         connectTimeoutMs: config.connectTimeoutMs ?? 20_000,
         logger: {
@@ -141,6 +160,9 @@ export async function createTokenProductionController(ctx, config, internals, de
   }).start();
   return {
     controller,
+    ...(supportsDeliveryChannel(channel) ? {
+      deliveryAdapter: createDeliveryAdapter({ channel, workspaces, coreController, stateFor }),
+    } : {}),
     ready: supervisor.ready,
     async close() {
       await supervisor.close();

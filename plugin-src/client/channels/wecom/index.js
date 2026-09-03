@@ -4,6 +4,7 @@ import { WecomLogoGlyph } from '../../channel-logos.js';
 import { CredentialActionIcon, CredentialBindingPanel, QrActionIcon } from '../../credential-binding.js';
 import { h } from '../../i18n.js';
 import { WorkspaceEditor } from '../../workspace-editor.js';
+import { ContextEnhancementEditor } from '../../context-enhancement.js';
 import {
   AgentPresetCatalogContext,
   AgentPresetEditor,
@@ -11,6 +12,7 @@ import {
 } from '../../agent-preset.js';
 import { useWorkspaceSnapshotFence } from '../../workspace-snapshot-fence.js';
 import {
+  BotSettingsButton,
   BotStatusMeta,
   ChannelListHeading,
   LastMessageErrorSummary,
@@ -165,6 +167,7 @@ export function AccountCard({
   onReconnect,
   onWorkspaceSave,
   onAgentPresetSave,
+  onContextEnhancementSave,
   onRequestRemove,
   onConfirmRemove,
   onCancelRemove,
@@ -179,14 +182,22 @@ export function AccountCard({
           h('div', { className: 'ddt-avatar dim-botAvatar dwecom-avatar', 'aria-hidden': 'true' }, h(WecomLogoGlyph, { size: 29 })),
           h('div', { className: 'dim-botName' },
             h('h3', null, account.bot.name), h('p', null, account.bot.appIdMasked))),
-        h(BotStatusMeta, {
-          className: 'ddt-health',
-          dotClassName: 'ddt-dot',
-          tone,
-          stateLabel,
-          lastCheckedAt: account.health.lastCheckedAt,
-          formatCheckedTime: checkedTime,
-        })),
+        h('div', { className: 'dim-botCardTools' },
+          h(BotStatusMeta, {
+            className: 'ddt-health',
+            dotClassName: 'ddt-dot',
+            tone,
+            stateLabel,
+            lastCheckedAt: account.health.lastCheckedAt,
+            formatCheckedTime: checkedTime,
+          }),
+          h(BotSettingsButton, {
+            channel: 'wecom',
+            botId: account.botId,
+            botName: account.bot.name,
+            connected: account.connected,
+            accessPolicy: account.accessPolicy,
+          }))),
       h(WorkspaceEditor, {
         workspace: account.workspace,
         disabled: Boolean(busy),
@@ -196,6 +207,11 @@ export function AccountCard({
         agentPreset: account.agentPreset,
         disabled: Boolean(busy),
         onSave: onAgentPresetSave,
+      }),
+      h(ContextEnhancementEditor, {
+        config: account.contextEnhancement,
+        disabled: Boolean(busy),
+        onSave: onContextEnhancementSave,
       }),
       h('div', { className: 'ddt-accountFooter dim-cardFooter' },
         h('div', { className: 'dim-cardFooterLayout' },
@@ -498,6 +514,12 @@ export function WecomSettingsTab({ rpcCall }) {
               'preset',
               WECOM_ENDPOINTS.setAgentPreset,
               { botId: account.botId, agentPreset },
+            ),
+            onContextEnhancementSave: (config) => botAction(
+              account,
+              'context-enhancement',
+              WECOM_ENDPOINTS.setContextEnhancement,
+              { botId: account.botId, config },
             ),
             onRequestRemove: () => setRemoveTarget(account.botId),
             onCancelRemove: () => setRemoveTarget(null),

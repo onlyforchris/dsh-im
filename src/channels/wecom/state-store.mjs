@@ -1,17 +1,7 @@
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
-const EMPTY_STATE = Object.freeze({
-  version: 1,
-  sessions: {},
-  seenMessageIds: [],
-  connectionTestTarget: null,
-});
-
-function connectionTestTarget(value) {
-  const chatId = typeof value?.chatId === 'string' ? value.chatId.trim() : '';
-  return chatId ? { chatId } : null;
-}
+const EMPTY_STATE = Object.freeze({ version: 1, sessions: {}, seenMessageIds: [] });
 
 function normalizeState(value) {
   if (!value || typeof value !== 'object') return structuredClone(EMPTY_STATE);
@@ -27,10 +17,6 @@ function normalizeState(value) {
     seenMessageIds: Array.isArray(value.seenMessageIds)
       ? value.seenMessageIds.filter((id) => typeof id === 'string').slice(-1_000)
       : [],
-    connectionTestTarget: connectionTestTarget(value.connectionTestTarget)
-      ?? connectionTestTarget({
-        chatId: Object.keys(sessions).findLast((key) => key.startsWith('direct:'))?.slice(7),
-      }),
   };
 }
 
@@ -83,17 +69,6 @@ export class WecomStateStore {
     if (this.#state.seenMessageIds.length > 1_000) {
       this.#state.seenMessageIds.splice(0, this.#state.seenMessageIds.length - 1_000);
     }
-    await this.#persist();
-  }
-
-  connectionTestTarget() {
-    return structuredClone(this.#state.connectionTestTarget);
-  }
-
-  async setConnectionTestTarget(target) {
-    const normalized = connectionTestTarget(target);
-    if (!normalized) throw new TypeError('Enterprise WeChat connection test target is required');
-    this.#state.connectionTestTarget = normalized;
     await this.#persist();
   }
 

@@ -27,12 +27,12 @@ import {
 } from '../shared/preset-command.mjs';
 import { runWorkspaceCommand } from '../shared/workspace-command.mjs';
 import { askInWorkspaceSession } from '../shared/workspace-session.mjs';
+import { captureContextEnhancement, enhanceContextContent } from '../shared/context-enhancement.mjs';
 import {
   hasInboundImages,
   ImagePromptError,
   imagePromptDiagnostic,
   imagePromptUserMessage,
-  promptContentForMessage,
 } from '../shared/image-prompt.mjs';
 import {
   hasInboundFiles,
@@ -42,6 +42,10 @@ import { rememberConnectionTestTarget } from '../shared/connection-test.mjs';
 import { trackOutboundArtifactProviderPromise } from '../shared/semantic/artifact.mjs';
 import { deliverOutboundArtifacts } from '../shared/semantic/artifact-delivery.mjs';
 import {
+  hasReplyReference,
+  promptContentForInboundMessage,
+} from '../shared/semantic/reply-reference.mjs';
+import {
   createDeliveryReceipt,
 } from '../shared/semantic/delivery.mjs';
 import {
@@ -50,6 +54,10 @@ import {
   messageFailureText,
   setLastMessageFailure,
 } from '../shared/message-failure.mjs';
+import {
+  COMMAND_PERMISSION_DENIED_MESSAGE,
+  evaluateInboundAccess,
+} from '../shared/inbound-access.mjs';
 import { t } from '../shared/i18n.mjs';
 
 const DEFAULT_FILE_UPLOAD_TIMEOUT_MS = 120_000;
@@ -63,16 +71,18 @@ function helpText() {
     t('/new  开启一个全新会话'),
     t('/compact  压缩当前会话的较早上下文'),
     t('/history [数量]  查看最近历史消息（默认 3 条，最多 5 条）'),
-    t('/workspace 工作区绝对路径  切换工作区'),
+    t('/workspace 工作区序号或绝对路径  切换工作区'),
     t('/workspacelist  列出工作区绝对路径'),
-    t('/sessionlist [工作区序号或绝对路径]  列出会话 ID 和标题'),
+    t('/ws、/wsl、/workspaces  工作区命令别名'),
+    t('/sessionlist 或 /sessions [工作区序号或绝对路径]  列出会话 ID 和标题'),
+    t('/sessionlist --limit N  仅列出当前工作区前 N 个会话'),
     t('/session Session ID 或当前工作区序号  将当前聊天绑定到指定会话'),
     t('/models  按序号列出所有可用模型'),
     t('/reasoninglist 或 /reasonings  按序号列出当前模型可用推理等级'),
     t('/reasoning [序号、等级ID或 --default]  查看或切换当前推理等级'),
     t('/model [序号或完整模型ID] [推理等级ID]  查看或切换当前会话模型'),
     t('示例：先发 /models，再发 /model 2 [推理等级ID]'),
-    t('/presetlist  按序号列出可用 Agent Preset'),
+    t('/presetlist 或 /presets  按序号列出可用 Agent Preset'),
     t('/preset [序号或完整ID]  查看或设置当前机器人 Agent Preset'),
     t('纯数字 ID：/preset id:<ID>'),
     t('/preset --default  跟随 Host 默认'),
@@ -103,8 +113,7 @@ function conversationKey(frame) {
   return body.chattype === 'group' ? `group:${body.chatid}` : `direct:${body.from?.userid}`;
 }
 
-function messageText(frame) {
-  const body = bodyOf(frame);
+function messageContentText(body) {
   let text = '';
   if (body.msgtype === 'text') {
     text = typeof body.text?.content === 'string' ? body.text.content.trim() : '';
@@ -117,6 +126,12 @@ function messageText(frame) {
       .join('\n')
       .trim();
   }
+  return text;
+}
+
+function messageText(frame) {
+  const body = bodyOf(frame);
+  const text = messageContentText(body);
   // Group callbacks retain the leading @bot mention that caused delivery.
   // It is routing metadata rather than part of the user's prompt or answer.
   return body.chattype === 'group'
@@ -138,6 +153,36 @@ function fileContents(frame) {
   return body.msgtype === 'file' && body.file && typeof body.file === 'object'
     ? [body.file]
     : [];
+}
+
+function quoteAttachments(quote) {
+  if (quote?.msgtype === 'image') return [{ kind: 'image' }];
+  if (quote?.msgtype === 'voice') return [{ kind: 'audio' }];
+  if (quote?.msgtype === 'file') {
+    const name = nonEmptyString(
+      quote.file?.filename ?? quote.file?.file_name ?? quote.file?.name,
+    );
+    return [{ kind: 'file', ...(name ? { name } : {}) }];
+  }
+  if (quote?.msgtype !== 'mixed' || !Array.isArray(quote.mixed?.msg_item)) return [];
+  return quote.mixed.msg_item
+    .filter((item) => item?.msgtype === 'image')
+    .map(() => ({ kind: 'image' }));
+}
+
+function replyReferenceForBody(body) {
+  const quote = body?.quote;
+  if (!quote || typeof quote !== 'object') return null;
+  const content = messageContentText(quote);
+  const attachments = quoteAttachments(quote);
+  const supported = ['text', 'image', 'mixed', 'voice', 'file'].includes(quote.msgtype);
+  return {
+    ...(content ? { content } : {}),
+    ...(attachments.length > 0 ? { attachments } : {}),
+    ...(!content && attachments.length === 0
+      ? { unavailableReason: supported ? 'not-delivered' : 'unsupported' }
+      : {}),
+  };
 }
 
 function imageSource(client, image) {
@@ -195,10 +240,13 @@ function fileSource(client, file) {
 }
 
 export function wecomInboundMessage(frame, client) {
+  const body = bodyOf(frame);
+  const replyTo = replyReferenceForBody(body);
   return {
     content: messageText(frame),
     images: imageContents(frame).map((image) => imageSource(client, image)).filter(Boolean),
     files: fileContents(frame).map((file) => fileSource(client, file)).filter(Boolean),
+    ...(replyTo ? { replyTo } : {}),
   };
 }
 
@@ -488,6 +536,8 @@ export class WecomHarnessBridge {
   #client;
   #harness;
   #state;
+  #contextEnhancement;
+  #accessPolicy;
   #status;
   #logger;
   #replyTimeoutMs;
@@ -498,7 +548,8 @@ export class WecomHarnessBridge {
   #queues = new Map();
   #pendingInteractions = new Map();
   #interactionKeys = new Map();
-  #acceptedMessageIds = new Set();
+  // Keep the accepted configuration through the existing queue/reply lifecycle.
+  #acceptedMessageIds = new Map();
   #approvalTasks = new Set();
   #commandTasks = new Set();
   #approvals;
@@ -509,6 +560,8 @@ export class WecomHarnessBridge {
     client,
     harness,
     state,
+    contextEnhancement,
+    accessPolicy,
     status = createWecomBridgeStatus(),
     logger = console,
     replyTimeoutMs = 600_000,
@@ -527,6 +580,8 @@ export class WecomHarnessBridge {
     this.#client = client;
     this.#harness = harness;
     this.#state = state;
+    this.#contextEnhancement = contextEnhancement;
+    this.#accessPolicy = accessPolicy;
     this.#status = status;
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
@@ -555,13 +610,28 @@ export class WecomHarnessBridge {
       || this.#acceptedMessageIds.has(messageId)) return Promise.resolve();
 
     const key = conversationKey(frame);
-    this.#acceptedMessageIds.add(messageId);
-    if (body.chattype === 'single') {
-      rememberConnectionTestTarget(this.#state, { chatId });
-    }
     const pending = this.#pendingInteractions.get(key);
     const commandMessage = wecomInboundMessage(frame, this.#client);
     const commandText = nonEmptyString(commandMessage.content) ?? '';
+    const conversationType = body.chattype === 'single' ? 'direct' : 'group';
+    const access = evaluateInboundAccess(this.#accessPolicy, {
+      conversationType,
+      senderIds: senderId,
+      text: commandText,
+      hasImages: hasInboundImages(commandMessage),
+      hasFiles: hasInboundFiles(commandMessage),
+    });
+    if (!access.allowed) {
+      this.#acceptedMessageIds.set(messageId, null);
+      return this.#finishAccessDecision(frame, messageId, chatId, access);
+    }
+    this.#acceptedMessageIds.set(messageId, captureContextEnhancement(
+      this.#contextEnhancement,
+      conversationType,
+    ));
+    if (body.chattype === 'single') {
+      rememberConnectionTestTarget(this.#state, { chatId });
+    }
     const batchCommand = isBatchInputCommand(commandText);
     const batchStatus = this.#batchInputs.status(key);
     if (batchCommand && body.chattype === 'group') {
@@ -580,7 +650,7 @@ export class WecomHarnessBridge {
         && (this.#queues.has(key) || pending || this.#approvals.hasPending(key))
         ? { handled: true, kind: 'busy', message: batchInputBusyMessage() }
         : this.#batchInputs.handle(key, commandText, {
-            plainText: isNativeWecomText(frame),
+            plainText: isNativeWecomText(frame) && !hasReplyReference(commandMessage),
           });
       if (result.handled) {
         if (result.kind === 'submit') {
@@ -755,6 +825,34 @@ export class WecomHarnessBridge {
     return task;
   }
 
+  #finishAccessDecision(frame, messageId, chatId, access) {
+    let task;
+    task = Promise.resolve().then(async () => {
+      if (this.#state.hasSeen(messageId)) return;
+      await this.#state.markSeen(messageId);
+      if (access.reason === 'command-not-allowed') {
+        this.#status.messagesReceived += 1;
+        this.#status.lastMessageAt = new Date().toISOString();
+        await this.#sendImmediate(frame, chatId, t(COMMAND_PERMISSION_DENIED_MESSAGE));
+        this.#status.messagesReplied += 1;
+        this.#status.lastReplyAt = new Date().toISOString();
+      } else {
+        this.#status.messagesRejected += 1;
+        this.#status.lastRejectedAt = new Date().toISOString();
+      }
+      this.#status.lastError = null;
+    }).catch((error) => {
+      if (this.#signal?.aborted) return;
+      this.#status.lastError = error?.message ?? String(error);
+      this.#logger.error?.('[dsh-im:wecom] failed to apply inbound access policy', error);
+    }).finally(() => {
+      this.#acceptedMessageIds.delete(messageId);
+      this.#commandTasks.delete(task);
+    });
+    this.#commandTasks.add(task);
+    return task;
+  }
+
   async waitForIdle() {
     await Promise.allSettled([
       ...this.#queues.values(),
@@ -882,6 +980,7 @@ export class WecomHarnessBridge {
     const text = message.content;
     const hasImages = hasInboundImages(message);
     const hasFiles = hasInboundFiles(message);
+    const hasReply = hasReplyReference(message);
     const key = conversationKey(frame);
     let streamId = null;
     let streamStarted = false;
@@ -890,7 +989,7 @@ export class WecomHarnessBridge {
     let batchSettled = batchSubmission === null;
     let promptRecorded = false;
     try {
-      if (!text && !hasImages && !hasFiles) {
+      if (!text && !hasImages && !hasFiles && !hasReply) {
         await this.#sendImmediate(frame, chatId, t('目前支持文字、图片、文件和语音转写消息。'));
         await this.#state.markSeen(messageId);
         return;
@@ -951,9 +1050,20 @@ export class WecomHarnessBridge {
         this.#logger.warn?.('[dsh-im:wecom] unable to start a stream; using an active reply:', error);
       }
 
-      const content = hasImages
-        ? await promptContentForMessage(message, { signal: this.#signal })
+      let content = hasImages || hasReply
+        ? await promptContentForInboundMessage(message, { signal: this.#signal })
         : undefined;
+      const snapshot = this.#acceptedMessageIds.get(messageId);
+      let contextEnhanced = false;
+      if (snapshot) {
+        const originalContent = content ?? text;
+        content = enhanceContextContent(originalContent, snapshot, () => ({
+          channel: 'wecom',
+          senderId,
+          chatId,
+        }));
+        contextEnhanced = content !== originalContent;
+      }
       await this.#state.markSeen(messageId);
       promptRecorded = true;
       const { answer, artifacts = [] } = await askInWorkspaceSession({
@@ -965,6 +1075,7 @@ export class WecomHarnessBridge {
         channelLabel: this.#sourceChannelLabel,
         fromUserId: senderId,
         msgId: messageId,
+        contextEnhanced,
         createOptions: { signal: this.#signal },
         existsOptions: { signal: this.#signal },
         askOptions: {

@@ -30,26 +30,22 @@ test('an explicit Harness URL preserves HTTP transport and never reads the Host 
   assert.throws(() => harnessConnection(ctx, { harnessBaseUrl: 'not a URL' }), TypeError);
 });
 
-test('a missing Host apiProxy falls back to the webServer loopback origin', () => {
-  const connection = harnessConnection({ webServer: { port: 3080 } });
-  assert.equal(connection.baseUrl.href, 'http://127.0.0.1:3080/');
-  assert.deepEqual(Object.keys(connection), ['baseUrl']);
-});
-
-test('without apiProxy or webServer the failure names every supported option', () => {
+test('a Host with neither legacy apiProxy nor a modern gateway fails clearly', () => {
   assert.throws(
-    () => harnessConnection({}),
-    /requires the Host apiProxy service, a webServer port, or an explicit harnessBaseUrl/,
+    () => harnessConnection({ webServer: { port: 3080 } }),
+    /requires the modern Host Typert gateway/,
   );
 });
 
-test('Host and all IM channel plugins wait for the webServer rather than an in-process apiProxy', async () => {
-  assert.ok(hostInject.includes('webServer'));
+test('Host and all IM channel plugins require only services shared by old and new Harness', async () => {
   assert.equal(hostInject.includes('apiProxy'), false);
+  assert.equal(hostInject.includes('webServer'), false);
+  assert.ok(hostInject.includes('typertGateway'));
   for (const channel of IM_CHANNELS) {
     const { inject } = await import(`../plugin-src/host/channels/${channel}/index.mjs`);
-    assert.ok(inject.includes('webServer'), channel);
     assert.equal(inject.includes('apiProxy'), false, channel);
+    assert.equal(inject.includes('webServer'), false, channel);
+    assert.ok(inject.includes('typertGateway'), channel);
   }
 });
 

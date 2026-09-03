@@ -13,7 +13,16 @@ import {
   normalizeAgentPresetCatalog,
   validateAgentPresetId,
 } from './agent-preset.mjs';
+import {
+  normalizeAccessPolicy,
+  validateAccessPolicy,
+} from './access-policy.mjs';
 import { CONNECTION_TEST_STATE_IDENTITY } from './connection-test.mjs';
+import {
+  DEFAULT_CONTEXT_ENHANCEMENT_CONFIG,
+  normalizeContextEnhancementConfig,
+  validateContextEnhancementConfig,
+} from './context-enhancement.mjs';
 import { WORKSPACE_SESSION_STALE } from './workspace-session.mjs';
 
 const EMPTY_DOCUMENT = Object.freeze({ version: 1, workspaces: Object.freeze({}) });
@@ -44,8 +53,110 @@ function botIdOf(value) {
   return value;
 }
 
+function deliveryTargetError(code, message, options) {
+  const error = new Error(message, options);
+  error.code = code;
+  return error;
+}
+
+function targetIdOf(value) {
+  if (typeof value !== 'string'
+    || !/^[A-Za-z0-9._:@-]{1,128}$/.test(value)) {
+    throw deliveryTargetError('invalid-target', 'Invalid target id');
+  }
+  return value;
+}
+
+function jsonRecord(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw deliveryTargetError('invalid-target', 'Invalid target route');
+  }
+  try {
+    const serialized = JSON.stringify(value);
+    if (serialized === undefined) throw new TypeError('route is not JSON');
+    const route = JSON.parse(serialized);
+    if (!route || typeof route !== 'object' || Array.isArray(route)) {
+      throw new TypeError('route is not an object');
+    }
+    return route;
+  } catch (cause) {
+    throw deliveryTargetError('invalid-target', 'Invalid target route', { cause });
+  }
+}
+
+function normalizeDeliveryTarget(value, { targetId } = {}) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw deliveryTargetError('invalid-target', 'Invalid delivery target');
+  }
+  const allowed = targetId === undefined
+    ? new Set(['targetId', 'name', 'kind', 'route'])
+    : new Set(['name', 'kind', 'route']);
+  if (Object.keys(value).some((key) => !allowed.has(key))) {
+    throw deliveryTargetError('invalid-target', 'Invalid delivery target');
+  }
+  const id = targetIdOf(targetId ?? value.targetId);
+  if (typeof value.kind !== 'string' || !/^[a-z][a-z0-9-]{0,31}$/.test(value.kind)) {
+    throw deliveryTargetError('invalid-target', 'Invalid target kind');
+  }
+  let name;
+  if (value.name !== undefined) {
+    if (typeof value.name !== 'string' || !value.name.trim() || value.name.trim().length > 80) {
+      throw deliveryTargetError('invalid-target', 'Invalid target name');
+    }
+    name = value.name.trim();
+  }
+  return {
+    targetId: id,
+    ...(name === undefined ? {} : { name }),
+    kind: value.kind,
+    route: jsonRecord(value.route),
+  };
+}
+
+function normalizeDeliveryTargets(value) {
+  const deliveryTargets = Object.create(null);
+  if (value === undefined) return deliveryTargets;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  try {
+    for (const [botId, targets] of Object.entries(value)) {
+      botIdOf(botId);
+      if (!targets || typeof targets !== 'object' || Array.isArray(targets)) return null;
+      const normalizedTargets = Object.create(null);
+      for (const [targetId, target] of Object.entries(targets)) {
+        const normalized = normalizeDeliveryTarget(target, { targetId });
+        const { targetId: _targetId, ...stored } = normalized;
+        normalizedTargets[targetId] = stored;
+      }
+      deliveryTargets[botId] = normalizedTargets;
+    }
+  } catch {
+    return null;
+  }
+  return deliveryTargets;
+}
+
+function normalizeAccessPolicies(value, workspaces) {
+  const accessPolicies = Object.create(null);
+  if (value === undefined) return accessPolicies;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    // Preserve the distinction between a missing policy (eligible for startup
+    // initialization) and damaged persisted data (fail closed).
+    for (const botId of Object.keys(workspaces)) accessPolicies[botId] = null;
+    return accessPolicies;
+  }
+  for (const [botId, policy] of Object.entries(value)) {
+    try {
+      botIdOf(botId);
+      accessPolicies[botId] = normalizeAccessPolicy(policy);
+    } catch {
+      // An invalid key cannot identify a bot, so it is isolated and ignored.
+    }
+  }
+  return accessPolicies;
+}
+
 function normalizeDocument(value) {
-  if (!value || value.version !== 1 || !value.workspaces
+  if (!value || ![1, 2].includes(value.version) || !value.workspaces
     || typeof value.workspaces !== 'object' || Array.isArray(value.workspaces)) return null;
   const workspaces = {};
   for (const [botId, workspace] of Object.entries(value.workspaces)) {
@@ -68,7 +179,63 @@ function normalizeDocument(value) {
       }
     }
   }
-  return { version: 1, workspaces, agentPresets };
+  const contextEnhancement = Object.create(null);
+  // Enhancement damage is isolated from the existing workspace/preset document.
+  if (value.contextEnhancement && typeof value.contextEnhancement === 'object'
+    && !Array.isArray(value.contextEnhancement)) {
+    for (const [botId, config] of Object.entries(value.contextEnhancement)) {
+      if (/^[A-Za-z0-9_-]{1,128}$/.test(botId)) {
+        contextEnhancement[botId] = normalizeContextEnhancementConfig(config);
+      }
+    }
+  }
+  if (value.version === 1 && value.deliveryTargets !== undefined) return null;
+  const deliveryTargets = normalizeDeliveryTargets(value.deliveryTargets);
+  if (!deliveryTargets) return null;
+  const accessPolicies = normalizeAccessPolicies(value.accessPolicies, workspaces);
+  const version = value.accessPolicies === undefined ? value.version : 2;
+  return {
+    // A v1 file cannot be emitted with this optional v2 section. If one is
+    // recovered from an interrupted/manual edit, retain it on the next write.
+    version,
+    workspaces,
+    agentPresets,
+    contextEnhancement,
+    deliveryTargets,
+    accessPolicies,
+  };
+}
+
+function storedDocument({
+  version,
+  workspaces,
+  agentPresets,
+  contextEnhancement,
+  deliveryTargets,
+  accessPolicies,
+}) {
+  const document = { version, workspaces };
+  if (Object.keys(agentPresets).length > 0) document.agentPresets = agentPresets;
+  if (Object.keys(contextEnhancement).length > 0) {
+    document.contextEnhancement = contextEnhancement;
+  }
+  if (version >= 2 && Object.keys(deliveryTargets).length > 0) {
+    document.deliveryTargets = deliveryTargets;
+  }
+  if (version >= 2 && Object.keys(accessPolicies).length > 0) {
+    document.accessPolicies = accessPolicies;
+  }
+  return document;
+}
+
+async function writeStoredDocument(path, document) {
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const temporary = `${path}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(document, null, 2)}\n`, {
+    encoding: 'utf8',
+    mode: 0o600,
+  });
+  await rename(temporary, path);
 }
 
 export async function validateWorkspacePath(value) {
@@ -97,8 +264,12 @@ export async function validateWorkspacePath(value) {
 export class BotWorkspaceStore {
   #path;
   #defaultWorkspace;
+  #version = 1;
   #workspaces = {};
   #agentPresets = {};
+  #contextEnhancement = {};
+  #deliveryTargets = Object.create(null);
+  #accessPolicies = Object.create(null);
   #generations = new Map();
   #nextGeneration = 1;
   #incarnations = new Map();
@@ -119,12 +290,20 @@ export class BotWorkspaceStore {
     try {
       const normalized = normalizeDocument(JSON.parse(await readFile(this.#path, 'utf8')));
       if (!normalized) throw new Error('dsh-im workspace config is invalid');
+      this.#version = normalized.version;
       this.#workspaces = normalized.workspaces;
       this.#agentPresets = normalized.agentPresets;
+      this.#contextEnhancement = normalized.contextEnhancement;
+      this.#deliveryTargets = normalized.deliveryTargets;
+      this.#accessPolicies = normalized.accessPolicies;
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
+      this.#version = 1;
       this.#workspaces = {};
       this.#agentPresets = {};
+      this.#contextEnhancement = {};
+      this.#deliveryTargets = Object.create(null);
+      this.#accessPolicies = Object.create(null);
     }
     this.#generations.clear();
     this.#nextGeneration = 1;
@@ -156,6 +335,97 @@ export class BotWorkspaceStore {
     return this.#agentPresets[botIdOf(botId)] ?? null;
   }
 
+  contextEnhancementFor(botId) {
+    const id = botIdOf(botId);
+    return this.has(id) && Object.hasOwn(this.#contextEnhancement, id)
+      ? this.#contextEnhancement[id]
+      : DEFAULT_CONTEXT_ENHANCEMENT_CONFIG;
+  }
+
+  accessPolicyFor(botId) {
+    const id = botIdOf(botId);
+    return this.has(id) && Object.hasOwn(this.#accessPolicies, id)
+      ? this.#accessPolicies[id]
+      : null;
+  }
+
+  listDeliveryTargets(botId) {
+    const id = botIdOf(botId);
+    if (!this.has(id)) throw deliveryTargetError('unknown-bot', 'Unknown bot');
+    return Object.entries(this.#deliveryTargets[id] ?? {})
+      .map(([targetId, target]) => normalizeDeliveryTarget(target, { targetId }))
+      .sort((left, right) => left.targetId.localeCompare(right.targetId));
+  }
+
+  deliveryTargetFor(botId, targetId) {
+    const id = botIdOf(botId);
+    const targetKey = targetIdOf(targetId);
+    if (!this.has(id)) throw deliveryTargetError('unknown-bot', 'Unknown bot');
+    const target = this.#deliveryTargets[id]?.[targetKey];
+    return target ? normalizeDeliveryTarget(target, { targetId: targetKey }) : null;
+  }
+
+  async createDeliveryTarget(botId, value) {
+    const id = botIdOf(botId);
+    const target = normalizeDeliveryTarget(value);
+    return this.#enqueue(id, async () => {
+      if (!this.has(id)) throw deliveryTargetError('unknown-bot', 'Unknown bot');
+      if (Object.hasOwn(this.#deliveryTargets[id] ?? {}, target.targetId)) {
+        throw deliveryTargetError('target-conflict', 'Target already exists');
+      }
+      const { targetId, ...stored } = target;
+      const next = {
+        ...this.#deliveryTargets,
+        [id]: { ...(this.#deliveryTargets[id] ?? {}), [targetId]: stored },
+      };
+      await this.#persist(this.#contextEnhancement, next, 2);
+      this.#deliveryTargets = next;
+      this.#version = 2;
+      return normalizeDeliveryTarget(stored, { targetId });
+    });
+  }
+
+  async updateDeliveryTarget(botId, targetId, value) {
+    const id = botIdOf(botId);
+    const targetKey = targetIdOf(targetId);
+    const replacement = normalizeDeliveryTarget(value, { targetId: targetKey });
+    return this.#enqueue(id, async () => {
+      if (!this.has(id)) throw deliveryTargetError('unknown-bot', 'Unknown bot');
+      if (!Object.hasOwn(this.#deliveryTargets[id] ?? {}, targetKey)) {
+        throw deliveryTargetError('unknown-target', 'Unknown target');
+      }
+      const { targetId: _targetId, ...stored } = replacement;
+      const next = {
+        ...this.#deliveryTargets,
+        [id]: { ...this.#deliveryTargets[id], [targetKey]: stored },
+      };
+      await this.#persist(this.#contextEnhancement, next, 2);
+      this.#deliveryTargets = next;
+      this.#version = 2;
+      return normalizeDeliveryTarget(stored, { targetId: targetKey });
+    });
+  }
+
+  async deleteDeliveryTarget(botId, targetId) {
+    const id = botIdOf(botId);
+    const targetKey = targetIdOf(targetId);
+    return this.#enqueue(id, async () => {
+      if (!this.has(id)) throw deliveryTargetError('unknown-bot', 'Unknown bot');
+      if (!Object.hasOwn(this.#deliveryTargets[id] ?? {}, targetKey)) {
+        throw deliveryTargetError('unknown-target', 'Unknown target');
+      }
+      const botTargets = { ...this.#deliveryTargets[id] };
+      delete botTargets[targetKey];
+      const next = { ...this.#deliveryTargets };
+      if (Object.keys(botTargets).length > 0) next[id] = botTargets;
+      else delete next[id];
+      await this.#persist(this.#contextEnhancement, next, 2);
+      this.#deliveryTargets = next;
+      this.#version = 2;
+      return true;
+    });
+  }
+
   generationFor(botId) {
     return this.#generations.get(botIdOf(botId)) ?? null;
   }
@@ -174,28 +444,53 @@ export class BotWorkspaceStore {
     }
   }
 
-  async ensure(botId, { workspace = this.#defaultWorkspace, defaultAgentPreset } = {}) {
+  async ensure(botId, {
+    workspace = this.#defaultWorkspace,
+    defaultAgentPreset,
+    initialAccessPolicy,
+  } = {}) {
     const id = botIdOf(botId);
     const initialWorkspace = resolve(workspace);
     return this.#enqueue(id, async () => {
-      if (!this.#workspaces[id]) {
-        const agentPreset = validateAgentPresetId(defaultAgentPreset);
+      const createsBot = !this.#workspaces[id];
+      const initializesAccessPolicy = initialAccessPolicy !== undefined
+        && !Object.hasOwn(this.#accessPolicies, id);
+      if (createsBot || initializesAccessPolicy) {
+        const accessPolicy = initializesAccessPolicy
+          ? validateAccessPolicy(initialAccessPolicy)
+          : undefined;
+        const agentPreset = createsBot ? validateAgentPresetId(defaultAgentPreset) : null;
         const hadAgentPreset = Object.hasOwn(this.#agentPresets, id);
         const previousAgentPreset = this.#agentPresets[id];
-        this.#workspaces[id] = initialWorkspace;
-        if (agentPreset) this.#agentPresets[id] = agentPreset;
-        this.#generations.set(id, this.#freshGeneration());
-        this.#incarnations.set(id, this.#freshIncarnation());
+        const nextAccessPolicies = initializesAccessPolicy
+          ? { ...this.#accessPolicies, [id]: accessPolicy }
+          : this.#accessPolicies;
+        if (createsBot) {
+          this.#workspaces[id] = initialWorkspace;
+          if (agentPreset) this.#agentPresets[id] = agentPreset;
+          this.#generations.set(id, this.#freshGeneration());
+          this.#incarnations.set(id, this.#freshIncarnation());
+        }
+        const nextVersion = initializesAccessPolicy ? 2 : this.#version;
         try {
-          await this.#persist();
+          await this.#persist(
+            this.#contextEnhancement,
+            this.#deliveryTargets,
+            nextVersion,
+            nextAccessPolicies,
+          );
         } catch (error) {
-          delete this.#workspaces[id];
-          if (hadAgentPreset) this.#agentPresets[id] = previousAgentPreset;
-          else delete this.#agentPresets[id];
-          this.#generations.delete(id);
-          this.#incarnations.delete(id);
+          if (createsBot) {
+            delete this.#workspaces[id];
+            if (hadAgentPreset) this.#agentPresets[id] = previousAgentPreset;
+            else delete this.#agentPresets[id];
+            this.#generations.delete(id);
+            this.#incarnations.delete(id);
+          }
           throw error;
         }
+        this.#accessPolicies = nextAccessPolicies;
+        this.#version = nextVersion;
       } else if (!this.#generations.has(id)) {
         this.#generations.set(id, this.#freshGeneration());
       }
@@ -267,6 +562,48 @@ export class BotWorkspaceStore {
         throw error;
       }
       return agentPreset;
+    });
+  }
+
+  async setContextEnhancement(botId, value, { incarnation } = {}) {
+    const id = botIdOf(botId);
+    const expectedIncarnation = incarnation === undefined ? this.incarnationFor(id) : incarnation;
+    const config = validateContextEnhancementConfig(value);
+    return this.#enqueue(id, async () => {
+      if (!this.has(id) || expectedIncarnation !== this.incarnationFor(id)) {
+        const error = new Error('找不到要修改的机器人。');
+        error.code = 'workspace-bot-not-found';
+        throw error;
+      }
+      const next = { ...this.#contextEnhancement, [id]: config };
+      // Messages keep the previous committed snapshot until rename succeeds.
+      await this.#persist(next);
+      this.#contextEnhancement = next;
+      return config;
+    });
+  }
+
+  async setAccessPolicy(botId, value, { incarnation } = {}) {
+    const id = botIdOf(botId);
+    const expectedIncarnation = incarnation === undefined ? this.incarnationFor(id) : incarnation;
+    const policy = validateAccessPolicy(value);
+    return this.#enqueue(id, async () => {
+      if (!this.has(id) || expectedIncarnation !== this.incarnationFor(id)) {
+        const error = new Error('找不到要修改的机器人。');
+        error.code = 'workspace-bot-not-found';
+        throw error;
+      }
+      const next = { ...this.#accessPolicies, [id]: policy };
+      // Inbound messages keep the previous committed snapshot until rename succeeds.
+      await this.#persist(
+        this.#contextEnhancement,
+        this.#deliveryTargets,
+        2,
+        next,
+      );
+      this.#accessPolicies = next;
+      this.#version = 2;
+      return policy;
     });
   }
 
@@ -408,6 +745,14 @@ export class BotWorkspaceStore {
     });
   }
 
+  /** A failed retirement must reach disk before the same config ID can be rebound. */
+  flushPendingRemoval(botId) {
+    if (!this.#dirtyRemovals.has(botId)) return undefined;
+    return this.#enqueue(botId, async () => {
+      if (this.#dirtyRemovals.has(botId)) await this.#persistCurrentDocument();
+    });
+  }
+
   async remove(botId) {
     const result = await this.retireAfterConfigCommit(botId);
     if (result.error) throw result.error;
@@ -419,6 +764,9 @@ export class BotWorkspaceStore {
     const candidates = new Set([
       ...Object.keys(this.#workspaces),
       ...Object.keys(this.#agentPresets),
+      ...Object.keys(this.#contextEnhancement),
+      ...Object.keys(this.#deliveryTargets),
+      ...Object.keys(this.#accessPolicies),
       ...this.#dirtyRemovals,
     ]);
     for (const botId of candidates) {
@@ -435,6 +783,8 @@ export class BotWorkspaceStore {
           ...bot,
           workspace: this.workspaceFor(bot.botId),
           agentPreset: this.agentPresetFor(bot.botId),
+          contextEnhancement: this.contextEnhancementFor(bot.botId),
+          accessPolicy: this.accessPolicyFor(bot.botId),
         }
         : bot),
     };
@@ -464,9 +814,16 @@ export class BotWorkspaceStore {
   async #retireCurrentIncarnation(id) {
     const hadWorkspace = Object.hasOwn(this.#workspaces, id);
     const hadPreset = Object.hasOwn(this.#agentPresets, id);
-    const needsCleanup = hadWorkspace || hadPreset || this.#dirtyRemovals.has(id);
+    const hadContextEnhancement = Object.hasOwn(this.#contextEnhancement, id);
+    const hadDeliveryTargets = Object.hasOwn(this.#deliveryTargets, id);
+    const hadAccessPolicy = Object.hasOwn(this.#accessPolicies, id);
+    const needsCleanup = hadWorkspace || hadPreset || hadContextEnhancement
+      || hadDeliveryTargets || hadAccessPolicy || this.#dirtyRemovals.has(id);
     delete this.#workspaces[id];
     delete this.#agentPresets[id];
+    delete this.#contextEnhancement[id];
+    delete this.#deliveryTargets[id];
+    delete this.#accessPolicies[id];
     this.#generations.delete(id);
     this.#incarnations.delete(id);
     if (!needsCleanup) return {
@@ -496,24 +853,29 @@ export class BotWorkspaceStore {
     return queued;
   }
 
-  async #persist() {
-    const document = { version: 1, workspaces: this.#workspaces };
-    if (Object.keys(this.#agentPresets).length > 0) {
-      document.agentPresets = this.#agentPresets;
-    }
-    await mkdir(dirname(this.#path), { recursive: true, mode: 0o700 });
-    const temporary = `${this.#path}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(document, null, 2)}\n`, {
-      encoding: 'utf8',
-      mode: 0o600,
-    });
-    await rename(temporary, this.#path);
+  async #persist(
+    contextEnhancement = this.#contextEnhancement,
+    deliveryTargets = this.#deliveryTargets,
+    version = this.#version,
+    accessPolicies = this.#accessPolicies,
+  ) {
+    await writeStoredDocument(this.#path, storedDocument({
+      version,
+      workspaces: this.#workspaces,
+      agentPresets: this.#agentPresets,
+      contextEnhancement,
+      deliveryTargets,
+      accessPolicies,
+    }));
     this.#dirtyRemovals.clear();
   }
 
   async #persistCurrentDocument() {
     if (Object.keys(this.#workspaces).length > 0
-      || Object.keys(this.#agentPresets).length > 0) {
+      || Object.keys(this.#agentPresets).length > 0
+      || Object.keys(this.#contextEnhancement).length > 0
+      || Object.keys(this.#deliveryTargets).length > 0
+      || Object.keys(this.#accessPolicies).length > 0) {
       await this.#persist();
       return;
     }
@@ -569,10 +931,16 @@ function targetStatus(controller) {
   return Promise.resolve(controller.status());
 }
 
-/** Observe the config store's durable removal commit without changing its API. */
+/** Observe durable removals and finish failed cleanup before a same-ID config save. */
 export function observeBotWorkspaceRemovals(
   configStore,
-  { workspaces, method = 'remove', botIdFromRemoved = (removed) => removed?.botId },
+  {
+    workspaces,
+    method = 'remove',
+    botIdFromRemoved = (removed) => removed?.botId,
+    saveMethod = 'save',
+    botIdFromSave = (config) => config?.botId,
+  },
 ) {
   if (!configStore || !workspaces || typeof configStore[method] !== 'function') {
     throw new TypeError('configStore removal observer dependencies are required');
@@ -586,6 +954,12 @@ export function observeBotWorkspaceRemovals(
           const botId = removed ? botIdFromRemoved(removed, args) : null;
           if (botId) await workspaces.retireAfterConfigCommit(botId);
           return removed;
+        };
+      }
+      if (property === saveMethod && typeof value === 'function') {
+        return (...args) => {
+          const cleanup = workspaces.flushPendingRemoval(botIdFromSave(args[0], args));
+          return cleanup ? cleanup.then(() => value.apply(target, args)) : value.apply(target, args);
         };
       }
       return typeof value === 'function' ? value.bind(target) : value;
@@ -837,6 +1211,11 @@ export function createBotWorkspaceScope(
             readHistory(...args) {
               return invokeCurrentSession('readSessionHistory', args, 'history read');
             },
+            ...(typeof target.renameSession === 'function' ? {
+              renameTitle(...args) {
+                return invokeStartedSessionMutation('renameSession', args, 'title rename');
+              },
+            } : {}),
             selectModel(...args) {
               return invokeCurrentSession('selectSessionModel', args, 'model selection');
             },
@@ -998,6 +1377,56 @@ export function createWorkspaceAwareController(controller, { workspaces, stateFo
       );
     });
   };
+  const updateContextEnhancement = (botId, value, projectStatus) => {
+    const incarnation = workspaces.incarnationFor(botId);
+    const config = validateContextEnhancementConfig(value);
+    return withBotTransition(botId, async () => {
+      const snapshot = await controller.status();
+      if (!snapshot?.bots?.some((bot) => bot?.botId === botId)) {
+        const error = new Error('找不到要修改的机器人。');
+        error.code = 'workspace-bot-not-found';
+        throw error;
+      }
+      const catalog = await resolveAgentPresetCatalog(agentPresetCatalog);
+      const decorated = workspaces.decorateStatus(snapshot);
+      const updated = {
+        ...decorated,
+        bots: decorated.bots.map((bot) => bot?.botId === botId
+          ? { ...bot, contextEnhancement: config } : bot),
+        ...(catalog ? { agentPresetCatalog: catalog } : {}),
+      };
+      // QR/status projection can fail too. Prepare the complete response before
+      // commit so a failed save never publishes new running settings.
+      const result = projectStatus ? await projectStatus(updated) : updated;
+      await workspaces.setContextEnhancement(botId, config, { incarnation });
+      return result;
+    });
+  };
+  const updateAccessPolicy = (botId, value, projectStatus) => {
+    const incarnation = workspaces.incarnationFor(botId);
+    const policy = validateAccessPolicy(value);
+    return withBotTransition(botId, async () => {
+      const snapshot = await controller.status();
+      if (!snapshot?.bots?.some((bot) => bot?.botId === botId)) {
+        const error = new Error('找不到要修改的机器人。');
+        error.code = 'workspace-bot-not-found';
+        throw error;
+      }
+      const catalog = await resolveAgentPresetCatalog(agentPresetCatalog);
+      const decorated = workspaces.decorateStatus(snapshot);
+      const updated = {
+        ...decorated,
+        bots: decorated.bots.map((bot) => bot?.botId === botId
+          ? { ...bot, accessPolicy: policy } : bot),
+        ...(catalog ? { agentPresetCatalog: catalog } : {}),
+      };
+      // Prepare the complete channel-specific response before commit. Failed
+      // projections and disk writes must leave the live policy unchanged.
+      const result = projectStatus ? await projectStatus(updated) : updated;
+      await workspaces.setAccessPolicy(botId, policy, { incarnation });
+      return result;
+    });
+  };
   const deleteWithWorkspace = (botId, invokeDelete) => withBotTransition(botId, async () => {
     // Fence the old runtime without changing the durable mapping. A crash
     // before the controller removes its config therefore keeps the bot's
@@ -1037,6 +1466,8 @@ export function createWorkspaceAwareController(controller, { workspaces, stateFo
     get(target, property) {
       if (property === 'updateWorkspace') return updateWorkspace;
       if (property === 'updateAgentPreset') return updateAgentPreset;
+      if (property === 'updateContextEnhancement') return updateContextEnhancement;
+      if (property === 'updateAccessPolicy') return updateAccessPolicy;
       const value = Reflect.get(target, property, target);
       if (typeof value !== 'function') return value;
       if (property === 'deleteBot') {

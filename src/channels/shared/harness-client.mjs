@@ -7,6 +7,12 @@ import {
   appendInboundFilesToPrompt,
   InboundFileError,
 } from './inbound-file.mjs';
+import {
+  IMAGE_FILE_FALLBACK_PROMPT,
+  contentWithoutImages,
+  imageFileSourcesFromContent,
+  isModelImageRejection,
+} from './image-prompt.mjs';
 import { outboundArtifactRegistry } from './semantic/artifact.mjs';
 import { t } from './i18n.mjs';
 import { watchHarnessMux } from './harness-mux.mjs';
@@ -389,6 +395,24 @@ function consumeInteractionOwnership(ownership, entries) {
   }
 }
 
+/**
+ * Decide whether the current Host has a live dsh-im interaction watcher for
+ * this Session.  The modern Harness adapter uses the same ownership registry
+ * as HarnessClient so it never steals a browser-owned question or approval.
+ */
+export function hasActiveHarnessInteractionOwner(scope, sessionId, entries = []) {
+  if (!scope || !['object', 'function', 'string'].includes(typeof scope)
+    || typeof sessionId !== 'string' || !sessionId) return false;
+  const owners = interactionRegistry(scope).ownerships.get(sessionId);
+  if (!owners || owners.size === 0) return false;
+  for (const ownership of owners) consumeInteractionOwnership(ownership, entries);
+  return [...owners].some((ownership) => (
+    ownership.active
+    && !ownership.completed
+    && typeof ownership.reconnect === 'function'
+  ));
+}
+
 export class HarnessReplyTracker {
   #promptRpcId;
   #lastSeq;
@@ -408,6 +432,11 @@ export class HarnessReplyTracker {
 
   get finished() {
     return this.#finished;
+  }
+
+  /** The highest event seq consumed so far; advances as the turn produces events. */
+  get lastSeq() {
+    return this.#lastSeq;
   }
 
   get answer() {
@@ -898,6 +927,12 @@ export class HarnessClient {
     return created.sessionId;
   }
 
+  async renameSession(sessionId, title, options = {}) {
+    if (typeof sessionId !== 'string' || !sessionId) throw new TypeError('sessionId is required');
+    if (typeof title !== 'string' || !title.trim()) throw new TypeError('session title is required');
+    return this.rpc('session.rename', { sessionId, title }, 30_000, options);
+  }
+
   async executeCommand(sessionId, line, options = {}) {
     if (typeof sessionId !== 'string' || !sessionId) throw new TypeError('sessionId is required');
     if (typeof line !== 'string' || !line) throw new TypeError('command line is required');
@@ -1223,6 +1258,31 @@ export class HarnessClient {
     return ownership ? { ownership, recovered: true } : null;
   }
 
+  /** Stage inbound file sources into the Session workspace via the Host executor. */
+  async #stageWorkspaceFiles(sessionId, files, signal) {
+    if (!this.#fileIngressExecutor) {
+      throw new InboundFileError(
+        'inbound-file-ingress-unavailable',
+        'Harness file ingress is unavailable in this Host process.',
+      );
+    }
+    const sessionList = await this.rpc(
+      'session.list',
+      {},
+      30_000,
+      { signal },
+    );
+    const sessionWorkspace = sessionList?.items?.find(
+      (item) => item?.sessionId === sessionId,
+    )?.cwd;
+    return this.#fileIngressExecutor({
+      sessionId,
+      workspace: sessionWorkspace,
+      files,
+      signal,
+    });
+  }
+
   async ask(sessionId, prompt, options = {}) {
     if (typeof options === 'number') options = { timeoutMs: options };
     const timeoutMs = options.timeoutMs ?? 600_000;
@@ -1279,7 +1339,7 @@ export class HarnessClient {
     let interactionTask = null;
     let artifactsDelivered = false;
     let deliveredArtifactCount = 0;
-    let stagedInboundFiles = null;
+    const stagedBatches = [];
     let promptAccepted = false;
     let turnFinished = false;
 
@@ -1310,29 +1370,11 @@ export class HarnessClient {
     const closeArtifactConsumer = outboundArtifactRegistry.openConsumer(sessionId, promptRpcId);
 
     try {
+      const basePrompt = prompt;
       if (inboundFiles.length > 0) {
-        if (!this.#fileIngressExecutor) {
-          throw new InboundFileError(
-            'inbound-file-ingress-unavailable',
-            'Harness file ingress is unavailable in this Host process.',
-          );
-        }
-        const sessionList = await this.rpc(
-          'session.list',
-          {},
-          30_000,
-          { signal },
-        );
-        const sessionWorkspace = sessionList?.items?.find(
-          (item) => item?.sessionId === sessionId,
-        )?.cwd;
-        stagedInboundFiles = await this.#fileIngressExecutor({
-          sessionId,
-          workspace: sessionWorkspace,
-          files: inboundFiles,
-          signal,
-        });
-        prompt = appendInboundFilesToPrompt(prompt, stagedInboundFiles);
+        const staged = await this.#stageWorkspaceFiles(sessionId, inboundFiles, signal);
+        stagedBatches.push(staged);
+        prompt = appendInboundFilesToPrompt(prompt, staged);
       }
       if (interactionSignal) {
         let markOpen;
@@ -1359,17 +1401,58 @@ export class HarnessClient {
       if (!Array.isArray(content) || content.length === 0) {
         throw new TypeError('Harness prompt content is required');
       }
-      await this.rpc('session.prompt', {
+      const clientTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const sendPrompt = (promptContent) => this.rpc('session.prompt', {
         sessionId,
         mode: 'queue',
-        content,
-        clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        content: promptContent,
+        clientTimeZone,
       }, 30_000, { rpcId: promptRpcId, signal });
+      try {
+        await sendPrompt(content);
+      } catch (error) {
+        // The Host refuses image blocks for a non-vision model before any
+        // durable user message exists. Re-deliver the same bytes the way
+        // ordinary uploads (zip, documents) already travel — staged into the
+        // Session workspace and named in a text manifest — then retry once
+        // with a text-only prompt. The retry reuses promptRpcId so reply
+        // tracking, control and interaction ownership stay bound to this ask.
+        const imageSources = isModelImageRejection(error)
+          ? imageFileSourcesFromContent(content)
+          : [];
+        if (imageSources.length === 0) throw error;
+        let stagedImages;
+        try {
+          stagedImages = await this.#stageWorkspaceFiles(sessionId, imageSources, signal);
+        } catch (stagingError) {
+          if (signal?.aborted) throw signal.reason ?? stagingError;
+          console.warn(
+            `[${this.#logPrefix}] unable to restage rejected images as workspace files:`,
+            stagingError?.message ?? String(stagingError),
+          );
+          throw error;
+        }
+        stagedBatches.push(stagedImages);
+        const baseContent = typeof basePrompt === 'string'
+          ? [{ type: 'text', text: basePrompt }]
+          : basePrompt;
+        const fallbackPrompt = appendInboundFilesToPrompt([
+          ...contentWithoutImages(baseContent),
+          { type: 'text', text: t(IMAGE_FILE_FALLBACK_PROMPT) },
+        ], { files: stagedBatches.flatMap((batch) => batch?.files ?? []) });
+        await sendPrompt(fallbackPrompt);
+      }
       promptAccepted = true;
 
       try {
-        const deadline = Date.now() + timeoutMs;
-        while (Date.now() < deadline) {
+        // Treat timeoutMs as a stall window rather than a hard runtime limit.
+        // Durable events are direct progress. Once a full quiet window elapses,
+        // confirm the Session is still running before renewing the wait.
+        // Interaction ownership is intentionally not a liveness signal: it stays
+        // active until turn/end and can therefore outlive a stalled turn.
+        let lastProgressAt = Date.now();
+        let lastPollSeq = tracker.lastSeq;
+        while (true) {
           await sleep(300, signal);
           const history = await this.rpc(
             'session.history',
@@ -1383,6 +1466,9 @@ export class HarnessClient {
             if (!wasActive && ownership.active) ownership.reconnect?.();
           }
           const updates = tracker.consumeAll(history.events ?? []);
+          const seqAdvanced = tracker.lastSeq > lastPollSeq;
+          lastPollSeq = tracker.lastSeq;
+          if (seqAdvanced) lastProgressAt = Date.now();
           if (onUpdate) {
             const visibleUpdates = progressMode === 'all' ? updates : updates.slice(-1);
             for (const update of visibleUpdates) {
@@ -1393,24 +1479,39 @@ export class HarnessClient {
               }
             }
           }
-          if (!tracker.finished) continue;
-          turnFinished = true;
-          if (!ownership?.stopRequested && !harnessTurnSucceeded(tracker.reason)) {
+          if (tracker.finished) {
+            turnFinished = true;
+            if (!ownership?.stopRequested && !harnessTurnSucceeded(tracker.reason)) {
+              throw harnessTurnError(tracker.reason);
+            }
+            // An accepted /stop revokes attachment delivery even when Harness
+            // preserved a useful partial text answer for the existing UX.
+            const artifactCount = ownership?.stopRequested
+              ? 0
+              : await deliverArtifacts();
+            if (tracker.answer) {
+              return tracker.answer;
+            }
+            if (artifactCount > 0) return '';
+            if (ownership?.stopRequested) throw turnStoppedError();
             throw harnessTurnError(tracker.reason);
           }
-          // An accepted /stop revokes attachment delivery even when Harness
-          // preserved a useful partial text answer for the existing UX.
-          const artifactCount = ownership?.stopRequested
-            ? 0
-            : await deliverArtifacts();
-          if (tracker.answer) {
-            return tracker.answer;
+
+          if (Date.now() - lastProgressAt < timeoutMs) continue;
+
+          let running = false;
+          try {
+            running = await this.isSessionRunning(sessionId, { signal });
+          } catch (error) {
+            if (signal?.aborted) throw signal.reason ?? error;
+            // A failed liveness probe is not evidence of progress.
           }
-          if (artifactCount > 0) return '';
-          if (ownership?.stopRequested) throw turnStoppedError();
-          throw harnessTurnError(tracker.reason);
+          if (running) {
+            lastProgressAt = Date.now();
+            continue;
+          }
+          throw new HarnessTurnError('harness-reply-timeout');
         }
-        throw new HarnessTurnError('harness-reply-timeout');
       } catch (error) {
         // Once cancellation was accepted, transport/poll failures and timeouts
         // describe the convergence of that stop, not an unrelated ask failure.
@@ -1422,10 +1523,14 @@ export class HarnessClient {
         throw turnStoppedError();
       }
     } finally {
-      if (stagedInboundFiles && (!promptAccepted || turnFinished)) {
-        await stagedInboundFiles.cleanup().catch((error) => {
-          console.warn(`[${this.#logPrefix}] unable to clean inbound files:`, error.message);
-        });
+      if (!promptAccepted || turnFinished) {
+        for (const staged of stagedBatches) {
+          try {
+            await staged?.cleanup?.();
+          } catch (error) {
+            console.warn(`[${this.#logPrefix}] unable to clean inbound files:`, error.message);
+          }
+        }
       }
       closeArtifactConsumer();
       if (ownership) {

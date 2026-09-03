@@ -5,6 +5,7 @@ import {
 } from './dingtalk-bridge.mjs';
 import { sendRememberedConnectionTest } from '../shared/connection-test.mjs';
 import { t } from '../shared/i18n.mjs';
+import { captureContextEnhancement } from '../shared/context-enhancement.mjs';
 
 function nonEmptyString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
@@ -128,6 +129,8 @@ export class DingtalkRuntime {
   #clientSecret;
   #harness;
   #state;
+  #contextEnhancement;
+  #accessPolicy;
   #logger;
   #replyTimeoutMs;
   #maxMessageChars;
@@ -149,6 +152,8 @@ export class DingtalkRuntime {
     clientSecret,
     harness,
     state,
+    contextEnhancement,
+    accessPolicy,
     logger = console,
     replyTimeoutMs = 600_000,
     maxMessageChars = 4_000,
@@ -166,6 +171,8 @@ export class DingtalkRuntime {
     this.#clientSecret = clientSecret.trim();
     this.#harness = harness;
     this.#state = state;
+    this.#contextEnhancement = contextEnhancement;
+    this.#accessPolicy = accessPolicy;
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#maxMessageChars = maxMessageChars;
@@ -233,6 +240,8 @@ export class DingtalkRuntime {
         approvedSenders: this.#config.approvedSenders,
         harness: this.#harness,
         state: this.#state,
+        contextEnhancement: this.#contextEnhancement,
+        accessPolicy: this.#accessPolicy,
         status: this.#status,
         logger: this.#logger,
         replyTimeoutMs: this.#replyTimeoutMs,
@@ -268,6 +277,15 @@ export class DingtalkRuntime {
           }
         }
 
+        // Retain the committed, read-only settings at receipt without moving
+        // JSON parsing out of the existing asynchronous callback path.
+        const contextEnhancement = this.#contextEnhancement;
+        let receivedSettings;
+        try {
+          receivedSettings = contextEnhancement?.getSettings?.();
+        } catch {
+          // Optional settings failures leave the original message path active.
+        }
         const task = Promise.resolve().then(async () => {
           if (this.#bridge !== bridge) return;
           let message;
@@ -282,7 +300,12 @@ export class DingtalkRuntime {
           }
           if (!message || typeof message !== 'object') return;
           this.#status.lastCallbackAt = Date.now();
-          await bridge.accept(message);
+          const contextSnapshot = captureContextEnhancement({
+            getSettings: () => receivedSettings,
+            get botId() { return contextEnhancement?.botId; },
+          }, message.conversationType === '1' || message.conversationType === 1 ? 'direct'
+            : message.conversationType === '2' || message.conversationType === 2 ? 'group' : null);
+          await bridge.accept(message, { contextSnapshot });
         }).catch(() => {
           if (signal.aborted || this.#bridge !== bridge) return;
           this.#status.lastError = t('钉钉消息处理失败。');
@@ -367,6 +390,45 @@ export class DingtalkRuntime {
         });
       },
     });
+  }
+
+  async sendProactiveText(target, text, { signal } = {}) {
+    const userId = typeof target?.route?.userId === 'string'
+      ? target.route.userId.trim() : '';
+    const openConversationId = typeof target?.route?.openConversationId === 'string'
+      ? target.route.openConversationId.trim() : '';
+    if ((target?.kind === 'user' && (!userId || openConversationId))
+      || (target?.kind === 'group' && (!openConversationId || userId))
+      || (target?.kind !== 'user' && target?.kind !== 'group')) {
+      const error = new TypeError('Invalid DingTalk proactive delivery target');
+      error.code = 'invalid-target';
+      throw error;
+    }
+    if (!this.#status.ready || !this.#abortController) {
+      const error = new Error('DingTalk runtime is not connected');
+      error.code = 'bot-not-connected';
+      throw error;
+    }
+    signal?.throwIfAborted();
+    try {
+      await this.#api.sendRobotText({
+        clientId: this.#config.clientId,
+        clientSecret: this.#clientSecret,
+        target: {
+          type: target.kind,
+          robotCode: this.#config.clientId,
+          ...(target.kind === 'user' ? { userId } : { openConversationId }),
+        },
+        text,
+        signal: signal ?? this.#abortController.signal,
+      });
+    } catch (cause) {
+      if (cause?.code !== 'send-rejected') throw cause;
+      const error = new Error('DingTalk rejected the proactive delivery target', { cause });
+      error.code = 'target-rejected';
+      throw error;
+    }
+    return { sent: true };
   }
 
   #pendingSenders() {

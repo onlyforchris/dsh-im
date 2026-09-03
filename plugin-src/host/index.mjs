@@ -10,6 +10,9 @@ import { apply as applyWeixin } from './channels/weixin/index.mjs';
 import { apply as applyWhatsapp } from './channels/whatsapp/index.mjs';
 import { installOutboundArtifactTool } from '../../src/channels/shared/semantic/artifact.mjs';
 import { setImHostLanguage } from '../../src/channels/shared/i18n.mjs';
+import { installDeliveryRpc } from './delivery-rpc.mjs';
+import { installDeliveryHttp } from './delivery-http.mjs';
+import { createDeliveryService } from './delivery-service.mjs';
 import { installUpdateRpc } from './update-rpc.mjs';
 import { installImPreAsk } from '../../src/channels/shared/im-pre-ask.mjs';
 
@@ -17,19 +20,22 @@ export const name = 'dsh-im-host';
 export const inject = [
   'connection',
   'credentials',
-  'webServer',
   'typertGateway',
 ];
 
-function channelConfig(config, name) {
+function channelConfig(config, name, deliveryService) {
   const channel = config[name] ?? {};
-  return config.rpcAuthority === undefined
+  const withAuthority = config.rpcAuthority === undefined
     ? channel
     : { ...channel, rpcAuthority: config.rpcAuthority };
+  return name === 'office' ? withAuthority : { ...withAuthority, deliveryService };
 }
 
 export function createImHostPlugin(internals = {}) {
   const startUpdate = internals.installUpdateRpc ?? installUpdateRpc;
+  const startDelivery = internals.installDeliveryRpc ?? installDeliveryRpc;
+  const startDeliveryHttp = internals.installDeliveryHttp ?? installDeliveryHttp;
+  const makeDeliveryService = internals.createDeliveryService ?? createDeliveryService;
   const startFeishu = internals.applyFeishu ?? applyFeishu;
   const startWeixin = internals.applyWeixin ?? applyWeixin;
   const startDingtalk = internals.applyDingtalk ?? applyDingtalk;
@@ -56,7 +62,15 @@ export function createImHostPlugin(internals = {}) {
     name,
     inject,
     async apply(ctx, config = {}) {
-      setImHostLanguage(config.language ?? process.env.DSH_IM_LANGUAGE);
+      const deliveryService = makeDeliveryService();
+      if (typeof ctx?.provide === 'function') {
+        ctx.provide('dshIm', Object.freeze({
+          send: (botId, targetId, text, options) => (
+            deliveryService.send(botId, targetId, text, options)
+          ),
+          listTargets: async (botId) => (await deliveryService.listTargets(botId)).targets,
+        }));
+      }
       // 通用扩展点：业务插件 ctx.on('im/pre-ask') 可短路固定回执（不进 LLM）
       const disposePreAsk = installImPreAsk(async (payload) => {
         if (typeof ctx.waterfall !== 'function') return { kind: 'continue' };
@@ -69,37 +83,64 @@ export function createImHostPlugin(internals = {}) {
       if (typeof ctx?.effect === 'function') {
         ctx.effect(() => disposePreAsk, 'dsh-im: im/pre-ask gate');
       }
+      const activate = async (readyCtx) => {
+        await activateChannels(readyCtx, config, deliveryService);
+      };
       if (typeof ctx?.inject === 'function') {
-        ctx.inject(['tools', 'systemPrompt'], (artifactCtx) => {
-          installOutboundArtifactTool(artifactCtx);
+        const modern = typeof ctx?.typertGateway?.stream === 'function';
+        await ctx.inject(
+          modern ? ['sessionController', 'workspaceController'] : ['apiProxy'],
+          activate,
+        );
+        ctx.inject(['webServer'], (httpCtx) => {
+          startDeliveryHttp(httpCtx, deliveryService);
         });
-      } else {
-        installOutboundArtifactTool(ctx);
+        return;
       }
-      const logger = typeof ctx?.logger === 'function'
-        ? ctx.logger(name)
-        : (ctx?.logger ?? console);
-      if (ctx?.connection?.rpc) {
-        try {
-          startUpdate(ctx);
-        } catch (error) {
-          logger.error?.('[dsh-im] failed to activate update management; continuing with channels', error);
-        }
-      }
-      const failures = [];
-      for (const [channel, start] of channels) {
-        try {
-          await start(ctx, channelConfig(config, channel));
-        } catch (error) {
-          failures.push(error);
-          logger.error?.(`[dsh-im] failed to activate ${channel}; continuing with the remaining channels`, error);
-        }
-      }
-      if (failures.length === channels.length) {
-        throw new AggregateError(failures, 'dsh-im failed to activate every channel');
+      await activate(ctx);
+      if (ctx?.webServer?.register && typeof ctx?.effect === 'function') {
+        startDeliveryHttp(ctx, deliveryService);
       }
     },
   });
+
+  async function activateChannels(ctx, config, deliveryService) {
+    setImHostLanguage(config.language ?? process.env.DSH_IM_LANGUAGE);
+    if (typeof ctx?.inject === 'function') {
+      ctx.inject(['tools', 'systemPrompt'], (artifactCtx) => {
+        installOutboundArtifactTool(artifactCtx);
+      });
+    } else {
+      installOutboundArtifactTool(ctx);
+    }
+    const logger = typeof ctx?.logger === 'function'
+      ? ctx.logger(name)
+      : (ctx?.logger ?? console);
+    if (ctx?.connection?.rpc) {
+      try {
+        startUpdate(ctx);
+      } catch (error) {
+        logger.error?.('[dsh-im] failed to activate update management; continuing with channels', error);
+      }
+      try {
+        startDelivery(ctx, deliveryService, { authority: config.rpcAuthority });
+      } catch (error) {
+        logger.error?.('[dsh-im] failed to activate delivery management; continuing with channels', error);
+      }
+    }
+    const failures = [];
+    for (const [channel, start] of channels) {
+      try {
+        await start(ctx, channelConfig(config, channel, deliveryService));
+      } catch (error) {
+        failures.push(error);
+        logger.error?.(`[dsh-im] failed to activate ${channel}; continuing with the remaining channels`, error);
+      }
+    }
+    if (failures.length === channels.length) {
+      throw new AggregateError(failures, 'dsh-im failed to activate every channel');
+    }
+  }
 }
 
 export async function apply(ctx, config = {}) {

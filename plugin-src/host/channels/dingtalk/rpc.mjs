@@ -1,4 +1,6 @@
 import QRCode from 'qrcode';
+import { SET_CONTEXT_ENHANCEMENT_ENDPOINT, validContextEnhancementPayload } from '../shared/context-enhancement-rpc.mjs';
+import { SET_ACCESS_POLICY_ENDPOINT, validAccessPolicyPayload } from '../shared/access-policy-rpc.mjs';
 import { resolveRpcAuthority } from '../../rpc-authority.mjs';
 import { publicWorkspaceError, SET_WORKSPACE_ENDPOINT, validWorkspacePayload } from '../shared/workspace-rpc.mjs';
 import { SET_AGENT_PRESET_ENDPOINT, validAgentPresetPayload } from '../shared/agent-preset-rpc.mjs';
@@ -18,6 +20,8 @@ export const DINGTALK_ENDPOINTS = Object.freeze({
   deleteBot: 'bot.delete',
   setWorkspace: SET_WORKSPACE_ENDPOINT,
   setAgentPreset: SET_AGENT_PRESET_ENDPOINT,
+  setContextEnhancement: SET_CONTEXT_ENHANCEMENT_ENDPOINT,
+  setAccessPolicy: SET_ACCESS_POLICY_ENDPOINT,
   approveSender: 'bot.sender.approve',
   revokeSender: 'bot.sender.revoke',
 });
@@ -93,6 +97,14 @@ function payloadFailure(endpoint, payload) {
   if (endpoint === DINGTALK_ENDPOINTS.setAgentPreset) {
     return validAgentPresetPayload(payload)
       ? null : '请选择 Agent Preset。';
+  }
+  if (endpoint === DINGTALK_ENDPOINTS.setContextEnhancement) {
+    return validContextEnhancementPayload(payload)
+      ? null : '请提交有效的上下文增强设置。';
+  }
+  if (endpoint === DINGTALK_ENDPOINTS.setAccessPolicy) {
+    return validAccessPolicyPayload(payload)
+      ? null : '请提交有效的访问设置。';
   }
   if (endpoint === DINGTALK_ENDPOINTS.approveSender) {
     return exactKeys(payload, ['botId', 'requestId', 'confirm'])
@@ -250,6 +262,16 @@ export function createDingtalkRpcHandler(controller, { encodeQr = qrDataUrl } = 
         value = await publicStatus(
           await controller.updateWorkspace(payload.botId, payload.workspace),
           cachedEncode,
+        );
+      } else if (endpoint === DINGTALK_ENDPOINTS.setContextEnhancement) {
+        if (typeof controller.updateContextEnhancement !== 'function') throw new Error('Context enhancement update is unavailable');
+        value = await controller.updateContextEnhancement(
+          payload.botId, payload.config, (status) => publicStatus(status, cachedEncode),
+        );
+      } else if (endpoint === DINGTALK_ENDPOINTS.setAccessPolicy) {
+        if (typeof controller.updateAccessPolicy !== 'function') throw new Error('Access policy update is unavailable');
+        value = await controller.updateAccessPolicy(
+          payload.botId, payload.policy, (status) => publicStatus(status, cachedEncode),
         );
       } else if (endpoint === DINGTALK_ENDPOINTS.setAgentPreset) {
         if (typeof controller.updateAgentPreset !== 'function') throw new Error('Agent preset update is unavailable');
