@@ -2,15 +2,20 @@ import { createProductionController } from './production.mjs';
 import { installDiscordRpc } from './rpc.mjs';
 
 export const name = 'dsh-im-discord-host';
-export const inject = ['connection', 'credentials', 'apiProxy', 'typertGateway'];
+export const inject = ['connection', 'credentials', 'typertGateway'];
 
 export async function apply(ctx, config = {}) {
   if (config?.controller) {
     return installDiscordRpc(ctx, config.controller, config.rpcAuthority);
   }
   const production = await createProductionController(ctx, config, config.internals ?? {});
+  const unregisterDelivery = config.deliveryService && production.deliveryAdapter
+    ? config.deliveryService.registerAdapter(production.deliveryAdapter) : undefined;
   const disposeRpc = installDiscordRpc(ctx, production.controller, config.rpcAuthority);
-  ctx.effect(() => async () => production.close(), 'dsh-im: close Discord bot connections');
+  ctx.effect(() => async () => {
+    await unregisterDelivery?.();
+    await production.close();
+  }, 'dsh-im: close Discord bot connections');
   return disposeRpc;
 }
 

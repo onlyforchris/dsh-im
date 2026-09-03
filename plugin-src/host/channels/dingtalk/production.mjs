@@ -15,10 +15,15 @@ import {
   observeBotWorkspaceRemovals,
 } from '../../../../src/channels/shared/bot-workspace-store.mjs';
 import { listAgentPresetCatalog } from '../../../../src/channels/shared/agent-preset.mjs';
+import { createDeliveryAdapter } from '../../delivery-adapter.mjs';
 import { createConnectionSupervisor } from './connection-supervisor.mjs';
 import { createHarnessCommandExecutor } from '../../harness-command-executor.mjs';
 import { harnessConnection } from '../../harness-connection.mjs';
 import { createHarnessSessionExecutors } from '../../harness-session-coordinator.mjs';
+import {
+  accessPolicyProvider,
+  initialAccessPolicyFor,
+} from '../shared/access-policy-production.mjs';
 
 function pluginPaths(config) {
   const dshHome = resolve(config.dshHome ?? process.env.DSH_HOME ?? join(homedir(), '.dsh'));
@@ -59,6 +64,7 @@ export async function createProductionController(ctx, config = {}, internals = {
   }
   await Promise.all(configuredBots.map((bot) => workspaces.ensure(bot.botId, {
     defaultAgentPreset: config.agentPreset,
+    initialAccessPolicy: initialAccessPolicyFor('dingtalk', bot),
   })));
   const observedConfigStore = typeof configStore.remove === 'function'
     ? observeBotWorkspaceRemovals(configStore, { workspaces })
@@ -100,7 +106,10 @@ export async function createProductionController(ctx, config = {}, internals = {
     logger,
     createRuntime: async ({ botId, config: botConfig, clientSecret }) => {
       const state = await stateFor(botId);
-      await workspaces.ensure(botId, { defaultAgentPreset: config.agentPreset });
+      await workspaces.ensure(botId, {
+        defaultAgentPreset: config.agentPreset,
+        initialAccessPolicy: initialAccessPolicyFor('dingtalk', botConfig),
+      });
       const workspaceScope = createBotWorkspaceScope(harness, {
         botId, workspaces, state, agentPresetCatalog,
       });
@@ -109,6 +118,10 @@ export async function createProductionController(ctx, config = {}, internals = {
         clientSecret,
         harness: workspaceScope.harness,
         state: workspaceScope.state,
+        contextEnhancement: { botId, getSettings: () => workspaces.contextEnhancementFor(botId) },
+        accessPolicy: accessPolicyProvider(workspaces, botId, {
+          channel: 'dingtalk', config: botConfig,
+        }),
         replyTimeoutMs: config.replyTimeoutMs ?? 600_000,
         maxMessageChars: config.maxMessageChars ?? 4_000,
         connectTimeoutMs: config.connectTimeoutMs ?? 15_000,
@@ -148,6 +161,9 @@ export async function createProductionController(ctx, config = {}, internals = {
   }).start();
   return {
     controller,
+    deliveryAdapter: createDeliveryAdapter({
+      channel: 'dingtalk', workspaces, coreController, stateFor,
+    }),
     ready: supervisor.ready,
     async close() {
       await supervisor.close();

@@ -24,11 +24,15 @@ const required = [
   'bin/dsh-im.mjs',
   'cordis.patch.yml',
   'README.md',
+  'README.en.md',
+  'PROACTIVE_DELIVERY.md',
+  'PROACTIVE_DELIVERY.en.md',
   'THIRD_PARTY_NOTICES.md',
   'plugin-src/client/channels/dingtalk/index.js',
   'plugin-src/client/channels/slack/index.js',
   'plugin-src/client/i18n.js',
   'plugin-src/client/update-panel.js',
+  'plugin-src/client/context-enhancement.js',
   'plugin-src/host/update-service.mjs',
   'plugin-src/host/update-runtime.mjs',
   'plugin-src/host/update-rpc.mjs',
@@ -48,9 +52,11 @@ const required = [
   'src/channels/slack/slack-runtime.mjs',
   'src/channels/wecom/wecom-runtime.mjs',
   'src/channels/telegram/telegram-runtime.mjs',
+  'src/channels/telegram/telegram-http.mjs',
   'src/channels/discord/discord-runtime.mjs',
   'src/channels/whatsapp/whatsapp-runtime.mjs',
   'src/channels/whatsapp/whatsapp-web-session.mjs',
+  'src/channels/shared/context-enhancement.mjs',
 ];
 await Promise.all(required.map((path) => access(resolve(root, path))));
 
@@ -135,8 +141,20 @@ if ((client.match(/\.slots\.inject\(\s*["']settings\.section["']/gu) ?? []).leng
 if (client.includes('settings.plugins.tab') || clientSources.includes('settings.plugins.tab')) {
   throw new Error('client source or bundle still contains the legacy Plugins-tab settings entry');
 }
-if (/role:\s*["']switch|type:\s*["']checkbox/.test(client)) {
-  throw new Error('client bundle contains a channel enable switch');
+// Connections still have no channel-enable toggle. Only the shared context
+// editor owns checkable inputs. Its reusable scope component contains one
+// switch template and one mapped field-input template; it renders both twice.
+const contextEditorSource = await readFile(resolve(root, 'plugin-src/client/context-enhancement.js'), 'utf8');
+const otherClientSources = clientSources.replace(contextEditorSource, '');
+if (/role:\s*["']switch|type:\s*["']checkbox/.test(otherClientSources)
+  || (client.match(/role:\s*["']switch["']/g) ?? []).length !== 1
+  || (client.match(/type:\s*["']checkbox["']/g) ?? []).length !== 2) {
+  throw new Error('checkable inputs must be limited to the context-enhancement editor');
+}
+for (const marker of ['bot.context-enhancement.set', '<dsh_im_source>', '<dsh_im_source_guidance>']) {
+  if (!host.includes(marker) || !client.includes(marker)) {
+    throw new Error(`context-enhancement marker missing from Host or Client bundle: ${marker}`);
+  }
 }
 if (!client.includes('container-type: inline-size')
   || !client.includes('@container (max-width: 680px)')) {
@@ -182,6 +200,7 @@ const directDependencies = {
   '@tencent-connect/qqbot-nodejs': '1.0.4',
   '@wecom/aibot-node-sdk': '1.0.7',
   qrcode: '1.5.4',
+  undici: '7.29.0',
 };
 for (const [name, version] of Object.entries(directDependencies)) {
   if (manifest.dependencies?.[name] !== version) {
@@ -209,6 +228,9 @@ if (manifest.bin?.['dsh-im'] !== 'bin/dsh-im.mjs') {
 }
 if (/(?:from\s*|import\s*\(|require\s*\()\s*["'](?:@larksuiteoapi\/node-sdk|@whiskeysockets\/baileys|https-proxy-agent|protobufjs)(?:\/[^"']*)?["']/.test(host)) {
   throw new Error('host bundle must not import a bundled SDK, proxy agent, or protobufjs at runtime');
+}
+if (!/(?:from\s*|import\s*\()\s*["']undici["']/.test(host)) {
+  throw new Error('host bundle must retain undici as an external runtime dependency');
 }
 if ((executable.mode & 0o111) === 0) throw new Error('dsh-im CLI is not executable');
 if (/private-bot-token|must-be-rolled-back|DEEPSEEK_API_KEY=/.test(client + host)) {

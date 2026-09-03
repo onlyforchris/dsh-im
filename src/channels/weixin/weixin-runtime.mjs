@@ -1,5 +1,6 @@
 import { DEFAULT_WEIXIN_MAX_MESSAGE_CHARS, WeixinApiError } from './weixin-api.mjs';
 import { createWeixinBridgeStatus, WeixinHarnessBridge } from './weixin-bridge.mjs';
+import { providerMessageIdsFor } from '../shared/semantic/delivery.mjs';
 import {
   connectionTestTarget,
   connectionTestTargetUnavailable,
@@ -108,6 +109,8 @@ export class WeixinRuntime {
   #token;
   #harness;
   #state;
+  #contextEnhancement;
+  #accessPolicy;
   #logger;
   #replyTimeoutMs;
   #maxMessageChars;
@@ -124,6 +127,8 @@ export class WeixinRuntime {
     token,
     harness,
     state,
+    contextEnhancement,
+    accessPolicy,
     logger = console,
     replyTimeoutMs = 600_000,
     maxMessageChars = DEFAULT_WEIXIN_MAX_MESSAGE_CHARS,
@@ -137,6 +142,8 @@ export class WeixinRuntime {
     this.#token = token;
     this.#harness = harness;
     this.#state = state;
+    this.#contextEnhancement = contextEnhancement;
+    this.#accessPolicy = accessPolicy;
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#maxMessageChars = maxMessageChars;
@@ -178,6 +185,8 @@ export class WeixinRuntime {
         ownerUserId: this.#config.ownerUserId,
         harness: this.#harness,
         state: this.#state,
+        contextEnhancement: this.#contextEnhancement,
+        accessPolicy: this.#accessPolicy,
         status: this.#status,
         logger: this.#logger,
         replyTimeoutMs: this.#replyTimeoutMs,
@@ -316,12 +325,55 @@ export class WeixinRuntime {
     if (!this.#status.ready || !this.#abortController) {
       throw new Error('Weixin runtime is not connected');
     }
-    await this.#api.sendText({
+    await this.#sendTrackedText({
+      toUserId,
+      text,
+      signal: this.#abortController.signal,
+    });
+    return { sent: true };
+  }
+
+  async #sendTrackedText({ toUserId, text, signal }) {
+    const sentAt = Date.now();
+    const result = await this.#api.sendText({
       baseUrl: this.#config.baseUrl,
       token: this.#token,
       toUserId,
       text,
-      signal: this.#abortController.signal,
+      signal,
+    });
+    try {
+      await this.#state.rememberOutboundMessage?.({
+        toUserId,
+        text,
+        sentAt,
+        completedAt: Date.now(),
+        providerMessageIds: providerMessageIdsFor(result),
+      });
+    } catch (error) {
+      this.#logger.warn?.('[dsh-weixin] failed to remember an outbound message:', error);
+    }
+    return result;
+  }
+
+  async sendProactiveText(target, text, { signal } = {}) {
+    const toUserId = typeof target?.route?.toUserId === 'string'
+      ? target.route.toUserId.trim() : '';
+    if (target?.kind !== 'user' || !toUserId) {
+      const error = new TypeError('Invalid Weixin proactive delivery target');
+      error.code = 'invalid-target';
+      throw error;
+    }
+    if (!this.#status.ready || !this.#abortController) {
+      const error = new Error('Weixin runtime is not connected');
+      error.code = 'bot-not-connected';
+      throw error;
+    }
+    signal?.throwIfAborted();
+    await this.#sendTrackedText({
+      toUserId,
+      text,
+      signal: signal ?? this.#abortController.signal,
     });
     return { sent: true };
   }

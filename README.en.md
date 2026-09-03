@@ -42,6 +42,8 @@ Connect IM bots to DeepSeek Harness by scanning a QR code, using an App Manifest
 
 ![IM bot settings page](docs/images/imbot_en.png)
 
+<img src="docs/images/Context_enhancement_en.png" alt="Context enhancement page" width="49%"> <img src="docs/images/access_mode_en.png" alt="Access modes page" width="49%">
+
 ## Built-in channels
 
 | Channel | Setup | Messaging and replies |
@@ -58,7 +60,7 @@ Connect IM bots to DeepSeek Harness by scanning a QR code, using an App Manifest
 
 Other IM platforms can be added through the same channel-adapter structure.
 
-All nine built-in channels can send JPEG, PNG, and WebP images, plus GIFs sent as image files, with optional captions to Harness. Each image is limited to 5 MB, and images in one message are limited to 20 MB in total. Downloading images or files from Feishu user messages requires the `im:message:readonly` tenant scope, shown on the confirmation page as **Read direct and group messages**; Feishu currently offers no narrower image-only scope for that download endpoint. Apps created through the built-in QR flow request it by default; for existing or manually connected apps, click **Complete permissions** on the IM Bot settings page and scan the QR code to incrementally add that scope, `im:resource` for uploading bot-sent images or files, and the card callback.
+All nine built-in channels can send JPEG, PNG, and WebP images, plus GIFs sent as image files, with optional captions to Harness. Each image is limited to 5 MB, and images in one message are limited to 20 MB in total. Downloading images or files from Feishu user messages requires the `im:message:readonly` tenant scope, shown on the confirmation page as **Read direct and group messages**; Feishu currently offers no narrower image-only scope for that download endpoint. Apps created through the built-in QR flow request it by default; for existing or manually connected apps, click **Complete permissions** on the IM Bot settings page and scan the QR code to incrementally add that scope, `im:resource` for uploading bot-sent images or files, `application:app_slash_command:read` / `write` for the native command panel, and the card callback.
 
 ### Result-file and image delivery
 
@@ -80,13 +82,7 @@ After the model calls the file-return tool, the plugin hands the specified file 
 
 ## AI Office Connector
 
-The **AI Office** page lets the local Harness connect outward to a public Office. The machine needs no public IP, forwarded port, or WebSocket server. The Device Token is written only to the Harness credential provider; the ordinary config file contains only the device ID, Office origin, workspace aliases, and instruction-preset aliases. Office selects aliases and never receives local absolute paths.
-
-The current protocol is `office-harness.v1`. The connector authenticates and advertises capabilities with `POST /api/harness/connector/heartbeat`, then opens the downstream event plane with `GET /api/harness/connector/stream` over SSE. The settings page derives every fixed hook from the Office Base URL and reconnects with backoff after a disconnect.
-
-A `job.available` event makes the local connector fetch the payload, validate Workspace/Preset aliases, claim a 90-second lease, and renew it every 30 seconds. It creates an isolated Harness Session, reports safe status/tool/text progress, and writes a terminal result exactly once. Tool approvals and follow-up questions surface in Office; approve, reject, and text answers return over SSE to the original Session. Heartbeats and leases recover from dropped connections.
-
-A successful heartbeat response must be JSON: `{"ok":true,"protocolVersion":"office-harness.v1"}`. This makes a successful connection test proof of a compatible Office Connector instead of any URL that happens to return 200.
+[Read the AI Office Connector guide](docs/AI-Office-Connector.en.md)
 
 ## Installation
 
@@ -98,7 +94,7 @@ dsh plugin --profile web add -w @xmanrui/dsh-im
 
 Restart `dsh web`, refresh the browser, then open **Settings → IM Bot**. The top-level IM Bot entry uses `order: 21` to follow **Agent Presets**, and the Plugins page no longer retains the old entry. Upgrading preserves existing bots, credentials, workspaces, Agent Presets, and Session bindings.
 
-Local `dsh web` and DSH Desktop use the current Host's internal `apiProxy` by default, without a loopback HTTP connection. Desktop's compatibility, extended-window, and advanced modes do not require browser access or LAN access to be enabled. An explicit channel `harnessBaseUrl` still uses the existing HTTP/WebSocket connection; failed internal calls never silently switch to another Host.
+Local `dsh web` and DSH Desktop reuse the current Host's internal services by default: legacy Harness releases use `apiProxy`, while current releases automatically use the Typert Gateway plus the Session and Workspace controllers. No Harness address or loopback HTTP connection is required. Desktop's compatibility, extended-window, and advanced modes do not require browser access or LAN access to be enabled. An explicit channel `harnessBaseUrl` is retained only for legacy remote HTTP/WebSocket Harness endpoints; failed internal calls never silently switch to another Host.
 
 To try the latest code before it is published to npm, use the GitHub-source installer instead:
 
@@ -128,28 +124,25 @@ Use the proxy URL required by your network and restart the Host after changing i
 | --- | --- |
 | Bot workspace | Each bot stores its workspace independently. New bots start with the Host's current working directory, which can later be changed from the bot card. |
 | Agent Preset | Each bot can choose an Agent Preset on its settings card. When none is chosen, new Sessions follow the Host's `agent-presets.default`. A channel-level `config.agentPreset` is only the default for later new bots on that channel. Changing the preset never modifies or clears existing Sessions; if the current chat already has a Session, send `/new` and then a regular message to create one with the new selection. |
+| Context enhancement | Open settings from a bot card to enable groups and DMs independently. Both switches default to off, including for existing bots after an upgrade. |
 
-Each Telegram bot has its own access-mode control on its bot card. Existing and newly connected bots both default to **Compatible mode**: DMs receive replies, while group messages require a mention of or reply to the bot. Restrictions apply only after explicitly switching that bot to **Safe mode (private-chat allowlist)**. Safe mode ignores every group message and admits only numeric User IDs in that bot's allowlist. Enter one ID per line. Switching back to Compatible mode retains the allowlist without enforcing it, so it is available when Safe mode is enabled again. An empty allowlist in Safe mode rejects all inbound messages for that bot.
+### Proactive delivery
 
-Each WhatsApp bot also has its own access mode. Existing bots migrate to **Only me**, which is also the default for newly linked bots and accepts only self-chat messages from the linked account. **Selected contacts** additionally accepts direct messages from allowlisted phone numbers and ignores groups. Enter one number with its country or region code per line; a leading `+` is optional. **Open responses** accepts all direct messages, group messages sent by the linked account, and mentions of or replies to that account from other group members; this also lets an owner-only group act as a separate conversation. Switching modes retains the allowlist. An empty Selected contacts allowlist behaves like Only me, and rejected messages are ignored silently.
+All nine IM channels can proactively send text through a stable `botId + targetId` pair. Bot settings support choosing a known conversation or entering a target manually, testing the current route before saving, and copying call parameters. HTTP POST, same-Host plugins, and Connection RPC share the same target configuration and delivery core.
+
+See the [Proactive Delivery Guide](PROACTIVE_DELIVERY.en.md) ([简体中文](PROACTIVE_DELIVERY.md)) for setup steps, native fields for all nine channels, complete call examples, management endpoints, error codes, and troubleshooting.
+
+### Context enhancement
+
+[Read the context enhancement guide](docs/context-enhancement.md)
+
+### Access modes
+
+[Read the access modes guide](docs/access-modes.md)
 
 ## Checking and installing updates
 
-In **Settings → IM Bot**, click **Check for updates** immediately to the left of GitHub. The official npm registry is contacted only on request; confirm the target version and current profile before installing. Only `@xmanrui/dsh-im` is updated, without fetching GitHub or updating Harness / Desktop itself.
-
-After installation, the backend still requires a manual restart, and the panel reports **Installed; restart manually** based on the Host's status. The updater does not request a restart, hot reload, or page refresh. The host's existing module watcher may refresh the plugin interface, but an interface change does not mean the new backend version is running; the Host-reported running version is authoritative. Update when bots are idle, then restart the current Harness / Desktop yourself. Closing the settings page does not cancel a submitted installation.
-
-If the existing page still shows a restart notice after you restart manually, click **Refresh status** in the dialog or reopen **Restart needed**. This reads the current Host status without checking npm or refreshing the page.
-
-The button reuses Desktop's package-management service or the current Harness CLI for an exact-version install equivalent to the following (replace the example profile and version with the confirmed values):
-
-```sh
-dsh plugin --profile web add -w --save-exact @xmanrui/dsh-im@3.1.0 --registry=https://registry.npmjs.org/
-```
-
-Source `link:`, `file:`, Git, and unrecognized installations can check versions but are never replaced automatically. Confirm the intended profile before manually migrating to npm. Conflicting scoped registries, incompatible Node versions, and unavailable Host executors disable installation with an explanation. Standard Windows CLI installations currently require a manual update; Desktop uses its existing executor.
-
-Do not modify the same profile through a terminal or plugin market during installation. A failed command may leave partial dependency changes; it is not an automatic rollback. Inspect the installation, reinstall the previous exact version if needed, and restart manually. The updater keeps only the profile's latest job and manifest backup under the current `DSH_HOME/updates/dsh-im`, without copying bot credentials. Resolve uncertain remaining installers or locks before retrying; do not blindly delete a lock.
+[Read the update-checking and installation guide](docs/checking-and-installing-updates.md)
 
 ## Bot commands
 
@@ -166,7 +159,7 @@ Do not modify the same profile through a terminal or plugin market during instal
 | `/reasoning` | Show the current Session model and reasoning effort. |
 | `/reasoning <number or effort ID>` | Switch the current model's reasoning effort. |
 | `/reasoning --default` | Restore the current model's default reasoning effort. |
-| `/presetlist` | List the Host's currently available Agent Presets, marking the Host default and this bot's selection. |
+| `/presetlist`, `/presets` | Equivalent aliases that list the Host's currently available Agent Presets, marking the Host default and this bot's selection. |
 | `/preset` | Show this bot's Agent Preset setting for new Sessions. |
 | `/preset <number or Preset ID>` | Set this bot's Agent Preset; use `/preset id:<ID>` for a numeric ID. |
 | `/preset --default` | Clear this bot's explicit selection so later new Sessions follow the Host default. |
@@ -175,55 +168,20 @@ Do not modify the same profile through a terminal or plugin market during instal
 | `/batch` | Start batch input in a direct chat and collect up to 10 text messages. |
 | `/send` | Submit the collected messages, in order, as one input. |
 | `/cancel` | Cancel batch input and discard its collected messages. |
-| `/repair` | In a Feishu direct chat, incrementally repair the card callback and permissions required to read and upload message images or files. |
+| `/repair` | In a Feishu direct chat, incrementally repair the card callback and permissions required for media and the native Slash Command panel. |
 | `/compact` | Immediately compact older context in the Session bound to the current chat. |
-| `/workspace <absolute workspace path>` | Switch the current bot's Harness workspace. |
-| `/workspacelist` | List workspace absolute paths that still exist on the current Harness Host. |
-| `/sessionlist [workspace number or absolute path]` | List every registered session ID and title in the selected workspace; omit the argument to use the current workspace. |
+| `/workspace <workspace index or absolute path>`, `/ws <workspace index or absolute path>` | Switch the current bot's Harness workspace by `/workspacelist` index or absolute path. |
+| `/workspacelist`, `/workspaces`, `/wsl` | List workspace absolute paths that still exist on the current Harness Host. |
+| `/sessionlist [workspace number or absolute path]`, `/sessions [...]` | Equivalent aliases that list every registered session ID and title in the selected workspace; omit the argument to use the current workspace. |
+| `/sessionlist --limit N`, `/sessions --limit N` | List the first N sessions in the current workspace's existing order; N must be a positive integer. |
 | `/session <Session ID>` | Bind the current chat to an existing Harness session. |
 | `/history [count]` | Preview recent messages from the bound Session in a direct chat; defaults to 3, capped at 5. |
 | Interactive question | Reply with an option number, option label, or custom text; separate multiple choices with commas. |
 | Remote approval | Reply with `批准` / `拒绝` / `同意` / `不同意` / `yes` / `no`. |
 
-Example: send `/models`, then `/model 2` to switch to the second model in the list; send `/reasoninglist`, then `/reasoning 2` to switch to the current model's second reasoning effort; send `/presetlist`, then `/preset 2` to select the second Agent Preset for this bot. Other examples: `/help`, `/new`, `/status`, `/version`, `/model deepseek-official/deepseek-v4-pro max`, `/reasoning --default`, `/preset marketing-jeep`, `/preset --default`, `/steer inspect only the configuration file`, `/stop`, `/compact`, `/workspace /Users/alice/projects/my-app`, `/sessionlist 2`, `/sessionlist /Users/alice/projects/my-app`, `/session session-id`, `/history`, or `/history 5`
-
-If the Slack desktop app has no native Slash Command registered with the same name, it intercepts messages that begin directly with `/`. Send the command with one leading space instead, for example ` /presetlist`, ` /preset 2`, ` /history`, or ` /history 10`; the plugin command layer trims surrounding whitespace, so it executes exactly like the unspaced form.
-
 ### Command details
 
-- `/help` takes no arguments and never creates a Session. It returns the complete command list supported by the current bot.
-- `/status` takes no arguments, never prompts the model, and does not change the Session binding. It confirms that the current bot can reach DeepSeek Harness.
-- `/version` takes no arguments and never contacts Harness, creates a Session, or prompts the model. It returns the version of the running dsh-im plugin.
-- `/new` only removes the current chat's saved dsh-im Session binding; it never deletes, empties, or archives the old Session. The next ordinary message creates and binds a new Session in the current workspace. If a task is running or waiting for a question or approval, finish the interaction or use `/stop` before `/new`.
-- `/models` takes no arguments and never creates a Session. It assigns a number to every currently configured Harness model and also shows its stable, copyable `provider/model-id`. If one provider fails, models from the remaining providers are still shown.
-- Bare `/model` shows the current Session model and reasoning effort. With arguments, it accepts a number from `/models` or an exact full model ID, followed optionally by an exact reasoning effort ID published in that target model's metadata, for example `/model 2 max`. When the effort is omitted, Harness resolves the target model's current default. If the chat has no Session yet, a valid switch creates and binds a blank Session without prompting the model.
-- `/reasoninglist` and `/reasonings` are equivalent. They list the efforts from the current model's metadata and mark the current and default values. `/reasoning` shows the current value; `/reasoning <number or effort ID>` accepts a listed number or an exact metadata ID; `/reasoning --default` lets Harness resolve the current model's default again. Every `/reasoning...` command requires an existing Session and never creates one or prompts the model.
-- The model or reasoning effort cannot be changed while a task is running or waiting for an approval or question answer. Wait for it to finish or use `/stop` first. A change takes effect on the next model request and keeps Harness's default-saving semantics: Harness attempts to save the accepted model and effort as the default selection for future Sessions, while other existing Sessions remain unchanged. A Session containing images cannot switch to a model that does not accept image input.
-- `/presetlist` takes no arguments and never creates a Session. It reads the Host's currently available Agent Presets every time, showing their names, stable IDs, the Host default, and this bot's selection. A selected Preset that has been deleted or become broken is retained and marked unavailable instead of being cleared automatically. Only safe names and IDs are shown; paths, errors, and other Host internals are never exposed.
-- Bare `/preset` shows this bot's setting for future new Sessions; it does not inspect or change the current Session. With an argument, it accepts a number from the most recent `/presetlist` in this chat or an exact ID; use `/preset id:<ID>` for a numeric ID. A numbered selection resolves the ID from that displayed list and then validates it against the latest Host catalog, asking for a fresh list if it has changed.
-- `/preset --default` clears this bot's explicit override so future Sessions resolve the Host default when they are created. Explicitly selecting an ID that currently matches the Host default pins that ID instead. Following the Host default remains available even while the catalog cannot be read.
-- An Agent Preset change is bot-wide: it affects future new Sessions in every chat for this bot, but never modifies, stops, unbinds, or rebuilds an existing Session and never runs `/new` automatically. If this chat already has a Session, ordinary messages keep using it; the first ordinary message after `/new` creates a Session with the new setting. Presets can still be queried or changed while a task is running or awaiting interaction because the command does not touch that Session.
-- `/stop` and `/steer` control only a running task started by this chat. Even when multiple chats bind the same Session, they do not intentionally control another chat's task. `/stop` does not delete the Session or its history, preserves queued work that has not started, and is safe to repeat.
-- `/steer` accepts text only, including multiple lines. It neither creates another Session nor starts a second task. Send an ordinary message when no task is running; while an approval or question is pending, answer it first or use `/stop`.
-- `/batch`, `/send`, and `/cancel` are available only in a direct chat with the bot. After `/batch`, subsequent text-only messages are held temporarily, up to 10 messages. The tenth is collected and prompts you to submit; later messages are rejected and the batch is never submitted automatically. `/send` processes the collected messages in their original order as one input, while `/cancel` discards them. Images, files, and other commands are not collected. An unsubmitted batch is lost if the bot restarts. Ordinary chat behavior is unchanged when batch input is not active.
-- Feishu `/repair` is available only in a direct chat and follows the current bot's channel access policy just like every other command; the plugin defines no separate administrator role. It incrementally adds up to `card.action.trigger`, `im:message:readonly`, and `im:resource`, while the confirmation page shows only items the app is currently missing. The authorization page must be opened by an account that can access the target app in Feishu Open Platform. Bare `/repair` starts repair; if an older attempt is still awaiting authorization, it invalidates that one-time link before generating a new one. Use `/repair qr` for the current link's QR code, `/repair status` to inspect the attempt, `/repair verify` to refresh verification, and `/repair cancel` to cancel it; none of these four supplemental commands starts another authorization. Once Feishu has accepted the update and the bot is waiting for the test-button callback, a second repair is not started concurrently.
-- `/compact` acts only on the Harness Session already bound to the current chat and is never sent to the model. The bot reports the applicable status when the chat has no Session yet, the Session is generating a reply, or there is no compactable history.
-- The path must be an existing absolute directory. The bot returns an actionable error and the correct usage when validation fails.
-- `/workspacelist` takes no arguments. It combines the Harness global registry with the current bot's path. When that current path still exists and is safe to display, it appears first and is marked as current. Any listed path can be copied directly into `/workspace`.
-- A numeric `/sessionlist` argument uses the same freshly resolved order as `/workspacelist` at command execution time. An absolute path can also select a workspace directly, and the result echoes the resolved path.
-- `/sessionlist` includes every session registered to the selected workspace. Archived sessions are marked as archived; blank and subagent sessions are included when they belong to that workspace; sessions without a title are shown as `No title yet`. Any listed ID can be passed directly to `/session Session ID`.
-- `/session` accepts exactly one Session ID obtained from `/sessionlist`. It neither creates a session nor immediately prompts the model; later messages in the current chat continue the bound session. Regular archived sessions can be bound without being unarchived, while subagent sessions cannot be bound.
-- `/history` works identically in direct chats on all nine channels. It only reads the Session already bound to this chat: it never creates a Session, prompts the model, or interrupts running tasks or pending interactions. It returns the latest 3 messages by default. `/history N` accepts a positive integer, caps values above 5 at 5, and returns fewer when fewer are available. Zero, negative, fractional, nonnumeric, and multiple arguments show usage; commands with images or files are rejected. While collecting batch input, use `/send` or `/cancel` first.
-- A user message or a final assistant reply counts as one history item, not one turn or day. The latest N items are displayed oldest first. Tool events, reasoning, injected content, and unfinished assistant output are omitted; old attachments are not downloaded or resent. Long text is marked as truncated, with at most 3 text segments per reply and no automatic pagination. After binding a Session, send `/history` manually; binding never replays history automatically. Message text may still contain sensitive information from the original conversation, so expose the bot only to trusted users.
-- `/session` locates the session's unique workspace automatically. Binding inside the current workspace replaces only this chat's mapping. A cross-workspace binding switches the bot workspace, clears the old session mappings for all of that bot's chats, and then binds this chat, so it affects the bot's other chats. A reply already being generated may still finish.
-- Workspace switches and session bindings only clear or replace dsh-im chat mappings. They never delete, empty, or archive old Session contents; an old Session can still be listed and bound again.
-- Any user admitted by the current channel access policy can run these commands; there is no separate administrator role. Telegram Compatible mode follows the original DM and group mention/reply rules, while Safe mode admits only allowlisted private users. WhatsApp Only me accepts self-chat only, Selected contacts accepts self-chat plus allowlisted direct messages, and Open responses accepts every direct message, group messages from the linked account, and mentions or replies from other group members.
-- Agent Preset names and IDs come from the same Harness Host, and any command-authorized user can change the Preset used by all future new Sessions across this bot's chats. Expose `/presetlist` and `/preset` only to trusted users.
-- The list comes from the Harness Host's global registry and can include local absolute paths for other bots, other channels, or non-IM projects. Restrict the bot's visibility to trusted users.
-- Session results also come from the global Harness Host. Session IDs and titles can belong to other bots, other channels, or non-IM projects, and may contain sensitive metadata. Enable these commands only when every user in the bot's visibility scope is trusted.
-- Any user who can run `/session` can continue the selected session and use later messages to write to it or invoke its available tools. Expose the bot and session list only to trusted users.
-- A successful switch clears only the current bot's old Harness session mappings and does not affect other bots.
-- The new workspace applies to subsequent messages; a reply that has already started generating is allowed to finish.
+[Read the command details](docs/bot-commands.md)
 
 ## Other features
 
@@ -280,11 +238,12 @@ Without a setting, Chinese is used. Chinese is always the fallback language — 
 
 ## Contact
 
-You can reach me by email, WeChat, Xiaohongshu, or WhatsApp.
+Join the WeCom community group, or reach me by email, WeChat, Xiaohongshu, or WhatsApp.
 
 <table>
   <tr>
     <th align="center">Email</th>
+    <th align="center">WeCom Group</th>
     <th align="center">WeChat</th>
     <th align="center">Xiaohongshu</th>
     <th align="center">WhatsApp</th>
@@ -292,6 +251,9 @@ You can reach me by email, WeChat, Xiaohongshu, or WhatsApp.
   <tr>
     <td align="center" valign="middle">
       <a href="mailto:longmanr307@gmail.com">longmanr307@gmail.com</a>
+    </td>
+    <td align="center" valign="top">
+      <a href="docs/images/wecom.jpg"><img src="docs/images/wecom.jpg" alt="dsh-im WeCom group QR code" width="240"></a>
     </td>
     <td align="center" valign="top">
       <a href="docs/images/weixin.jpg"><img src="docs/images/weixin.jpg" alt="WeChat QR code" width="240"></a>

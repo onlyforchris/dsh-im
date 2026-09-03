@@ -2,15 +2,20 @@ import { createProductionController } from './production.mjs';
 import { installTelegramRpc } from './rpc.mjs';
 
 export const name = 'dsh-im-telegram-host';
-export const inject = ['connection', 'credentials', 'apiProxy', 'typertGateway'];
+export const inject = ['connection', 'credentials', 'typertGateway'];
 
 export async function apply(ctx, config = {}) {
   if (config?.controller) {
     return installTelegramRpc(ctx, config.controller, config.rpcAuthority);
   }
   const production = await createProductionController(ctx, config, config.internals ?? {});
+  const unregisterDelivery = config.deliveryService && production.deliveryAdapter
+    ? config.deliveryService.registerAdapter(production.deliveryAdapter) : undefined;
   const disposeRpc = installTelegramRpc(ctx, production.controller, config.rpcAuthority);
-  ctx.effect(() => async () => production.close(), 'dsh-im: close Telegram bot connections');
+  ctx.effect(() => async () => {
+    await unregisterDelivery?.();
+    await production.close();
+  }, 'dsh-im: close Telegram bot connections');
   return disposeRpc;
 }
 

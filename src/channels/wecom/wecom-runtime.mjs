@@ -28,6 +28,8 @@ export class WecomRuntime {
   #secret;
   #harness;
   #state;
+  #contextEnhancement;
+  #accessPolicy;
   #logger;
   #replyTimeoutMs;
   #connectTimeoutMs;
@@ -45,6 +47,8 @@ export class WecomRuntime {
     secret,
     harness,
     state,
+    contextEnhancement,
+    accessPolicy,
     logger = console,
     replyTimeoutMs = 600_000,
     connectTimeoutMs = 20_000,
@@ -58,6 +62,8 @@ export class WecomRuntime {
     this.#secret = secret;
     this.#harness = harness;
     this.#state = state;
+    this.#contextEnhancement = contextEnhancement;
+    this.#accessPolicy = accessPolicy;
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#connectTimeoutMs = connectTimeoutMs;
@@ -107,6 +113,8 @@ export class WecomRuntime {
       client,
       harness: this.#harness,
       state: this.#state,
+      contextEnhancement: this.#contextEnhancement,
+      accessPolicy: this.#accessPolicy,
       status: this.#status,
       logger: this.#logger,
       replyTimeoutMs: this.#replyTimeoutMs,
@@ -214,6 +222,27 @@ export class WecomRuntime {
         });
       },
     });
+  }
+
+  async sendProactiveText(target, text, { signal } = {}) {
+    const chatId = typeof target?.route?.chatId === 'string'
+      ? target.route.chatId.trim() : '';
+    if ((target?.kind !== 'user' && target?.kind !== 'group') || !chatId) {
+      const error = new TypeError('Invalid Enterprise WeChat proactive delivery target');
+      error.code = 'invalid-target';
+      throw error;
+    }
+    if (!this.#status.ready || !this.#client) {
+      const error = new Error('Enterprise WeChat runtime is not connected');
+      error.code = 'bot-not-connected';
+      throw error;
+    }
+    signal?.throwIfAborted();
+    await this.#client.sendMessage(chatId, {
+      msgtype: 'markdown',
+      markdown: { content: text },
+    });
+    return { sent: true };
   }
 
   async #stopActive() {

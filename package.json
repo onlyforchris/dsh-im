@@ -1,6 +1,6 @@
 {
   "name": "@xmanrui/dsh-im",
-  "version": "3.1.1",
+  "version": "4.9.0",
   "description": "把九种 IM 机器人和公网 AI Office 接入本机 DeepSeek Harness。 Connect nine IM channels and a public AI Office to a local DeepSeek Harness.",
   "keywords": [
     "deepseek-harness",
@@ -30,6 +30,14 @@
     {
       "name": "C3H3-AI",
       "url": "https://github.com/C3H3-AI"
+    },
+    {
+      "name": "divingleee",
+      "url": "https://github.com/divingleee"
+    },
+    {
+      "name": "Chan-0312",
+      "url": "https://github.com/Chan-0312"
     }
   ],
   "license": "MIT",
@@ -60,6 +68,8 @@
     "plugin-src",
     "scripts",
     "src",
+    "PROACTIVE_DELIVERY.md",
+    "PROACTIVE_DELIVERY.en.md",
     "LICENSE",
     "README.md",
     "README.en.md",
@@ -93,9 +103,11 @@
     "@tencent-connect/qqbot-nodejs": "1.0.4",
     "@wecom/aibot-node-sdk": "1.0.7",
     "dingtalk-stream": "2.1.4",
-    "qrcode": "1.5.4"
+    "qrcode": "1.5.4",
+    "undici": "7.29.0"
   },
   "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.1",
     "@larksuiteoapi/node-sdk": "1.73.0",
     "@whiskeysockets/baileys": "7.0.0-rc14",
     "esbuild": "0.25.9",

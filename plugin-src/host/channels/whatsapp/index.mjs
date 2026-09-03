@@ -2,20 +2,25 @@ import { createProductionController } from './production.mjs';
 import { installWhatsappRpc } from './rpc.mjs';
 
 export const name = 'dsh-im-whatsapp-host';
-export const inject = ['connection', 'apiProxy', 'typertGateway'];
+export const inject = ['connection', 'typertGateway'];
 
 export async function apply(ctx, config = {}) {
   if (config?.controller) {
     return installWhatsappRpc(ctx, config.controller, config.rpcOptions, config.rpcAuthority);
   }
   const production = await createProductionController(ctx, config, config.internals ?? {});
+  const unregisterDelivery = config.deliveryService && production.deliveryAdapter
+    ? config.deliveryService.registerAdapter(production.deliveryAdapter) : undefined;
   const disposeRpc = installWhatsappRpc(
     ctx,
     production.controller,
     config.rpcOptions,
     config.rpcAuthority,
   );
-  ctx.effect(() => async () => production.close(), 'dsh-im: close WhatsApp Web connections');
+  ctx.effect(() => async () => {
+    await unregisterDelivery?.();
+    await production.close();
+  }, 'dsh-im: close WhatsApp Web connections');
   return disposeRpc;
 }
 

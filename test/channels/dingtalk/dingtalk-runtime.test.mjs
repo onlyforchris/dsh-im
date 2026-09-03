@@ -48,6 +48,8 @@ function stateFixture() {
 test('runtime sends a DingTalk connection test only through the remembered private webhook', async () => {
   const state = stateFixture();
   const sends = [];
+  const proactiveSends = [];
+  let proactiveFailure = null;
   const client = {
     connected: true,
     socket: { readyState: 1 },
@@ -61,7 +63,13 @@ test('runtime sends a DingTalk connection test only through the remembered priva
     clientSecret: 'host-secret',
     harness: { ensureRunning: async () => true },
     state,
-    api: { sendText: async (request) => sends.push(request) },
+    api: {
+      sendText: async (request) => sends.push(request),
+      sendRobotText: async (request) => {
+        proactiveSends.push(request);
+        if (proactiveFailure) throw proactiveFailure;
+      },
+    },
     streamFactory: async () => ({ client, topic: 'robot-topic' }),
   });
 
@@ -78,6 +86,23 @@ test('runtime sends a DingTalk connection test only through the remembered priva
   assert.equal(sends[0].clientSecret, 'host-secret');
   assert.equal(sends[0].sessionWebhook, 'https://oapi.dingtalk.com/robot/reply?ticket=inbound-private');
   assert.equal(sends[0].text, '连接测试');
+  assert.deepEqual(await runtime.sendProactiveText({
+    kind: 'group',
+    route: { openConversationId: 'cid-proactive' },
+  }, '主动投递'), { sent: true });
+  assert.equal(proactiveSends.length, 1);
+  assert.deepEqual(proactiveSends[0].target, {
+    type: 'group',
+    robotCode: 'ding-client',
+    openConversationId: 'cid-proactive',
+  });
+  assert.equal(proactiveSends[0].text, '主动投递');
+  assert.equal('sessionWebhook' in proactiveSends[0], false);
+  proactiveFailure = Object.assign(new Error('provider detail'), { code: 'send-rejected' });
+  await assert.rejects(() => runtime.sendProactiveText({
+    kind: 'user',
+    route: { userId: 'staff-one' },
+  }, '失败投递'), { code: 'target-rejected' });
   await runtime.stop();
 });
 
@@ -225,6 +250,85 @@ test('runtime sends visible-scope messages to Harness without local sender appro
   assert.deepEqual(runtime.pendingSenders(), []);
   await runtime.stop();
 });
+
+for (const scenario of [
+  { name: 'private enabled to disabled', conversationType: '1', before: [true, false], after: [false, true] },
+  { name: 'group enabled to disabled', conversationType: '2', before: [false, true], after: [true, false] },
+  { name: 'private disabled to enabled', conversationType: '1', before: [false, true], after: [true, false] },
+]) {
+  test(`DingTalk received callback retains settings before its parse microtask: ${scenario.name}`, async () => {
+    const order = [];
+    const asked = [];
+    const configFor = ([directEnabled, groupEnabled], guidance) => ({
+      group: { enabled: groupEnabled, fields: ['channel', 'botId'], guidance },
+      direct: { enabled: directEnabled, fields: ['channel', 'botId'], guidance },
+    });
+    let config = configFor(scenario.before, 'before callback returned');
+    let callback;
+    const client = {
+      connected: true,
+      socket: { readyState: 1 },
+      registerCallbackListener(_topic, listener) { callback = listener; },
+      async connect() {},
+      socketCallBackResponse(messageId) { order.push(['ack', messageId]); },
+      disconnect() {},
+    };
+    const runtime = new DingtalkRuntime({
+      config: { clientId: 'ding-client', approvedSenders: [] },
+      clientSecret: 'host-secret',
+      contextEnhancement: {
+        botId: 'dingtalk_internal',
+        getSettings: () => { order.push(['settings']); return config; },
+      },
+      harness: {
+        ensureRunning: async () => true,
+        createSession: async () => 'session-existing',
+        sessionExists: async () => true,
+        ask: async (_sessionId, text) => { asked.push(text); order.push(['ask']); return 'done'; },
+      },
+      state: stateFixture(),
+      api: { sendText: async () => {} },
+      streamFactory: async () => ({ client, topic: 'robot-topic' }),
+      logger: { warn() {}, error() {} },
+    });
+    const response = (id) => ({
+      headers: { messageId: `callback-${id}` },
+      get data() {
+        order.push(['read-data', id]);
+        return JSON.stringify({
+          msgId: `message-${id}`, msgtype: 'text', text: { content: `message ${id}` },
+          conversationType: scenario.conversationType, conversationId: 'group-chat',
+          isInAtList: true, senderStaffId: 'staff-id', senderNick: 'Ada',
+          sessionWebhook: 'https://oapi.dingtalk.com/robot/reply?ticket=test',
+        });
+      },
+    });
+    try {
+      await runtime.start();
+      callback(response(1));
+      assert.deepEqual(order, [['ack', 'callback-1'], ['settings']], 'ACK stays first and JSON remains unparsed until the original microtask');
+      config = configFor(scenario.after, 'after callback returned');
+      await eventually(() => runtime.status.messagesReplied === 1, 5_000);
+      callback(response(2));
+      await eventually(() => runtime.status.messagesReplied === 2, 5_000);
+      for (const [index, switches] of [scenario.before, scenario.after].entries()) {
+        const enabled = switches[scenario.conversationType === '1' ? 0 : 1];
+        if (enabled) {
+          assert.match(asked[index], index === 0 ? /before callback returned/ : /after callback returned/);
+          assert.deepEqual(JSON.parse(/^<dsh_im_source>(.*?)<\/dsh_im_source>/su.exec(asked[index])[1]), {
+            channel: 'dingtalk', botId: 'dingtalk_internal',
+          });
+        } else {
+          assert.equal(asked[index], `message ${index + 1}`);
+        }
+      }
+      assert.equal(order.filter(([action]) => action === 'settings').length, 2, 'one source configuration read per callback');
+      assert.equal(order.filter(([action]) => action === 'read-data').length, 4, 'preserves the original data parsing path');
+    } finally {
+      await runtime.stop();
+    }
+  });
+}
 
 test('runtime accepts an OPEN DingTalk socket when the SDK registered flag remains false', async () => {
   const client = {

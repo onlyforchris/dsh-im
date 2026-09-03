@@ -4,6 +4,7 @@ import { CredentialActionIcon, CredentialBindingPanel } from '../../credential-b
 import { h } from '../../i18n.js';
 import { installDingtalkStyles } from '../dingtalk/styles.js';
 import { WorkspaceEditor } from '../../workspace-editor.js';
+import { ContextEnhancementEditor } from '../../context-enhancement.js';
 import {
   AgentPresetCatalogContext,
   AgentPresetEditor,
@@ -11,6 +12,7 @@ import {
 } from '../../agent-preset.js';
 import { useWorkspaceSnapshotFence } from '../../workspace-snapshot-fence.js';
 import {
+  BotSettingsButton,
   BotStatusMeta,
   ChannelListHeading,
   LastMessageErrorSummary,
@@ -73,7 +75,7 @@ export function createTokenChannelSettings(definition) {
     accountSettingsEndpoint = null,
   } = definition;
 
-  function AccountCard({ account, busy, testNotice, removing, onReconnect, onWorkspaceSave, onAgentPresetSave, onAccountSettingsSave, onRequestRemove, onConfirmRemove, onCancelRemove }) {
+  function AccountCard({ account, busy, testNotice, removing, onReconnect, onWorkspaceSave, onAgentPresetSave, onContextEnhancementSave, onAccountSettingsSave, onRequestRemove, onConfirmRemove, onCancelRemove }) {
     const state = busy === 'reconnect' ? 'connecting' : account.state;
     const tone = account.connected ? 'success' : state === 'error' ? 'error' : 'warning';
     const stateLabel = account.connected ? '运行正常' : state === 'connecting' ? '正在连接' : '连接未就绪';
@@ -87,14 +89,22 @@ export function createTokenChannelSettings(definition) {
               h(LogoGlyph, { size: 29 })),
             h('div', { className: 'dim-botName' },
               h('h3', null, account.bot.name), h('p', null, identity))),
-          h(BotStatusMeta, {
-            className: 'ddt-health',
-            dotClassName: 'ddt-dot',
-            tone,
-            stateLabel,
-            lastCheckedAt: account.health.lastCheckedAt,
-            formatCheckedTime: checkedTime,
-          })),
+          h('div', { className: 'dim-botCardTools' },
+            h(BotStatusMeta, {
+              className: 'ddt-health',
+              dotClassName: 'ddt-dot',
+              tone,
+              stateLabel,
+              lastCheckedAt: account.health.lastCheckedAt,
+              formatCheckedTime: checkedTime,
+            }),
+            h(BotSettingsButton, {
+              channel: channel.toLowerCase(),
+              botId: account.botId,
+              botName: account.bot.name,
+              connected: account.connected,
+              accessPolicy: account.accessPolicy,
+            }))),
         h(WorkspaceEditor, {
           workspace: account.workspace,
           disabled: Boolean(busy),
@@ -104,6 +114,11 @@ export function createTokenChannelSettings(definition) {
           agentPreset: account.agentPreset,
           disabled: Boolean(busy),
           onSave: onAgentPresetSave,
+        }),
+        h(ContextEnhancementEditor, {
+          config: account.contextEnhancement,
+          disabled: Boolean(busy),
+          onSave: onContextEnhancementSave,
         }),
         AccountSettings ? h(AccountSettings, {
           account,
@@ -308,6 +323,12 @@ export function createTokenChannelSettings(definition) {
                 'preset',
                 endpoints.setAgentPreset,
                 { botId: account.botId, agentPreset },
+              ),
+              onContextEnhancementSave: (config) => botAction(
+                account,
+                'context-enhancement',
+                endpoints.setContextEnhancement,
+                { botId: account.botId, config },
               ),
               onAccountSettingsSave: AccountSettings && accountSettingsEndpoint
                 ? (payload) => botAction(

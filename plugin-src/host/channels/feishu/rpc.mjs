@@ -5,19 +5,27 @@ import {
 } from '../../../../src/channels/shared/agent-preset.mjs';
 import { publicConnectionTestResult } from '../../../../src/channels/shared/connection-test.mjs';
 import { publicMessageFailure } from '../../../../src/channels/shared/message-failure.mjs';
+import { normalizeAccessPolicy } from '../../../../src/channels/shared/access-policy.mjs';
 import { resolveRpcAuthority } from '../../rpc-authority.mjs';
 import { publicWorkspaceError, validWorkspacePayload } from '../shared/workspace-rpc.mjs';
 import { validAgentPresetPayload } from '../shared/agent-preset-rpc.mjs';
+import { validContextEnhancementPayload } from '../shared/context-enhancement-rpc.mjs';
+import { SET_ACCESS_POLICY_ENDPOINT, validAccessPolicyPayload } from '../shared/access-policy-rpc.mjs';
+import { normalizeContextEnhancementConfig } from '../../../../src/channels/shared/context-enhancement.mjs';
 import {
   isFeishuGroupResponseMode,
   normalizeFeishuGroupResponseMode,
 } from '../../../../src/channels/feishu/group-response-mode.mjs';
 import {
-  FEISHU_ENDPOINTS,
+  FEISHU_ENDPOINTS as FEISHU_CLIENT_ENDPOINTS,
   FEISHU_RPC_CHANNEL,
 } from '../../../client/channels/feishu/api.js';
 
-export { FEISHU_ENDPOINTS, FEISHU_RPC_CHANNEL };
+export const FEISHU_ENDPOINTS = Object.freeze({
+  ...FEISHU_CLIENT_ENDPOINTS,
+  setAccessPolicy: SET_ACCESS_POLICY_ENDPOINT,
+});
+export { FEISHU_RPC_CHANNEL };
 export const FEISHU_MULTI_ENDPOINTS = Object.freeze({
   reconnectBot: 'bot.reconnect',
   disconnectBot: 'bot.disconnect',
@@ -276,6 +284,8 @@ function publicBotEntry(entry) {
     connected,
     configured: source.configured === true,
     agentPreset: normalizeAgentPresetId(source.agentPreset),
+    contextEnhancement: normalizeContextEnhancementConfig(source.contextEnhancement),
+    accessPolicy: normalizeAccessPolicy(source.accessPolicy),
     groupResponseMode: normalizeFeishuGroupResponseMode(source.groupResponseMode),
     groupMessagePermissionGranted: source.groupMessagePermissionGranted === true,
     bot: publicBot(source.bot),
@@ -414,6 +424,14 @@ function validPayload(endpoint, payload) {
   if (endpoint === FEISHU_ENDPOINTS.setAgentPreset) {
     return validAgentPresetPayload(payload)
       ? null : '请选择 Agent Preset。';
+  }
+  if (endpoint === FEISHU_ENDPOINTS.setContextEnhancement) {
+    return validContextEnhancementPayload(payload)
+      ? null : '请提交有效的上下文增强设置。';
+  }
+  if (endpoint === FEISHU_ENDPOINTS.setAccessPolicy) {
+    return validAccessPolicyPayload(payload)
+      ? null : '请提交有效的访问设置。';
   }
   if (endpoint === FEISHU_ENDPOINTS.setGroupResponseMode) {
     return hasOnlyKeys(payload, new Set(['botId', 'groupResponseMode']))
@@ -665,6 +683,18 @@ export function createFeishuRpcHandler(controller, { encodeQr = qrCodeDataUrl } 
         value = await toPublicFeishuStatus(
           await controller.updateWorkspace(payload.botId, payload.workspace),
           { encodeQr: cachedEncodeQr },
+        );
+      } else if (endpoint === FEISHU_ENDPOINTS.setContextEnhancement) {
+        if (typeof controller.updateContextEnhancement !== 'function') throw new Error('Context enhancement update is unavailable');
+        value = await controller.updateContextEnhancement(
+          payload.botId, payload.config,
+          (status) => toPublicFeishuStatus(status, { encodeQr: cachedEncodeQr }),
+        );
+      } else if (endpoint === FEISHU_ENDPOINTS.setAccessPolicy) {
+        if (typeof controller.updateAccessPolicy !== 'function') throw new Error('Access policy update is unavailable');
+        value = await controller.updateAccessPolicy(
+          payload.botId, payload.policy,
+          (status) => toPublicFeishuStatus(status, { encodeQr: cachedEncodeQr }),
         );
       } else if (endpoint === FEISHU_ENDPOINTS.setAgentPreset) {
         if (typeof controller.updateAgentPreset !== 'function') throw new Error('Agent preset update is unavailable');

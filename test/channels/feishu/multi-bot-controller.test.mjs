@@ -107,6 +107,7 @@ function fixture({
         starts: 0,
         stops: 0,
         sentTests: [],
+        proactiveSends: [],
         probes: [],
         responseModes: [],
         repair,
@@ -125,6 +126,10 @@ function fixture({
         },
         async sendConnectionTest(text) {
           runtime.sentTests.push(text);
+          return { sent: true };
+        },
+        async sendProactiveText(...args) {
+          runtime.proactiveSends.push(args);
           return { sent: true };
         },
         setGroupResponseMode(mode) {
@@ -182,6 +187,8 @@ test('QR registration separates events from card callbacks', async () => {
   assert.deepEqual(run.options.addons.callbacks.items, ['card.action.trigger']);
   assert.ok(run.options.addons.scopes.tenant.includes('im:resource'));
   assert.equal(run.options.addons.scopes.tenant.includes('im:resource:upload'), false);
+  assert.ok(run.options.addons.scopes.tenant.includes('application:app_slash_command:read'));
+  assert.ok(run.options.addons.scopes.tenant.includes('application:app_slash_command:write'));
   run.options.onQRCodeReady({ url: 'https://accounts.feishu.cn/callbacks', expireIn: 60 });
   run.resolve({
     client_id: 'cli_callbacks', client_secret: 'callbacks-secret',
@@ -341,7 +348,14 @@ test('callback repair is deduplicated per bot, updates only its secret, and prov
   assert.equal(Object.hasOwn(run.options, 'appPreset'), false);
   assert.deepEqual(run.options.addons, {
     preset: false,
-    scopes: { tenant: ['im:message:readonly', 'im:resource'] },
+    scopes: {
+      tenant: [
+        'im:message:readonly',
+        'im:resource',
+        'application:app_slash_command:read',
+        'application:app_slash_command:write',
+      ],
+    },
     callbacks: { items: ['card.action.trigger'] },
   });
   run.options.onQRCodeReady({
@@ -793,6 +807,11 @@ test('connection test uses the selected bot runtime and shared message copy', as
   assert.deepEqual(fx.runtimes.get(healthy.id)[0].sentTests, [
     '✅ DeepSeek Harness 连接测试成功\n这条消息由「IM机器人」设置页中的“机器人 healthy（cli_heal••••7890）”机器人卡片发出。',
   ]);
+  const target = { kind: 'group', route: { chatId: 'oc_target' } };
+  assert.deepEqual(await fx.controller.sendProactiveText(healthy.id, target, '主动投递'), {
+    sent: true,
+  });
+  assert.deepEqual(fx.runtimes.get(healthy.id)[0].proactiveSends, [[target, '主动投递', {}]]);
   await fx.controller.close();
 });
 

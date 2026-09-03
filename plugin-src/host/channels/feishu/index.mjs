@@ -3,7 +3,7 @@ import { createProductionController } from './production.mjs';
 import { installFeishuRpc } from './rpc.mjs';
 
 export const name = 'dsh-feishu-host';
-export const inject = ['connection', 'credentials', 'apiProxy', 'typertGateway'];
+export const inject = ['connection', 'credentials', 'typertGateway'];
 
 function controllerFrom(ctx, config) {
   if (config?.controller) return config.controller;
@@ -29,6 +29,8 @@ export async function apply(ctx, config = {}) {
   }
 
   const production = await createProductionController(ctx, config);
+  const unregisterDelivery = config.deliveryService && production.deliveryAdapter
+    ? config.deliveryService.registerAdapter(production.deliveryAdapter) : undefined;
   const disposeRpc = installFeishuRpc(
     ctx,
     production.controller,
@@ -36,6 +38,7 @@ export async function apply(ctx, config = {}) {
     config.rpcAuthority,
   );
   ctx.effect(() => async () => {
+    await unregisterDelivery?.();
     await production.close();
   }, 'dsh-feishu: close controller and live connection');
   return disposeRpc;
