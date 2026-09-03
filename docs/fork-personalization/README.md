@@ -8,11 +8,19 @@
 
 | 项 | 值 |
 |---|---|
-| fork 分叉点（merge-base） | `0579c24`（上游 0.16.0） |
-| fork HEAD | `421dd47`（3.1.7，2026-09-02；history 已吸收上游 v3.1.4/v3.1.5，含 `ce9d489` 重启后恢复持久化通知目标） |
-| 上游合并基线 | `45c0a7f`（上游 3.1.1，2026-08-28） |
-| fork 增量 commits | 10 个（f8645d9 → 421dd47） |
+| fork 分叉点（merge-base） | `90f765e`（合成 tag `v4.9.0-synth` = 上游 v4.9.0，commit `3010535`，tree `71564e1`；2026-09-03 经 codeload tarball 合成提交，tree-sha 字节级验证。此前 merge-base 为 `0579c24`/0.16.0 时代） |
+| fork HEAD | 4.9.0-1（2026-09-03 合并上游 v4.9.0：merge commit `49eb5f7` + fork-id 修正 `905f66d` + 测试对齐 `24fccf8`） |
+| 上游合并基线 | `45c0a7f`（上游 3.1.1，2026-08-28）→ 本轮已推进到上游 v4.9.0 |
+| fork 增量 commits | 10 个（f8645d9 → 421dd47）+ 合并后修正 2 个（905f66d、24fccf8） |
 | 权威 diff 快照 | `docs/fork-personalization/commit-*.diff`（每个 fork commit 的源码 diff） |
+
+### v4.9.0 合并要点（2026-09-03）
+
+- **合并方式**：github.com git 传输被代理 502 阻断 → codeload tarball + 合成提交（tag `v4.9.0-synth`，parent=45c0a7f，tree sha 与上游一致），再真实 `git merge`。
+- **被上游收编/取代，不再恢复**：① 渠道状态灯（上游 `dim-rail`/`dim-stateDot` 等价实现）；② webServer 回退 `92fa6f2`（上游 4.0.0+ typertGateway 自动探测双兼容，issue #83）；③ connectionTestTarget **持久化**（上游 connection-test.mjs 改纯内存 Map，消费方已删；fork state-store 的 `setConnectionTestTarget` 持久化方法与 fork 独有测试 `test/channels/wecom/state-store.test.mjs` 一并删除）。**注意**：fork 的 `sendNotification`（weixin outbox 消费路径，含 contextToken/runId）上游未收编（上游只有 `sendConnectionTest`/`sendProactiveText`/`#sendTrackedText`），已与上游三方法并存保留。
+- **上游 4.x 新增的 fork 适配点**：`plugin-src/client/update-panel.js` 手动安装命令模板（2 处硬编码 `@xmanrui/dsh-im`，已改 fork 包名，否则 UI 生成命令会装上游包覆盖 fork）；`scripts/verify-package.mjs` 包名断言 fork 化（含正则内 `@xmanrui\/dsh-` 转义形态）。**每次上游新增 client/host UI 功能时必须全量 grep `@xmanrui`**。
+- **Windows 测试基线**（4.9.0-1）：全量 2118 tests，fail ≈ 69 全部为上游测试的 Windows 路径/权限位问题（discord/qq/feishu 路径分隔符、`mode & 0o600` 无 win32 guard、bin 执行位），与 fork 无关；fork 关键套件（channel-tag / client-ui / weixin notification-outbox / wecom runtime / weixin stores）全绿。
+- **weixin 传参语义变化**：上游 4.x `askInWorkspaceSession` 无条件传 `text, content`（3.x 为 `hasImages ? {content} : {text}` 条件传参），fork 的 `channelLabel/fromUserId/msgId` 四字段在 wecom/weixin bridge 与共享 text-harness-bridge 均与 `contextEnhanced` 并存保留。
 
 ## 二、Fork 个性化总览（10 个 commit）
 
