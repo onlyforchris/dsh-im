@@ -118,18 +118,18 @@ if (forbiddenDshLockPaths.length > 0) {
   );
 }
 
-if (!/\bid\s*:\s*["']@xmanrui\/dsh-im["']/u.test(client)) {
+if (!/\bid\s*:\s*["']@onlyforchris\/dsh-im["']/u.test(client)) {
   throw new Error('client bundle does not register the dsh-im loader id');
 }
 const sourceSectionMarkers = [
   /ctx\.slots\.inject\(\s*["']settings\.section["']/u,
   /name\s*:\s*["']settings\.section["']/u,
-  /id\s*:\s*["']xmanrui-dsh-im["']/u,
+  /id\s*:\s*["']onlyforchris-dsh-im["']/u,
   /order\s*:\s*21\b/u,
   /label\s*:\s*\(\)\s*=>\s*t\(\s*["']IM机器人["']\s*\)/u,
   /locale\s*:\s*IM_LOCALE_NAMESPACE\b/u,
 ];
-const bundleSectionPattern = /name\s*:\s*["']settings\.section["']\s*,\s*id\s*:\s*["']xmanrui-dsh-im["']\s*,\s*order\s*:\s*21\s*,\s*label\s*:\s*\(\)\s*=>\s*[$A-Z_a-z][$\w]*\(\s*["']IM(?:机器人|\\u673A\\u5668\\u4EBA)["']\s*\)\s*,\s*locale\s*:\s*(?:[$A-Z_a-z][$\w]*|["']dsh-im["'])/u;
+const bundleSectionPattern = /name\s*:\s*["']settings\.section["']\s*,\s*id\s*:\s*["']onlyforchris-dsh-im["']\s*,\s*order\s*:\s*21\s*,\s*label\s*:\s*\(\)\s*=>\s*[$A-Z_a-z][$\w]*\(\s*["']IM(?:机器人|\\u673A\\u5668\\u4EBA)["']\s*\)\s*,\s*locale\s*:\s*(?:[$A-Z_a-z][$\w]*|["']dsh-im["'])/u;
 if (sourceSectionMarkers.some((pattern) => !pattern.test(clientEntrySource))
   || !/IM_LOCALE_NAMESPACE\s*=\s*["']dsh-im["']/u.test(clientSources)
   || !bundleSectionPattern.test(client)) {
@@ -178,18 +178,18 @@ for (const marker of ['/session Session ID', 'bindWorkspaceSession', 'session-su
     throw new Error(`host bundle does not contain the Session binding marker: ${marker}`);
   }
 }
-if (/@xmanrui\/dsh-(?:feishu|weixin|dingtalk)/.test(host)) {
+if (/@onlyforchris\/dsh-(?:feishu|weixin|dingtalk)/.test(host)) {
   throw new Error('host bundle still imports an external channel plugin');
 }
-if (/@xmanrui\/dsh-(?:feishu|weixin|dingtalk)/.test(
+if (/@onlyforchris\/dsh-(?:feishu|weixin|dingtalk)/.test(
   manifestText + lockText + hostSource + clientSources,
 )) {
   throw new Error('source or package metadata still depends on an external channel plugin');
 }
-if (!patch.includes("name: '@xmanrui/dsh-im'") || /dsh-(?:feishu|weixin|dingtalk)/.test(patch)) {
+if (!patch.includes("name: '@onlyforchris/dsh-im'") || /dsh-(?:feishu|weixin|dingtalk)/.test(patch)) {
   throw new Error('bundle patch must activate only dsh-im');
 }
-for (const name of ['@xmanrui/dsh-feishu', '@xmanrui/dsh-weixin', '@xmanrui/dsh-dingtalk']) {
+for (const name of ['@onlyforchris/dsh-feishu', '@onlyforchris/dsh-weixin', '@onlyforchris/dsh-dingtalk']) {
   if (manifest.dependencies?.[name]) {
     throw new Error(`${name} must not remain an external dependency`);
   }
