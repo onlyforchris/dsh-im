@@ -1,6 +1,6 @@
 {
   "name": "@onlyforchris/dsh-im",
-  "version": "4.9.0-1",
+  "version": "4.9.1-1",
   "description": "把九种 IM 机器人和公网 AI Office 接入本机 DeepSeek Harness。 Connect nine IM channels and a public AI Office to a local DeepSeek Harness.",
   "keywords": [
     "deepseek-harness",
@@ -120,5 +120,10 @@
     "react-dom": "18.3.1",
     "react-test-renderer": "18.3.1",
     "semver": "7.8.5"
+  },
+  "directories": {
+    "doc": "docs",
+    "lib": "lib",
+    "test": "test"
   }
 }
