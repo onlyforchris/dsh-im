@@ -9,6 +9,7 @@ const EMPTY_STATE = Object.freeze({
   seenMessageIds: [],
   getUpdatesBuf: '',
   recentOutboundMessages: [],
+  connectionTestTarget: null,
 });
 
 export const WEIXIN_RECENT_OUTBOUND_LIMIT = 200;
@@ -62,6 +63,18 @@ function recentOutboundMessages(value, now = Date.now()) {
     .slice(-WEIXIN_RECENT_OUTBOUND_LIMIT);
 }
 
+// 微信主动通知（S5 outbox）的送达目标。2026-09-08 前只在内存里，DSH 重启即丢失，
+// 通知卡在 outbox 无人送达。目标形态由 bridge 决定（单聊 { toUserId }）。
+function normalizeConnectionTestTarget(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (Object.keys(value).length === 0) return null;
+  try {
+    return structuredClone(value);
+  } catch {
+    return null;
+  }
+}
+
 function normalizeState(value) {
   if (!value || typeof value !== 'object') return structuredClone(EMPTY_STATE);
   const sessions = {};
@@ -80,6 +93,7 @@ function normalizeState(value) {
       : [],
     getUpdatesBuf: typeof value.getUpdatesBuf === 'string' ? value.getUpdatesBuf : '',
     recentOutboundMessages: recentOutboundMessages(value.recentOutboundMessages),
+    connectionTestTarget: normalizeConnectionTestTarget(value.connectionTestTarget),
   };
 }
 
@@ -198,6 +212,18 @@ export class WeixinStateStore {
         && quotedAt <= entry.completedAt + WEIXIN_RECENT_OUTBOUND_MATCH_TOLERANCE_MS
     )));
     return candidates.length === 1 ? candidates[0].text : null;
+  }
+
+  connectionTestTarget() {
+    return this.#state.connectionTestTarget ? structuredClone(this.#state.connectionTestTarget) : null;
+  }
+
+  async setConnectionTestTarget(target) {
+    const normalized = normalizeConnectionTestTarget(target);
+    if (!normalized) throw new TypeError('Invalid Weixin connection test target');
+    this.#state.connectionTestTarget = normalized;
+    await this.#persist();
+    return structuredClone(normalized);
   }
 
   snapshot() {

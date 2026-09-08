@@ -1,7 +1,25 @@
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
-const EMPTY_STATE = Object.freeze({ version: 1, sessions: {}, seenMessageIds: [] });
+const EMPTY_STATE = Object.freeze({
+  version: 1,
+  sessions: {},
+  seenMessageIds: [],
+  connectionTestTarget: null,
+});
+
+// 企微主动通知（S5 outbox）的送达目标。2026-09-08 前只存在进程内存里，DSH 一重启
+// 就丢，sendNotification 抛「尚未收到可用于测试的私聊消息」，通知永远停在 outbox。
+// 这里把它纳入持久化，使重启后仍能送达；目标形态由 bridge 决定（单聊 { chatId }）。
+function normalizeConnectionTestTarget(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (Object.keys(value).length === 0) return null;
+  try {
+    return structuredClone(value);
+  } catch {
+    return null;
+  }
+}
 
 function normalizeState(value) {
   if (!value || typeof value !== 'object') return structuredClone(EMPTY_STATE);
@@ -17,6 +35,7 @@ function normalizeState(value) {
     seenMessageIds: Array.isArray(value.seenMessageIds)
       ? value.seenMessageIds.filter((id) => typeof id === 'string').slice(-1_000)
       : [],
+    connectionTestTarget: normalizeConnectionTestTarget(value.connectionTestTarget),
   };
 }
 
@@ -70,6 +89,18 @@ export class WecomStateStore {
       this.#state.seenMessageIds.splice(0, this.#state.seenMessageIds.length - 1_000);
     }
     await this.#persist();
+  }
+
+  connectionTestTarget() {
+    return this.#state.connectionTestTarget ? structuredClone(this.#state.connectionTestTarget) : null;
+  }
+
+  async setConnectionTestTarget(target) {
+    const normalized = normalizeConnectionTestTarget(target);
+    if (!normalized) throw new TypeError('Invalid WeCom connection test target');
+    this.#state.connectionTestTarget = normalized;
+    await this.#persist();
+    return structuredClone(normalized);
   }
 
   snapshot() {

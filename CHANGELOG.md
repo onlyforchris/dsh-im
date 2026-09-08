@@ -8,6 +8,17 @@ This file records the notable changes in each dsh-im release. Its format follows
 
 > 以下为 fork 本地版本线记录（基于上游 v3.1.1–v3.1.5，包名 @onlyforchris/dsh-im）。
 
+## [4.9.1-2] - 2026-09-08
+
+### Fixed / 修复
+
+- **企微/微信主动通知（S5 outbox）送达目标重启即丢**：`WecomStateStore` / `WeixinStateStore`
+  原先只持久化 `sessions` 与 `seenMessageIds`，`rememberConnectionTestTarget()` 写入的目标仅存在进程内存，
+  DSH 每次重启后 `sendNotification` 抛「尚未收到可用于测试的私聊消息」，通知事件卡在 outbox 无限重试。
+  现两个 state-store 均新增 `connectionTestTarget()` / `setConnectionTestTarget()` 并纳入持久化，
+  重启后无需用户先发一条消息即可送达。非法目标一律 fail-closed（抛错且不落盘）。
+- 新增 `test/channels/{wecom,weixin}/state-store.test.mjs` 共 9 例（含重载后仍在、副本隔离、非法值不落盘）。
+
 ## [3.1.5] - 2026-08-31
 
 ### Fixed / 修复
