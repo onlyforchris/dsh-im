@@ -4,6 +4,7 @@ import test from 'node:test';
 import { harnessConnection } from '../plugin-src/host/harness-connection.mjs';
 import { modernHarnessApi } from '../plugin-src/host/modern-harness-api.mjs';
 import { HarnessClient, HarnessRpcError } from '../src/channels/shared/harness-client.mjs';
+import { classifyMessageFailure } from '../src/channels/shared/message-failure.mjs';
 
 function asyncValues(...values) {
   return {
@@ -231,6 +232,122 @@ test('modern adapter preserves Typert business failures as Harness RPC errors', 
       && error.code === 'session-not-found'
       && error.details.sessionId === 'missing',
   );
+});
+
+test('modern adapter preserves direct DSH RemoteErrors through message classification', async () => {
+  const sourceError = Object.assign(new Error('preset "removed" not found'), {
+    name: 'RemoteError',
+    isDSHRemoteError: true,
+    code: 'agent-preset/not-found',
+    details: { agentPreset: 'removed', available: ['standard'] },
+  });
+  const { ctx } = fakeContext({
+    async invoke() { throw sourceError; },
+    async stream() { throw new Error('unused'); },
+  });
+  const client = new HarnessClient({ apiProxy: modernHarnessApi(ctx), workspace: '/workspace' });
+  await assert.rejects(() => client.rpc('session.prompt', { sessionId: 'session', text: 'test' }), (error) => {
+    assert.ok(error instanceof HarnessRpcError);
+    assert.equal(error.code, sourceError.code);
+    assert.deepEqual(error.details, sourceError.details);
+    const failure = classifyMessageFailure(error);
+    assert.equal(failure.code, 'PRESET_UNAVAILABLE');
+    assert.equal(failure.reason, 'AGENT_PRESET_NOT_FOUND');
+    return true;
+  });
+});
+
+test('modern adapter keeps unmarked internal errors internal', async () => {
+  const { ctx } = fakeContext({
+    async invoke() { throw Object.assign(new Error('local error'), { code: 'agent-preset/not-found' }); },
+    async stream() { throw new Error('unused'); },
+  });
+  const client = new HarnessClient({ apiProxy: modernHarnessApi(ctx), workspace: '/workspace' });
+  await assert.rejects(() => client.rpc('session.prompt', { sessionId: 'session', text: 'test' }), {
+    code: 'internal',
+  });
+});
+
+test('modern adapter exposes DSH v2 live assistant chunks through legacy history', async () => {
+  const records = [
+    {
+      type: 'event',
+      event: { type: 'turn/start', seq: 0, time: 0, data: { turn: 1 } },
+    },
+    {
+      type: 'event',
+      event: {
+        type: 'user/message', seq: 1, time: 1,
+        data: { turn: 1, source: { kind: 'user', rpcId: 'prompt' }, message: { content: [] } },
+      },
+    },
+  ];
+  const gateway = {
+    async invoke(request) {
+      if (`${request.namespace}/${request.method}` !== 'session/page') {
+        throw new Error('unexpected invoke');
+      }
+      return { records, hasMore: false };
+    },
+    async stream(request) {
+      if (`${request.namespace}/${request.method}` !== 'session/follow') {
+        throw new Error('unexpected stream');
+      }
+      return asyncValues({
+        type: 'snapshot', cursor: 1, records, hasMore: false,
+        projections: { asOfSeq: 1, values: {} },
+      });
+    },
+  };
+  const fixture = fakeContext(gateway);
+  const api = modernHarnessApi(fixture.ctx);
+
+  await api.sessions.history({ rpcId: 'baseline', payload: { sessionId: 'session' } });
+  const agent = { session: { id: 'session', seq: 2 } };
+  fixture.emit('agent/assistant-stream', {
+    agent,
+    frame: {
+      type: 'start', attemptId: 'session:1', revision: 1, turn: 1, step: 1,
+    },
+  });
+  fixture.emit('agent/assistant-stream', {
+    agent,
+    frame: {
+      type: 'chunk', attemptId: 'session:1', revision: 2, index: 0, time: 2,
+      chunk: { type: 'text-delta', index: 0, text: '你好' },
+    },
+  });
+  fixture.emit('agent/assistant-stream', {
+    agent,
+    frame: {
+      type: 'chunk', attemptId: 'session:1', revision: 3, index: 1, time: 3,
+      chunk: { type: 'text-delta', index: 0, text: '，世界' },
+    },
+  });
+
+  const live = await api.sessions.history({
+    rpcId: 'live', payload: { sessionId: 'session' },
+  });
+  const chunks = live.result.value.events.filter(
+    ({ event }) => event.type === 'assistant/chunk',
+  );
+  assert.deepEqual(chunks.map(({ event }) => event.data.chunk.text), ['你好', '，世界']);
+  assert.ok(chunks.every(({ event }) => event.seq > 1 && event.seq < 2));
+  assert.ok(chunks[0].event.seq < chunks[1].event.seq);
+
+  fixture.emit('agent/assistant-stream', {
+    agent,
+    frame: {
+      type: 'end', attemptId: 'session:1', revision: 4, index: 2,
+      outcome: { kind: 'committed', eventType: 'assistant/message', seq: 2 },
+    },
+  });
+  const settled = await api.sessions.history({
+    rpcId: 'settled', payload: { sessionId: 'session' },
+  });
+  assert.equal(settled.result.value.events.some(
+    ({ event }) => event.type === 'assistant/chunk',
+  ), false);
 });
 
 forEachSessionApi('an approval', async (sessionApi) => {

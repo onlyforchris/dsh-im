@@ -1,3 +1,4 @@
+import { createDeferredDeliveryCoordinator, deferredOutcomeText } from '../shared/deferred-delivery-coordinator.mjs';
 import {
   DEFAULT_WEIXIN_MAX_MESSAGE_CHARS,
   extractWeixinFiles,
@@ -163,7 +164,7 @@ function createWeixinSendDiagnostic({
   ].join(' ');
 }
 
-function weixinSendError(error, details) {
+export function weixinSendError(error, details) {
   const diagnostic = createWeixinSendDiagnostic({ ...details, error });
   const wrapped = new Error(`Weixin text delivery failed (${diagnostic})`, { cause: error });
   const code = safeDiagnosticToken(error?.code);
@@ -176,7 +177,7 @@ function weixinSendError(error, details) {
   return wrapped;
 }
 
-function weixinSendFailureOptions(error) {
+export function weixinSendFailureOptions(error, { proactive = false } = {}) {
   let current = error;
   for (let depth = 0; current && depth < 5; depth += 1) {
     const diagnostic = current[WEIXIN_SEND_DIAGNOSTIC];
@@ -184,7 +185,12 @@ function weixinSendFailureOptions(error) {
       return {
         reason: 'weixin-send-failed',
         userMessage: [
-          t('回复已经生成，但微信发送失败，可能只收到部分内容。请将下面的诊断信息完整反馈给管理员。'),
+          proactive
+            ? t('微信主动消息发送失败。长轮询在线不代表消息可以发送。')
+            : t('回复已经生成，但微信发送失败，可能只收到部分内容。请将下面的诊断信息完整反馈给管理员。'),
+          ...(String(current.providerCode) === '-2' ? [
+            t('iLink 拒绝发送，可能涉及会话有效期、发送额度或消息内容。可让接收者发一条消息后重试；不要通过反复发送心跳尝试续期。'),
+          ] : []),
           t('微信发送诊断：{diagnostic}', { diagnostic }),
         ].join('\n'),
       };
@@ -289,6 +295,7 @@ export class WeixinHarnessBridge {
   #ownerUserId;
   #harness;
   #state;
+  #deferred;
   #contextEnhancement;
   #accessPolicy;
   #status;
@@ -354,6 +361,9 @@ export class WeixinHarnessBridge {
     this.#sourceChannelLabel = sourceChannelLabel;
     this.#typingKeepaliveMs = typingKeepaliveMs;
     this.#signal = signal;
+    this.#deferred = createDeferredDeliveryCoordinator({ harness, state, signal, logger,
+      deliver: (entry, outcome) => this.#deliverDeferredOutcome(entry, outcome),
+    });
     this.#approvals = new HarnessApprovalQueue({ label: 'weixin', logger });
   }
 
@@ -393,6 +403,12 @@ export class WeixinHarnessBridge {
     }
     const key = conversationKey(sender);
     const contextToken = nonEmptyString(message?.context_token) ?? undefined;
+    void this.#state.rememberContextToken?.({
+      userId: sender,
+      contextToken,
+      seq: message.seq,
+      messageTimeMs: message.create_time_ms ?? weixinMessageTimestampMs(messageId),
+    }).catch((error) => this.#logger.warn?.('[dsh-weixin] failed to persist conversation context:', error));
     const runId = nonEmptyString(message?.run_id) ?? undefined;
     const pending = this.#pendingInteractions.get(key);
     const batchCommand = isBatchInputCommand(commandText);
@@ -645,6 +661,11 @@ export class WeixinHarnessBridge {
     return task;
   }
 
+  async #deliverDeferredOutcome(entry, outcome) {
+    await this.#send(entry.target.toUserId, deferredOutcomeText(outcome), undefined, undefined, { stopTyping: false });
+    return true;
+  }
+
   async waitForIdle() {
     await Promise.allSettled([
       ...this.#queues.values(),
@@ -655,9 +676,11 @@ export class WeixinHarnessBridge {
       ...this.#commandTasks,
       this.#typingTail,
     ]);
+    await this.#deferred.whenIdle();
   }
 
   async close() {
+    this.#deferred.close();
     this.#typingClosed = true;
     await this.#stopTyping({ signal: AbortSignal.timeout(5_000) });
   }
@@ -685,6 +708,7 @@ export class WeixinHarnessBridge {
       pendingInteraction: this.#pendingInteractions.has(key)
         || this.#approvals.hasPending(key),
       control: { owner: this, key },
+      deferredDelivery: this.#deferred,
     });
     if (result?.stopped) {
       await Promise.allSettled([
@@ -797,6 +821,7 @@ export class WeixinHarnessBridge {
         await this.#state.markSeen(messageId);
         promptRecorded = true;
         ({ answer, artifacts = [] } = await askInWorkspaceSession({
+          deferredDelivery: () => ({ coordinator: this.#deferred, target: { toUserId: sender } }),
           harness: this.#harness,
           state: this.#state,
           key,
@@ -1231,8 +1256,9 @@ export class WeixinHarnessBridge {
     ).catch(() => undefined);
   }
 
-  async #send(toUserId, text, contextToken, runId) {
-    await this.#stopTyping();
+  async #send(toUserId, text, contextToken, runId, { stopTyping = true } = {}) {
+    if (stopTyping) await this.#stopTyping();
+    contextToken ??= this.#state.contextTokenFor?.(toUserId);
     const providerMessageIds = [];
     const chunks = splitWeixinText(text, this.#maxMessageChars);
     for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {

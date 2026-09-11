@@ -89,8 +89,8 @@ export default {
     'The Workspace or Session state just changed. Please send this message again.',
   '当前工作区不存在或暂不可用。请重新选择工作区后重试。':
     'The current Workspace does not exist or is unavailable. Select another Workspace and try again.',
-  '当前 Agent Preset 不存在或暂不可用。请发送 /presetlist 后重新选择。':
-    'The current Agent Preset does not exist or is unavailable. Send /presetlist and select another one.',
+  '当前 Agent Preset 无法使用。请发送 /presetlist 查看可用项，使用 /preset <序号或 ID> 重新选择，再发送 /new 创建新会话后重试。如需继续原会话，请联系管理员恢复原 Preset。':
+    'The current Agent Preset is unavailable. Send /presetlist to see available options, select one with /preset <index or ID>, then send /new to create a new Session and try again. To continue the original Session, ask an administrator to restore the original Preset.',
   '回复已经生成，但机器人没有发送权限。请联系管理员检查渠道权限或重新绑定机器人。':
     'The reply was generated, but the bot cannot send it. Ask an administrator to check channel permissions or reconnect the bot.',
   '回复已经生成，但当前渠道正在限流，暂时无法发送。请稍后重试。':
@@ -118,6 +118,9 @@ export default {
   '直接发送文字、图片、文件或带文字识别结果的语音即可继续当前会话。':
     'Send text, an image, a file, or a voice message already transcribed to text to continue the current session.',
   '{label}机器人已连接 DeepSeek Harness。': 'The {label} bot is connected to DeepSeek Harness.',
+  '查看最近历史消息（仅私聊）': 'Show recent history (private chats only)',
+  '按序号列出当前模型可用推理等级': 'List reasoning efforts for the current model by index',
+  '查看或切换当前推理等级': 'Show or switch the current reasoning effort',
   '/new  开启一个全新会话': '/new  Start a brand-new session',
   '/compact  压缩当前会话的较早上下文': '/compact  Compact the earlier context of the current session',
   '/workspace 工作区序号或绝对路径  切换工作区':

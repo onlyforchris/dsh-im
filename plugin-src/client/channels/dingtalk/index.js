@@ -1,6 +1,7 @@
 import * as React from 'react';
 
 import { CredentialActionIcon, CredentialBindingPanel, QrActionIcon } from '../../credential-binding.js';
+import { CollapsibleAccountSection } from '../shared/collapsible-account.js';
 import { h } from '../../i18n.js';
 import { WorkspaceEditor } from '../../workspace-editor.js';
 import { ContextEnhancementEditor } from '../../context-enhancement.js';
@@ -9,6 +10,11 @@ import {
   AgentPresetEditor,
   EMPTY_AGENT_PRESET_CATALOG,
 } from '../../agent-preset.js';
+import {
+  EMPTY_MODEL_CATALOG,
+  ModelCatalogContext,
+  ModelEditor,
+} from '../../model-setting.js';
 import { useWorkspaceSnapshotFence } from '../../workspace-snapshot-fence.js';
 import {
   BotSettingsButton,
@@ -238,6 +244,7 @@ export function AccountCard({
   removing,
   onReconnect,
   onWorkspaceSave,
+  onModelSave,
   onAgentPresetSave,
   onContextEnhancementSave,
   onRequestRemove,
@@ -250,13 +257,20 @@ export function AccountCard({
   const summary = account.error?.message ?? (account.connected ? null : account.health.summary);
   return h('article', { className: 'ddt-card dim-botCard', tabIndex: -1, 'data-bot-id': account.botId },
     h('div', { className: 'ddt-cardBody dim-botCardBody' },
-      h('div', { className: 'ddt-accountTop dim-botCardTop' },
+      h(CollapsibleAccountSection, {
+        id: `ddt-settings-${account.botId.replace(/[^a-zA-Z0-9_-]/g, '-')}`,
+        header: h('div', { className: 'ddt-accountTop dim-botCardTop' },
         h('div', { className: 'ddt-accountIdentity dim-botIdentity' },
           h('div', { className: 'ddt-avatar dim-botAvatar', 'aria-hidden': 'true' }, h(DingtalkIcon, { size: 29 })),
           h('div', { className: 'dim-botName' },
             h('h3', { title: account.bot.name }, account.bot.name),
             h('p', { title: account.bot.clientIdMasked }, account.bot.clientIdMasked))),
-        h('div', { className: 'dim-botCardTools' },
+        h('div', {
+            className: 'dim-botCardTools',
+            // The header is the collapse toggle; keep inner controls clickable.
+            onClick: (event) => { event.stopPropagation(); },
+            onKeyDown: (event) => { if (event.key === 'Enter' || event.key === ' ') event.stopPropagation(); },
+          },
           h(BotStatusMeta, {
             className: 'ddt-health',
             dotClassName: 'ddt-dot',
@@ -271,11 +285,17 @@ export function AccountCard({
             botName: account.bot.name,
             connected: account.connected,
             accessPolicy: account.accessPolicy,
-          }))),
-      h(WorkspaceEditor, {
+          })))
+      },
+        h(WorkspaceEditor, {
         workspace: account.workspace,
         disabled: Boolean(busy),
         onSave: onWorkspaceSave,
+      }),
+      h(ModelEditor, {
+        model: account.model,
+        disabled: Boolean(busy),
+        onSave: onModelSave,
       }),
       h(AgentPresetEditor, {
         agentPreset: account.agentPreset,
@@ -303,7 +323,9 @@ export function AccountCard({
           feedback ? h('div', {
             className: 'ddt-summary dim-cardFeedback',
             role: 'status',
-          }, feedback) : null))),
+          }, feedback) : null)),
+      ),
+    ),
     removing ? h(RemoveConfirmation, {
       account,
       busy: busy === 'delete',
@@ -327,6 +349,7 @@ function AccountList(props) {
         removing: props.removeTarget === account.botId,
         onReconnect: () => props.onReconnect(account),
         onWorkspaceSave: (workspace) => props.onWorkspaceSave(account, workspace),
+        onModelSave: (model) => props.onModelSave(account, model),
         onAgentPresetSave: (agentPreset) => props.onAgentPresetSave(account, agentPreset),
         onContextEnhancementSave: (config) => props.onContextEnhancementSave(account, config),
         onRequestRemove: () => props.onRequestRemove(account),
@@ -341,6 +364,7 @@ export function DingtalkSettingsTab({ rpcCall }) {
   const [model, setModel] = React.useState({
     phase: 'loading', bots: [], totals: EMPTY_TOTALS, revision: 0, error: null,
     agentPresetCatalog: EMPTY_AGENT_PRESET_CATALOG,
+    modelCatalog: EMPTY_MODEL_CATALOG,
   });
   const [provision, setProvision] = React.useState(null);
   const [busy, setBusy] = React.useState(false);
@@ -448,6 +472,7 @@ export function DingtalkSettingsTab({ rpcCall }) {
         revision: snapshot.revision,
         error: null,
         agentPresetCatalog: snapshot.agentPresetCatalog ?? EMPTY_AGENT_PRESET_CATALOG,
+        modelCatalog: snapshot.modelCatalog ?? EMPTY_MODEL_CATALOG,
       });
       discardStaleFeedback(snapshot);
       if (restoreProvisioning && snapshot.provisioning) {
@@ -564,6 +589,7 @@ export function DingtalkSettingsTab({ rpcCall }) {
           revision: snapshot.revision,
           error: null,
           agentPresetCatalog: snapshot.agentPresetCatalog ?? EMPTY_AGENT_PRESET_CATALOG,
+          modelCatalog: snapshot.modelCatalog ?? EMPTY_MODEL_CATALOG,
         });
         discardStaleFeedback(snapshot);
       }
@@ -705,6 +731,7 @@ export function DingtalkSettingsTab({ rpcCall }) {
           revision: snapshot.revision,
           error: null,
           agentPresetCatalog: snapshot.agentPresetCatalog ?? EMPTY_AGENT_PRESET_CATALOG,
+          modelCatalog: snapshot.modelCatalog ?? EMPTY_MODEL_CATALOG,
         });
         discardStaleFeedback(snapshot);
       }
@@ -771,6 +798,7 @@ export function DingtalkSettingsTab({ rpcCall }) {
           revision: snapshot.revision,
           error: null,
           agentPresetCatalog: snapshot.agentPresetCatalog ?? EMPTY_AGENT_PRESET_CATALOG,
+          modelCatalog: snapshot.modelCatalog ?? EMPTY_MODEL_CATALOG,
         });
         discardStaleFeedback(snapshot);
       }
@@ -797,6 +825,7 @@ export function DingtalkSettingsTab({ rpcCall }) {
           revision: snapshot.revision,
           error: null,
           agentPresetCatalog: snapshot.agentPresetCatalog ?? EMPTY_AGENT_PRESET_CATALOG,
+          modelCatalog: snapshot.modelCatalog ?? EMPTY_MODEL_CATALOG,
         });
         discardStaleFeedback(snapshot);
       }
@@ -859,7 +888,9 @@ export function DingtalkSettingsTab({ rpcCall }) {
       })
     : null;
 
-  return h(AgentPresetCatalogContext.Provider, {
+  return h(ModelCatalogContext.Provider, {
+    value: model.modelCatalog ?? EMPTY_MODEL_CATALOG,
+  }, h(AgentPresetCatalogContext.Provider, {
     value: model.agentPresetCatalog ?? EMPTY_AGENT_PRESET_CATALOG,
   }, h('section', { className: 'ddt-page dim-channelPage', 'aria-label': '钉钉设置' },
     h(Heading, {
@@ -897,6 +928,9 @@ export function DingtalkSettingsTab({ rpcCall }) {
                   removeTarget,
                   onReconnect: (account) => void reconnect(account),
                   onWorkspaceSave: saveWorkspace,
+                  onModelSave: (account, selectedModel) => saveBotSetting(
+                    account, 'model', DINGTALK_ENDPOINTS.setModel, { model: selectedModel },
+                  ),
                   onAgentPresetSave: (account, agentPreset) => saveBotSetting(
                     account, 'preset', DINGTALK_ENDPOINTS.setAgentPreset, { agentPreset },
                   ),
@@ -907,5 +941,5 @@ export function DingtalkSettingsTab({ rpcCall }) {
                   onConfirmRemove: (account) => void remove(account),
                   onCancelRemove: () => setRemoveTarget(null),
                 })
-              : null)));
+              : null))));
 }

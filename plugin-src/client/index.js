@@ -1,3 +1,4 @@
+import { callManagementRpc } from '../management-rpc.mjs';
 import * as React from 'react';
 import manifest from '../../package.json' with { type: 'json' };
 
@@ -12,6 +13,7 @@ import {
   WecomLogoGlyph,
   WeixinLogoGlyph,
   WhatsappLogoGlyph,
+  IMessageLogoGlyph,
 } from './channel-logos.js';
 import { DINGTALK_RPC_CHANNEL } from './channels/dingtalk/api.js';
 import { DingtalkSettingsTab } from './channels/dingtalk/index.js';
@@ -36,12 +38,18 @@ import { installTelegramStyles } from './channels/telegram/styles.js';
 import { WECOM_RPC_CHANNEL } from './channels/wecom/api.js';
 import { WecomSettingsTab } from './channels/wecom/index.js';
 import { installWecomStyles } from './channels/wecom/styles.js';
+import { WECOM_APP_RPC_CHANNEL } from './channels/wecom-app/api.js';
+import { WecomAppSettingsTab } from './channels/wecom-app/index.js';
+import { installWecomAppStyles } from './channels/wecom-app/styles.js';
 import { WeixinSettingsTab } from './channels/weixin/index.js';
 import { WEIXIN_RPC_CHANNEL } from './channels/weixin/api.js';
 import { installWeixinStyles } from './channels/weixin/styles.js';
 import { WHATSAPP_RPC_CHANNEL } from './channels/whatsapp/api.js';
 import { WhatsappSettingsTab } from './channels/whatsapp/index.js';
 import { installWhatsappStyles } from './channels/whatsapp/styles.js';
+import { IMESSAGE_RPC_CHANNEL } from './channels/imessage/api.js';
+import { IMessageSettingsTab } from './channels/imessage/index.js';
+import { installIMessageStyles } from './channels/imessage/styles.js';
 import { en, h, IM_LOCALE_NAMESPACE, setImTranslator, zh } from './i18n.js';
 import { BotSettingsContext } from './channel-card-meta.js';
 import {
@@ -49,10 +57,17 @@ import {
   DeliveryTargetSettingsPage,
 } from './delivery-settings.js';
 import {
+  GLOBAL_SETTINGS_RPC_CHANNEL,
+  GLOBAL_SETTINGS_TAB_ID,
+  GlobalSettingsLogoGlyph,
+  GlobalSettingsPanel,
+} from './global-settings.js';
+import {
   createLoopbackAwareRpcCalls,
   replacePageLocation,
 } from './loopback-recovery.js';
 import { installImStyles } from './styles.js';
+import { installSessionChannelLogos } from './session-channel-logos.js';
 import { UpdatePanel, UPDATE_RPC_CHANNEL } from './update-panel.js';
 import { WorkspaceDirectoryPickerContext } from './workspace-editor.js';
 
@@ -80,6 +95,8 @@ const CHANNELS = Object.freeze([
   { id: 'telegram', label: 'Telegram' },
   { id: 'discord', label: 'Discord' },
   { id: 'whatsapp', label: 'WhatsApp' },
+  { id: 'wecomApp', label: '企业微信应用', note: '（实验功能）' },
+  { id: 'imessage', label: 'iMessage', note: '（实验功能）' },
   { id: 'office', label: 'AI Office', note: '（实验功能）' },
 ]);
 
@@ -106,6 +123,10 @@ function WecomLogo() {
   return h('span', { className: 'dim-logo dim-logoWecom', 'aria-hidden': 'true' }, h(WecomLogoGlyph));
 }
 
+function WecomAppLogo() {
+  return h('span', { className: 'dim-logo dim-logoWecomApp', 'aria-hidden': 'true' }, h(WecomLogoGlyph));
+}
+
 function TelegramLogo() {
   return h('span', { className: 'dim-logo dim-logoTelegram', 'aria-hidden': 'true' },
     h(TelegramLogoGlyph));
@@ -126,6 +147,11 @@ function WhatsappLogo() {
     h(WhatsappLogoGlyph));
 }
 
+function IMessageLogo() {
+  return h('span', { className: 'dim-logo dim-logoIMessage', 'aria-hidden': 'true' },
+    h(IMessageLogoGlyph));
+}
+
 function OfficeLogo() {
   return h('span', { className: 'dim-logo dim-logoOffice', 'aria-hidden': 'true' },
     h(OfficeLogoGlyph));
@@ -136,11 +162,13 @@ function ChannelLogo({ channel }) {
   if (channel === 'feishu') return h(FeishuLogo);
   if (channel === 'dingtalk') return h(DingtalkLogo);
   if (channel === 'wecom') return h(WecomLogo);
+  if (channel === 'wecomApp') return h(WecomAppLogo);
   if (channel === 'qq') return h(QqLogo);
   if (channel === 'slack') return h(SlackLogo);
   if (channel === 'telegram') return h(TelegramLogo);
   if (channel === 'discord') return h(DiscordLogo);
   if (channel === 'whatsapp') return h(WhatsappLogo);
+  if (channel === 'imessage') return h(IMessageLogo);
   return h(OfficeLogo);
 }
 
@@ -164,15 +192,18 @@ export function IMSettingsTab({
   dingtalkRpcCall,
   discordRpcCall,
   feishuRpcCall,
+  imessageRpcCall,
   qqRpcCall,
   slackRpcCall,
   telegramRpcCall,
   wecomRpcCall,
+  wecomAppRpcCall,
   weixinRpcCall,
   whatsappRpcCall,
   officeRpcCall,
   updateRpcCall,
   deliveryRpcCall,
+  globalSettingsRpcCall,
   workspaceDirectoryPicker,
   browserLocation = globalThis.location,
   navigateToRecoveryUrl = replacePageLocation,
@@ -182,7 +213,15 @@ export function IMSettingsTab({
   const [runningVersion, setRunningVersion] = React.useState(IM_PLUGIN_VERSION);
   const [deliverySettings, setDeliverySettings] = React.useState(null);
   const githubTooltipId = React.useId();
+  const generalSettingsTooltipId = React.useId();
+  const globalSettingsSelected = selected === GLOBAL_SETTINGS_TAB_ID;
   const active = CHANNELS.find((channel) => channel.id === selected) ?? CHANNELS[0];
+  const activeTabId = globalSettingsSelected
+    ? 'dim-general-settings-trigger'
+    : `dim-tab-${active.id}`;
+  const activePanelId = globalSettingsSelected
+    ? `dim-panel-${GLOBAL_SETTINGS_TAB_ID}`
+    : `dim-panel-${active.id}`;
   const reportLoopbackRecovery = React.useCallback((recovery) => {
     setLoopbackRecovery((current) => current?.url === recovery.url ? current : recovery);
   }, []);
@@ -197,11 +236,14 @@ export function IMSettingsTab({
     slackRpcCall,
     telegramRpcCall,
     wecomRpcCall,
+    wecomAppRpcCall,
     weixinRpcCall,
     whatsappRpcCall,
     officeRpcCall,
     updateRpcCall,
     deliveryRpcCall,
+    globalSettingsRpcCall,
+    imessageRpcCall,
   }, {
     location: browserLocation,
     onRecovery: reportLoopbackRecovery,
@@ -211,6 +253,8 @@ export function IMSettingsTab({
     discordRpcCall,
     deliveryRpcCall,
     feishuRpcCall,
+    globalSettingsRpcCall,
+    imessageRpcCall,
     officeRpcCall,
     qqRpcCall,
     reportLoopbackRecovery,
@@ -218,6 +262,7 @@ export function IMSettingsTab({
     telegramRpcCall,
     updateRpcCall,
     wecomRpcCall,
+    wecomAppRpcCall,
     weixinRpcCall,
     whatsappRpcCall,
   ]);
@@ -253,17 +298,36 @@ export function IMSettingsTab({
           id: githubTooltipId,
           className: 'dim-githubTooltip',
           role: 'tooltip',
-        }, '帮助与反馈 · 前往 GitHub'))),
+        }, '帮助与反馈 · 前往 GitHub')),
+      h('span', { className: 'dim-generalSettingsAction' },
+        h('button', {
+          type: 'button',
+          id: 'dim-general-settings-trigger',
+          className: 'dim-generalSettingsButton',
+          'aria-label': '通用设置',
+          'aria-describedby': generalSettingsTooltipId,
+          'aria-controls': `dim-panel-${GLOBAL_SETTINGS_TAB_ID}`,
+          'aria-current': globalSettingsSelected ? 'page' : undefined,
+          onClick: () => {
+            setSelected(GLOBAL_SETTINGS_TAB_ID);
+            setDeliverySettings(null);
+          },
+        }, h(GlobalSettingsLogoGlyph, { size: 17 })),
+        h('span', {
+          id: generalSettingsTooltipId,
+          className: 'dim-generalSettingsTooltip',
+          role: 'tooltip',
+        }, '通用设置'))),
     ),
     h('div', { className: 'dim-layout' },
-      h('nav', { className: 'dim-rail', role: 'tablist', 'aria-label': 'IM 渠道' },
+      h('nav', { className: 'dim-rail', role: 'tablist', 'aria-label': 'IM 设置导航' },
         CHANNELS.map((channel) => h('button', {
           key: channel.id,
           type: 'button',
           role: 'tab',
           id: `dim-tab-${channel.id}`,
           className: 'dim-channel',
-          'aria-selected': channel.id === active.id,
+          'aria-selected': !globalSettingsSelected && channel.id === active.id,
           'aria-controls': `dim-panel-${channel.id}`,
           onClick: () => {
             setSelected(channel.id);
@@ -279,8 +343,8 @@ export function IMSettingsTab({
       h('main', {
         className: 'dim-panel',
         role: 'tabpanel',
-        id: `dim-panel-${active.id}`,
-        'aria-labelledby': `dim-tab-${active.id}`,
+        id: activePanelId,
+        'aria-labelledby': activeTabId,
       },
       loopbackRecovery
         ? h(LoopbackRecoveryNotice, {
@@ -289,7 +353,9 @@ export function IMSettingsTab({
           })
         : null,
       h(BotSettingsContext.Provider, { value: botSettingsContext },
-        deliverySettings?.channel === active.id
+        globalSettingsSelected
+          ? h(GlobalSettingsPanel, { rpcCall: rpcCalls.globalSettingsRpcCall })
+          : deliverySettings?.channel === active.id
           ? h(DeliveryTargetSettingsPage, {
               channel: active.id,
               account: deliverySettings,
@@ -305,6 +371,8 @@ export function IMSettingsTab({
                 ? h(DingtalkSettingsTab, { rpcCall: rpcCalls.dingtalkRpcCall })
                 : active.id === 'wecom'
                   ? h(WecomSettingsTab, { rpcCall: rpcCalls.wecomRpcCall })
+                : active.id === 'wecomApp'
+                  ? h(WecomAppSettingsTab, { rpcCall: rpcCalls.wecomAppRpcCall })
                   : active.id === 'qq'
                     ? h(QqSettingsTab, { rpcCall: rpcCalls.qqRpcCall })
                     : active.id === 'slack'
@@ -315,6 +383,8 @@ export function IMSettingsTab({
                         ? h(DiscordSettingsTab, { rpcCall: rpcCalls.discordRpcCall })
                         : active.id === 'whatsapp'
                           ? h(WhatsappSettingsTab, { rpcCall: rpcCalls.whatsappRpcCall })
+                          : active.id === 'imessage'
+                            ? h(IMessageSettingsTab, { rpcCall: rpcCalls.imessageRpcCall })
                           : h(OfficeSettingsTab, { rpcCall: rpcCalls.officeRpcCall }))),
     ),
   ));
@@ -328,16 +398,20 @@ export function apply(ctx) {
   const t = ctx.locale.bind(IM_LOCALE_NAMESPACE);
   setImTranslator(t);
 
+  ctx.effect(() => installSessionChannelLogos(), 'im-settings: Session channel logos');
+
   ctx.effect(() => {
     const disposers = [
       installFeishuStyles(),
       installWeixinStyles(),
       installWecomStyles(),
+      installWecomAppStyles(),
       installQqStyles(),
       installSlackStyles(),
       installTelegramStyles(),
       installDiscordStyles(),
       installWhatsappStyles(),
+      installIMessageStyles(),
       installOfficeStyles(),
       installImStyles(),
     ];
@@ -347,29 +421,35 @@ export function apply(ctx) {
   }, 'im-settings: install combined channel styles');
 
   const feishuRpcCall = (endpoint, payload, signal) =>
-    ctx.connection.rpc.call(FEISHU_RPC_CHANNEL, endpoint, payload, signal);
+    callManagementRpc(ctx.connection, FEISHU_RPC_CHANNEL, endpoint, payload, signal);
   const weixinRpcCall = (endpoint, payload, signal) =>
-    ctx.connection.rpc.call(WEIXIN_RPC_CHANNEL, endpoint, payload, signal);
+    callManagementRpc(ctx.connection, WEIXIN_RPC_CHANNEL, endpoint, payload, signal);
   const dingtalkRpcCall = (endpoint, payload, signal) =>
-    ctx.connection.rpc.call(DINGTALK_RPC_CHANNEL, endpoint, payload, signal);
+    callManagementRpc(ctx.connection, DINGTALK_RPC_CHANNEL, endpoint, payload, signal);
   const qqRpcCall = (endpoint, payload, signal) =>
-    ctx.connection.rpc.call(QQ_RPC_CHANNEL, endpoint, payload, signal);
+    callManagementRpc(ctx.connection, QQ_RPC_CHANNEL, endpoint, payload, signal);
   const wecomRpcCall = (endpoint, payload, signal) =>
-    ctx.connection.rpc.call(WECOM_RPC_CHANNEL, endpoint, payload, signal);
+    callManagementRpc(ctx.connection, WECOM_RPC_CHANNEL, endpoint, payload, signal);
+  const wecomAppRpcCall = (endpoint, payload, signal) =>
+    callManagementRpc(ctx.connection, WECOM_APP_RPC_CHANNEL, endpoint, payload, signal);
   const telegramRpcCall = (endpoint, payload, signal) =>
-    ctx.connection.rpc.call(TELEGRAM_RPC_CHANNEL, endpoint, payload, signal);
+    callManagementRpc(ctx.connection, TELEGRAM_RPC_CHANNEL, endpoint, payload, signal);
   const discordRpcCall = (endpoint, payload, signal) =>
-    ctx.connection.rpc.call(DISCORD_RPC_CHANNEL, endpoint, payload, signal);
+    callManagementRpc(ctx.connection, DISCORD_RPC_CHANNEL, endpoint, payload, signal);
   const whatsappRpcCall = (endpoint, payload, signal) =>
-    ctx.connection.rpc.call(WHATSAPP_RPC_CHANNEL, endpoint, payload, signal);
+    callManagementRpc(ctx.connection, WHATSAPP_RPC_CHANNEL, endpoint, payload, signal);
+  const imessageRpcCall = (endpoint, payload, signal) =>
+    callManagementRpc(ctx.connection, IMESSAGE_RPC_CHANNEL, endpoint, payload, signal);
   const slackRpcCall = (endpoint, payload, signal) =>
-    ctx.connection.rpc.call(SLACK_RPC_CHANNEL, endpoint, payload, signal);
+    callManagementRpc(ctx.connection, SLACK_RPC_CHANNEL, endpoint, payload, signal);
   const officeRpcCall = (endpoint, payload, signal) =>
-    ctx.connection.rpc.call(OFFICE_RPC_CHANNEL, endpoint, payload, signal);
+    callManagementRpc(ctx.connection, OFFICE_RPC_CHANNEL, endpoint, payload, signal);
   const updateRpcCall = (endpoint, payload, signal) =>
-    ctx.connection.rpc.call(UPDATE_RPC_CHANNEL, endpoint, payload, signal);
+    callManagementRpc(ctx.connection, UPDATE_RPC_CHANNEL, endpoint, payload, signal);
   const deliveryRpcCall = (endpoint, payload, signal) =>
-    ctx.connection.rpc.call(DELIVERY_RPC_CHANNEL, endpoint, payload, signal);
+    callManagementRpc(ctx.connection, DELIVERY_RPC_CHANNEL, endpoint, payload, signal);
+  const globalSettingsRpcCall = (endpoint, payload, signal) =>
+    callManagementRpc(ctx.connection, GLOBAL_SETTINGS_RPC_CHANNEL, endpoint, payload, signal);
   const workspaceDirectoryPicker = Object.freeze({
     listDirectory: (path, signal) =>
       callWorkspaceDirectoryApi(ctx, 'listDirectory', path, signal),
@@ -390,11 +470,14 @@ export function apply(ctx) {
       slackRpcCall,
       telegramRpcCall,
       wecomRpcCall,
+      wecomAppRpcCall,
       weixinRpcCall,
       whatsappRpcCall,
+      imessageRpcCall,
       officeRpcCall,
       updateRpcCall,
       deliveryRpcCall,
+      globalSettingsRpcCall,
       workspaceDirectoryPicker,
     }),
   }, IMSettingsTab));

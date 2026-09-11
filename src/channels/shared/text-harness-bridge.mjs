@@ -1,4 +1,6 @@
+import { createDeferredDeliveryCoordinator, deferredOutcomeText } from './deferred-delivery-coordinator.mjs';
 import { t } from './i18n.mjs';
+import { commandHelpLines } from './command-catalog.mjs';
 import {
   COMMAND_PERMISSION_DENIED_MESSAGE,
   evaluateInboundAccess,
@@ -135,12 +137,14 @@ export class TextHarnessBridge {
   #bot;
   #harness;
   #state;
+  #deferred;
   #contextEnhancement;
   #accessPolicy;
   #status;
   #logger;
   #replyTimeoutMs;
   #signal;
+  #keepaliveIntervalMs;
   #sourceChannelLabel;
   #queues = new Map();
   #pendingInteractions = new Map();
@@ -164,6 +168,7 @@ export class TextHarnessBridge {
     replyTimeoutMs = 600_000,
     sourceChannelLabel,
     signal,
+    keepaliveIntervalMs = 4_000,
   }) {
     if (!descriptor?.key || !descriptor?.label) throw new TypeError('A channel descriptor is required');
     if (!bot || typeof bot.sendText !== 'function') throw new TypeError('A bot client is required');
@@ -178,6 +183,10 @@ export class TextHarnessBridge {
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#signal = signal;
+    this.#keepaliveIntervalMs = keepaliveIntervalMs;
+    this.#deferred = createDeferredDeliveryCoordinator({ harness, state, signal, logger,
+      deliver: (entry, outcome) => this.#deliverDeferredOutcome(entry, outcome),
+    });
     this.#sourceChannelLabel = sourceChannelLabel;
     this.#approvals = new HarnessApprovalQueue({
       label: descriptor.key,
@@ -452,6 +461,13 @@ export class TextHarnessBridge {
     return current;
   }
 
+  async #deliverDeferredOutcome(entry, outcome) {
+    const text = deferredOutcomeText(outcome);
+    return typeof this.#bot.sendDelivery === 'function'
+      ? this.#bot.sendDelivery(entry.target, createTextDeliveryBlock(text, outcome.found ? 'markdown' : 'plain'))
+      : this.#bot.sendText(entry.target, text);
+  }
+
   async waitForIdle() {
     await Promise.allSettled([
       ...this.#queues.values(),
@@ -461,6 +477,7 @@ export class TextHarnessBridge {
       ...this.#approvalTasks,
       ...this.#commandTasks,
     ]);
+    await this.#deferred.whenIdle();
   }
 
   async #processFastCommand(message, messageId, key, runner) {
@@ -483,6 +500,7 @@ export class TextHarnessBridge {
           pendingInteraction: this.#pendingInteractions.has(key)
             || this.#approvals.hasPending(key),
           control: { owner: this, key },
+          deferredDelivery: this.#deferred,
         },
       );
       if (result?.stopped) {
@@ -574,6 +592,15 @@ export class TextHarnessBridge {
     const batchSubmission = message.batchSubmission;
     let stream = null;
     let semanticStream = false;
+    // A keepalive heartbeat keeps short-lived carriers (e.g. Telegram's
+    // private-chat Rich Draft) visible during long silent stretches such as a
+    // running tool call. Declared outside the try so every exit path (including
+    // pre-prompt failures like image parsing) clears the timer.
+    let keepaliveTimer = null;
+    const stopKeepalive = () => {
+      if (keepaliveTimer !== null) clearInterval(keepaliveTimer);
+      keepaliveTimer = null;
+    };
     try {
       this.#signal?.throwIfAborted();
       if (message.kind === 'group' && message.addressed !== true) {
@@ -594,32 +621,7 @@ export class TextHarnessBridge {
           t('{label}机器人已连接 DeepSeek Harness。', { label: this.#descriptor.label }),
           '',
           t('直接发送文字、图片或文件即可继续当前会话。'),
-          t('/new  开启一个全新会话'),
-          t('/compact  压缩当前会话的较早上下文'),
-          t('/history [数量]  查看最近历史消息（默认 3 条，最多 5 条）'),
-          t('/workspace 工作区序号或绝对路径  切换工作区'),
-          t('/workspacelist  列出工作区绝对路径'),
-          t('/ws、/wsl、/workspaces  工作区命令别名'),
-          t('/sessionlist 或 /sessions [工作区序号或绝对路径]  列出会话 ID 和标题'),
-          t('/sessionlist --limit N  仅列出当前工作区前 N 个会话'),
-          t('/session Session ID 或当前工作区序号  将当前聊天绑定到指定会话'),
-          t('/models  按序号列出所有可用模型'),
-          t('/reasoninglist 或 /reasonings  按序号列出当前模型可用推理等级'),
-          t('/reasoning [序号、等级ID或 --default]  查看或切换当前推理等级'),
-          t('/model [序号或完整模型ID] [推理等级ID]  查看或切换当前会话模型'),
-          t('示例：先发 /models，再发 /model 2 [推理等级ID]'),
-          t('/presetlist 或 /presets  按序号列出可用 Agent Preset'),
-          t('/preset [序号或完整ID]  查看或设置当前机器人 Agent Preset'),
-          t('纯数字 ID：/preset id:<ID>'),
-          t('/preset --default  跟随 Host 默认'),
-          t('/stop  停止当前任务'),
-          t('/steer 补充指令  纠偏当前任务'),
-          t('/batch  开始批量输入（仅私聊，最多 10 条文字）'),
-          t('/send  提交当前批次'),
-          t('/cancel  取消当前批次'),
-          t('/status  检查连接状态'),
-          t('/version  查看插件版本'),
-          t('/help  显示本帮助'),
+          ...commandHelpLines(this.#descriptor.key),
         ].join('\n'));
         return;
       }
@@ -698,7 +700,31 @@ export class TextHarnessBridge {
         }));
         contextEnhanced = content !== originalContent;
       }
+      // Start the keepalive only after the inbound payload is ready, so a
+      // pre-prompt failure (image parsing, context building) cannot leave the
+      // timer running; the outermost finally below clears it on every path.
+      if (stream && stream.keepalive === true && typeof stream.refresh === 'function') {
+        let refreshing = false;
+        keepaliveTimer = setInterval(async () => {
+          // Skip ticks while the previous heartbeat is pending so redundant
+          // refreshes cannot queue ahead of the final answer on a slow network.
+          if (refreshing) return;
+          refreshing = true;
+          try {
+            await Promise.allSettled([
+              this.#bot.sendTyping?.(target),
+              stream.refresh(),
+            ]);
+          } catch {
+            // Keepalive is best-effort, including synchronous adapter failures.
+          } finally {
+            refreshing = false;
+          }
+        }, this.#keepaliveIntervalMs);
+        keepaliveTimer.unref?.();
+      }
       const { answer, artifacts = [] } = await askInWorkspaceSession({
+        deferredDelivery: () => ({ coordinator: this.#deferred, target: this.#descriptor.key === 'whatsapp' ? { jid: target.jid, selfChat: target.selfChat } : target }),
         harness: this.#harness,
         state: this.#state,
         key: conversationKey,
@@ -734,6 +760,7 @@ export class TextHarnessBridge {
           files: message.files,
         },
       });
+      stopKeepalive();
       if (batchSubmission) {
         this.#batches.complete(conversationKey, batchSubmission.token);
       }
@@ -820,6 +847,7 @@ export class TextHarnessBridge {
       }
       return delivery.receipt;
     } catch (error) {
+      stopKeepalive();
       const turnStopped = error?.code === 'turn-stopped';
       if (batchSubmission && turnStopped) {
         this.#batches.complete(conversationKey, batchSubmission.token);
@@ -890,6 +918,7 @@ export class TextHarnessBridge {
       }
       return error.deliveryReceipt;
     } finally {
+      stopKeepalive();
       await Promise.allSettled([
         this.#cancelPendingInteraction(conversationKey),
         this.#approvals.closeRoute(conversationKey),
