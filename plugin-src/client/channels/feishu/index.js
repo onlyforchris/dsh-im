@@ -1,3 +1,4 @@
+import { BotName } from '../../bot-alias.js';
 import * as React from "react";
 
 import { FeishuLogoGlyph } from "../../channel-logos.js";
@@ -560,6 +561,7 @@ export function BotCard({
   onReconnect,
   onRepairCallback,
   onWorkspaceSave,
+  onAliasSave,
   onModelSave,
   onAgentPresetSave,
   onContextEnhancementSave,
@@ -600,7 +602,7 @@ export function BotCard({
             h("div", { className: "bxf-avatar dim-botAvatar", "aria-hidden": "true" },
               h(FeishuLogoGlyph, { size: 34 })),
             h("div", { className: "bxf-botName dim-botName" },
-              h("h3", { id: titleId, title: bot.name }, bot.name),
+              h(BotName, { bot, id: titleId, disabled: Boolean(busy), onSave: onAliasSave }),
               h("p", { title: bot.appIdMasked }, bot.appIdMasked ?? "应用标识已安全保存")),
           ),
           h("div", {
@@ -747,6 +749,7 @@ function BotList(props) {
           onReconnect: () => props.onReconnect(bot),
           onRepairCallback: () => props.onRepairCallback(bot),
           onWorkspaceSave: (workspace) => props.onWorkspaceSave(bot, workspace),
+          onAliasSave: (alias) => props.onAliasSave(bot, alias),
           onModelSave: (model) => props.onModelSave(bot, model),
           onAgentPresetSave: (agentPreset) => props.onAgentPresetSave(bot, agentPreset),
           onContextEnhancementSave: (config) => props.onContextEnhancementSave(bot, config),
@@ -823,6 +826,7 @@ export function FeishuSettingsTab({ rpcCall }) {
   const [pageBusy, setPageBusy] = React.useState(false);
   const [provisionBusy, setProvisionBusy] = React.useState(false);
   const [credentialOpen, setCredentialOpen] = React.useState(false);
+  const [credentialDomain, setCredentialDomain] = React.useState("feishu");
   const [credentialBusy, setCredentialBusy] = React.useState(false);
   const [credentialError, setCredentialError] = React.useState(null);
   const [busyByBot, setBusyByBot] = React.useState({});
@@ -1038,13 +1042,13 @@ export function FeishuSettingsTab({ rpcCall }) {
     try {
       const snapshot = normalizeBotsSnapshot(await invoke(
         FEISHU_ENDPOINTS.bindCredentials,
-        { appId: identity, appSecret: secret },
+        { appId: identity, appSecret: secret, domain: credentialDomain },
       ));
       if (mountedRef.current && workspaceFence.canCommitMutation(snapshotVersion)) {
         mergeSnapshot(snapshot);
       }
       setCredentialOpen(false);
-      announce("飞书机器人凭据已绑定。");
+      announce(credentialDomain === "lark" ? "Lark 机器人凭据已绑定。" : "飞书机器人凭据已绑定。");
     } catch (error) {
       setCredentialError(presentError(error));
     } finally {
@@ -1052,7 +1056,7 @@ export function FeishuSettingsTab({ rpcCall }) {
       if (shouldRefresh && mountedRef.current) void loadStatus({ silent: true });
       setCredentialBusy(false);
     }
-  }, [announce, invoke, loadStatus, mergeSnapshot, workspaceFence]);
+  }, [announce, credentialDomain, invoke, loadStatus, mergeSnapshot, workspaceFence]);
 
   const cancelProvisioning = React.useCallback(async () => {
     const activeProvision = model.provisioning;
@@ -1446,16 +1450,30 @@ export function FeishuSettingsTab({ rpcCall }) {
 
   const credentialContent = credentialOpen
     ? h(CredentialBindingPanel, {
-        channel: "飞书",
+        key: credentialDomain,
+        channel: credentialDomain === "lark" ? "Lark" : "飞书",
         identityLabel: "App ID",
-        identityPlaceholder: "填写飞书开放平台 App ID",
+        identityPlaceholder: credentialDomain === "lark" ? "填写 Lark 开放平台 App ID" : "填写飞书开放平台 App ID",
         secretLabel: "App Secret",
-        secretPlaceholder: "填写飞书开放平台 App Secret",
+        secretPlaceholder: credentialDomain === "lark" ? "填写 Lark 开放平台 App Secret" : "填写飞书开放平台 App Secret",
         busy: credentialBusy,
         error: credentialError,
         onSubmit: bindCredentials,
         onCancel: () => { setCredentialOpen(false); setCredentialError(null); },
-      })
+      }, h("label", { className: "dim-credentialField" },
+        h("span", null, "应用平台"),
+        h("select", {
+          className: "dim-feishuGroupSelect",
+          "aria-label": "应用平台",
+          value: credentialDomain,
+          disabled: credentialBusy,
+          onChange: (event) => {
+            setCredentialDomain(event.target.value);
+            setCredentialError(null);
+          },
+        },
+        h("option", { value: "feishu" }, "飞书"),
+        h("option", { value: "lark" }, "Lark（国际版）"))))
     : null;
 
   const setCardRef = React.useCallback((botId, node) => {
@@ -1517,6 +1535,9 @@ export function FeishuSettingsTab({ rpcCall }) {
                   onReconnect: (bot) => void reconnectOneBot(bot),
                   onRepairCallback: repairCallback,
                   onWorkspaceSave: saveWorkspace,
+                  onAliasSave: (connection, alias) => saveBotSetting(
+                    connection, 'alias', FEISHU_ENDPOINTS.setAlias, { alias },
+                  ),
                   onModelSave: (connection, selectedModel) => saveBotSetting(
                     connection, "model", FEISHU_ENDPOINTS.setModel, { model: selectedModel },
                   ),

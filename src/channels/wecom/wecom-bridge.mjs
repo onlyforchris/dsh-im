@@ -33,7 +33,11 @@ import {
 } from '../shared/preset-command.mjs';
 import { runWorkspaceCommand, workspacePathSnapshot } from '../shared/workspace-command.mjs';
 import { askInWorkspaceSession } from '../shared/workspace-session.mjs';
-import { captureContextEnhancement, enhanceContextContent } from '../shared/context-enhancement.mjs';
+import {
+  captureContextEnhancement,
+  captureContextEnhancementSource,
+  enhanceContextContent,
+} from '../shared/context-enhancement.mjs';
 import {
   hasInboundImages,
   ImagePromptError,
@@ -611,27 +615,17 @@ export class WecomHarnessBridge {
     return structuredClone(this.#status);
   }
 
-  #mainMenu() {
-    return wecomMenu({
-      workspace: this.#harness.currentWorkspace?.(),
-      workspaces: [[t('更多选项…'), '/menu workspaces']],
-    });
-  }
-
-  async #showMain(frame, { welcome = false } = {}) {
+  async #showMain(frame) {
     const previousFailure = this.#status.lastMessageError;
     const key = conversationKey(frame);
     const workspace = this.#harness.currentWorkspace?.();
     const sessionId = this.#state.sessionFor(key);
-    // The welcome reply has a five-second deadline. Show immediate controls,
-    // then load the selectors independently of that reply window.
-    if (welcome) await this.#sendMenu(frame, this.#mainMenu(), { welcome: true });
     const options = { signal: this.#signal };
     const settled = await Promise.allSettled([
       workspacePathSnapshot(this.#harness, options),
       this.#harness.listWorkspaceSessions?.(workspace, options),
       (async () => {
-        const session = sessionId ? this.#harness.workspaceSession?.(sessionId) : null;
+        const session = sessionId ? this.#harness.workspaceSession?.(sessionId, key) : null;
         return typeof session?.models === 'function'
           ? session.models(options) : this.#harness.listModels?.(options);
       })(),
@@ -653,12 +647,10 @@ export class WecomHarnessBridge {
       currentPreset: currentPreset ? `/preset ${/^\d+$/u.test(currentPreset) ? 'id:' : ''}${currentPreset}` : '/preset --default',
       presetLabel: settings?.agentPresetCatalog?.items.find((item) => item.id === currentPreset)?.label,
     });
-    await this.#sendMenu(frame, settingsMenu, { active: welcome });
-    if (!welcome) {
-      await this.#sendMenu(frame, wecomMenu({ workspace,
-        workspaces: (paths?.paths ?? (workspace ? [workspace] : [])).map((path) => [path, `/workspace ${path}`]),
-      }), { active: true });
-    }
+    await this.#sendMenu(frame, settingsMenu);
+    await this.#sendMenu(frame, wecomMenu({ workspace,
+      workspaces: (paths?.paths ?? (workspace ? [workspace] : [])).map((path) => [path, `/workspace ${path}`]),
+    }), { active: true });
     this.#clearMenuFailure(previousFailure);
   }
 
@@ -685,17 +677,14 @@ export class WecomHarnessBridge {
     return wecomTemplateCard(menu, taskId);
   }
 
-  async #sendMenu(frame, menu, { welcome = false, active = false } = {}) {
+  async #sendMenu(frame, menu, { active = false } = {}) {
     this.#signal?.throwIfAborted();
     const body = bodyOf(frame);
     const chatId = body.chattype === 'group' ? body.chatid : body.from.userid;
     const card = this.#rememberMenu(frame, menu);
-    const operation = welcome ? 'replyWelcome'
-      : active || this.#cardFrames.has(frame) ? 'sendMessage' : 'replyTemplateCard';
+    const operation = active || this.#cardFrames.has(frame) ? 'sendMessage' : 'replyTemplateCard';
     try {
-      if (welcome) {
-        await this.#client.replyWelcome(frame, { msgtype: 'template_card', template_card: card });
-      } else if (active || this.#cardFrames.has(frame)) {
+      if (active || this.#cardFrames.has(frame)) {
         await this.#client.sendMessage(chatId, { msgtype: 'template_card', template_card: card });
       } else {
         await this.#client.replyTemplateCard(frame, card);
@@ -707,16 +696,7 @@ export class WecomHarnessBridge {
       // Only a definite card rejection can safely fall back to text.
       if (error.code !== 'channel-delivery-failed' || error.providerCode === undefined) throw error;
       this.#logger.warn?.('[dsh-im:wecom] menu delivery failed; using text:', wecomSendDiagnostic(error));
-      if (welcome) {
-        const content = wecomMenuText(menu);
-        try {
-          await this.#client.replyWelcome(frame, { msgtype: 'text', text: { content } });
-        } catch (cause) {
-          throw wecomSendError(cause, 'replyWelcome');
-        }
-      } else {
-        await this.#sendImmediate(frame, chatId, wecomMenuText(menu));
-      }
+      await this.#sendImmediate(frame, chatId, wecomMenuText(menu));
     }
   }
 
@@ -747,7 +727,7 @@ export class WecomHarnessBridge {
     const body = bodyOf(frame);
     const senderId = nonEmptyString(body.from?.userid);
     const type = body.event?.eventtype;
-    if (!senderId || !['enter_chat', 'template_card_event'].includes(type)) return;
+    if (!senderId || type !== 'template_card_event') return;
     const chattype = body.chattype ?? (body.chatid ? 'group' : 'single');
     if (!['single', 'group'].includes(chattype) || (chattype === 'group' && !body.chatid)) return;
     const normalized = { ...frame, body: { ...body, chattype } };
@@ -756,17 +736,13 @@ export class WecomHarnessBridge {
       conversationType: chattype === 'single' ? 'direct' : 'group', senderIds: senderId, isCommand: true,
     });
     if (!access.allowed) {
-      if (type === 'template_card_event' && access.reason === 'command-not-allowed') {
+      if (access.reason === 'command-not-allowed') {
         await this.#sendActive(chatId, t(COMMAND_PERMISSION_DENIED_MESSAGE));
       }
       return;
     }
     await this.#state.markSeen(body.msgid);
     const key = conversationKey(normalized);
-    if (type === 'enter_chat') {
-      if (chattype === 'single') await this.#showMain(normalized, { welcome: true });
-      return;
-    }
     // Live callbacks nest these fields; older SDK examples show them flat.
     const callback = body.event.template_card_event ?? body.event;
     const entry = this.#menus.get(callback.task_id);
@@ -810,7 +786,7 @@ export class WecomHarnessBridge {
     const navigation = commands.find((command) => parseWecomMenu(command));
     if (navigation) commands = [navigation];
     if (!navigation && entry.workspace !== this.#harness.currentWorkspace?.()) {
-      await this.#sendActive(chatId, t('工作区已变化，请从新菜单重新选择。'));
+      await this.#sendActive(chatId, t('工作区已变化，请发送 /m 重新打开菜单后选择。'));
     } else {
       for (const [index, command] of commands.entries()) {
         const commandFrame = { ...normalized, body: { ...normalized.body,
@@ -820,10 +796,6 @@ export class WecomHarnessBridge {
         await this.accept(commandFrame);
       }
       if (!commands.length) await this.#sendActive(chatId, t('设置未改变。'));
-    }
-    if (!navigation) {
-      this.#cardFrames.add(normalized);
-      await this.#showMain(normalized);
     }
   }
 
@@ -855,7 +827,7 @@ export class WecomHarnessBridge {
         } else if (menu.section === 'models') {
           title = t('🧠 切换模型');
           const sessionId = this.#state.sessionFor(key);
-          const session = sessionId ? this.#harness.workspaceSession?.(sessionId) : null;
+          const session = sessionId ? this.#harness.workspaceSession?.(sessionId, key) : null;
           const catalog = typeof session?.models === 'function'
             ? await session.models(options) : await this.#harness.listModels(options);
           entries = catalog.groups.flatMap((group) => group.models.map((model) => [
@@ -963,6 +935,9 @@ export class WecomHarnessBridge {
               ...body,
               msgtype: 'text',
               text: { content: result.prompt },
+              // The submission is exactly the collected text, so a quote on the
+              // command itself must not become part of it.
+              quote: undefined,
             },
           }, messageId, key, { batchSubmission: result });
         }
@@ -1198,6 +1173,11 @@ export class WecomHarnessBridge {
         || this.#approvals.hasPending(key),
       control: { owner: this, key },
       deferredDelivery: this.#deferred,
+      enhancement: captureContextEnhancementSource(
+        this.#contextEnhancement,
+        bodyOf(frame).chattype === 'single' ? 'direct' : 'group',
+        () => ({ channel: 'wecom', senderId: bodyOf(frame).from?.userid, chatId }),
+      ),
     });
     if (result?.stopped) {
       await Promise.allSettled([
@@ -1404,6 +1384,8 @@ export class WecomHarnessBridge {
         channelLabel: this.#sourceChannelLabel,
         fromUserId: senderId,
         msgId: messageId,
+        titleText: batchSubmission?.title,
+        sourceGuidance: snapshot?.config?.guidance,
         contextEnhanced,
         createOptions: { signal: this.#signal },
         existsOptions: { signal: this.#signal },

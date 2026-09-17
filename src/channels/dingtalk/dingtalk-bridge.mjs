@@ -30,7 +30,11 @@ import {
 } from '../shared/preset-command.mjs';
 import { runWorkspaceCommand } from '../shared/workspace-command.mjs';
 import { askInWorkspaceSession } from '../shared/workspace-session.mjs';
-import { captureContextEnhancement, enhanceContextContent } from '../shared/context-enhancement.mjs';
+import {
+  captureContextEnhancement,
+  captureContextEnhancementSource,
+  enhanceContextContent,
+} from '../shared/context-enhancement.mjs';
 import {
   BatchInputManager,
   batchInputBusyMessage,
@@ -43,6 +47,7 @@ import {
   imagePromptUserMessage,
 } from '../shared/image-prompt.mjs';
 import {
+  InboundFileError,
   hasInboundFiles,
   inboundFileUserMessage,
   prefetchInboundFiles,
@@ -195,6 +200,13 @@ function downloadCodeFor(value) {
   return nonEmptyString(value?.downloadCode) ?? nonEmptyString(value?.pictureDownloadCode);
 }
 
+function dingtalkImageEntries(msgtype, content) {
+  if (msgtype === 'picture') return [content];
+  if (msgtype !== 'richtext') return [];
+  return richTextEntries(content)
+    .filter((entry) => String(entry?.type ?? '').toLowerCase() === 'picture');
+}
+
 function dingtalkTimestampMs(value) {
   const number = typeof value === 'string' && value.trim() ? Number(value) : value;
   if (!Number.isFinite(number) || number < 0) return null;
@@ -206,24 +218,36 @@ function usefulReplyText(value) {
   return text && !/^\[interactive card message\]$/iu.test(text) ? text : null;
 }
 
-function dingtalkReplyReference(message, options) {
-  const replyEnvelope = message?.text;
-  if (replyEnvelope?.isReplyMsg !== true) return null;
-  const replied = replyEnvelope?.repliedMsg;
-  if (!replied || typeof replied !== 'object') {
-    return { unavailableReason: 'not-delivered' };
-  }
-
+function dingtalkReplyMessage(message) {
+  if (message?.text?.isReplyMsg !== true) return null;
+  const replied = message.text.repliedMsg;
+  if (!replied || typeof replied !== 'object') return null;
   const msgtype = nonEmptyString(replied.msgType ?? replied.msgtype)?.toLowerCase() ?? '';
   const repliedContent = parsedMessageContent({ content: replied.content }) ?? {};
-  const pseudoMessage = {
+  // Quoted richText entries use msgType instead of the direct callback's type.
+  const content = msgtype === 'richtext' ? {
+    ...repliedContent,
+    richText: richTextEntries(repliedContent).map((entry) => ({
+      ...entry, type: entry?.type ?? entry?.msgType ?? entry?.msgtype,
+    })),
+  } : repliedContent;
+  return {
     msgtype,
+    robotCode: message.robotCode,
     text: {
       content: nonEmptyString(repliedContent.text)
         ?? (typeof replied.content === 'string' ? replied.content : ''),
     },
-    content: repliedContent,
+    content,
   };
+}
+
+function dingtalkReplyReference(message, options) {
+  if (message?.text?.isReplyMsg !== true) return null;
+  const pseudoMessage = dingtalkReplyMessage(message);
+  if (!pseudoMessage) return { unavailableReason: 'not-delivered' };
+  const replied = message.text.repliedMsg;
+  const { msgtype, content: repliedContent } = pseudoMessage;
   const normalized = dingtalkInboundMessage(pseudoMessage, options);
   let attachments = [];
   if (msgtype === 'picture') {
@@ -232,8 +256,7 @@ function dingtalkReplyReference(message, options) {
     const name = nonEmptyString(repliedContent.fileName ?? repliedContent.file_name);
     attachments = [{ kind: 'file', ...(name ? { name } : {}) }];
   } else if (msgtype === 'richtext') {
-    attachments = richTextEntries(repliedContent)
-      .filter((entry) => String(entry?.type ?? '').toLowerCase() === 'picture')
+    attachments = dingtalkImageEntries(msgtype, repliedContent)
       .map(() => ({ kind: 'image' }));
   } else if (msgtype === 'voice' || msgtype === 'audio') {
     attachments = [{ kind: 'audio' }];
@@ -278,6 +301,43 @@ function dingtalkReplyReference(message, options) {
   };
 }
 
+// Resolve only the immediate quote, after command/interaction routing has finished.
+function prepareDingtalkReplyAttachments(message, promptMessage, options) {
+  const quoted = dingtalkReplyMessage(message);
+  if (!quoted) return promptMessage;
+  if (['audio', 'voice', 'video'].includes(quoted.msgtype)) quoted.msgtype = 'file';
+  const imageCodes = dingtalkImageEntries(quoted.msgtype, quoted.content).map(downloadCodeFor);
+  const fileCodes = quoted.msgtype === 'file' ? [downloadCodeFor(quoted.content)] : [];
+  if ([...imageCodes, ...fileCodes].some((code) => !code)) {
+    throw new InboundFileError(
+      'dingtalk-quoted-attachment-unavailable',
+      'DingTalk did not deliver a download reference for the quoted attachment.',
+      t('钉钉未提供引用附件的下载信息，无法读取原附件。请直接重新发送附件后再提问。'),
+    );
+  }
+  if (imageCodes.length === 0 && fileCodes.length === 0) return promptMessage;
+  const currentType = String(message?.msgtype ?? '').toLowerCase();
+  const currentContent = parsedMessageContent(message);
+  const seen = new Set([
+    ...dingtalkImageEntries(currentType, currentContent).map(downloadCodeFor),
+    ...(currentType === 'file' ? [downloadCodeFor(currentContent)] : []),
+  ].filter(Boolean));
+  const take = (code) => {
+    if (seen.has(code)) return false;
+    seen.add(code);
+    return true;
+  };
+  const normalized = dingtalkInboundMessage(quoted, options);
+  const images = normalized.images.filter((_, index) => take(imageCodes[index]));
+  const files = normalized.files.filter((_, index) => take(fileCodes[index]));
+  const prefetched = prefetchInboundFiles({ files }, { signal: options.signal });
+  return {
+    ...promptMessage,
+    images: [...promptMessage.images, ...images],
+    files: [...promptMessage.files, ...prefetched.files],
+  };
+}
+
 /** Normalize DingTalk picture and richText callbacks into lazy image references. */
 export function dingtalkInboundMessage(message, {
   api,
@@ -291,17 +351,7 @@ export function dingtalkInboundMessage(message, {
   const text = msgtype === 'text'
     ? nonEmptyString(message?.text?.content) ?? ''
     : richEntries.map(richTextEntryText).filter(Boolean).join('\n');
-  const imageCodes = [];
-  if (msgtype === 'picture') {
-    const code = downloadCodeFor(content);
-    if (code) imageCodes.push(code);
-  } else if (msgtype === 'richtext') {
-    for (const entry of richEntries) {
-      if (String(entry?.type ?? '').toLowerCase() !== 'picture') continue;
-      const code = downloadCodeFor(entry);
-      if (code) imageCodes.push(code);
-    }
-  }
+  const imageCodes = dingtalkImageEntries(msgtype, content).map(downloadCodeFor).filter(Boolean);
   const fileCode = msgtype === 'file' ? downloadCodeFor(content) : null;
   const replyTo = dingtalkReplyReference(message, {
     api,
@@ -838,6 +888,17 @@ export class DingtalkHarnessBridge {
       signal: this.#signal, isDirect: String(message.conversationType) === '1',
       pendingInteraction: this.#pendingInteractions.has(key) || this.#approvals.hasPending(key),
       control: { owner: this, key }, deferredDelivery: this.#deferred,
+      enhancement: captureContextEnhancementSource(
+        this.#contextEnhancement,
+        String(message.conversationType) === '1' ? 'direct' : 'group',
+        () => ({
+          channel: 'dingtalk',
+          senderId: senderStaffId(message),
+          senderName: message.senderNick,
+          conversationTitle: message.conversationTitle,
+          chatId: message.conversationId,
+        }),
+      ),
     };
     const access = evaluateInboundAccess(this.#accessPolicy, {
       conversationType: options.isDirect ? 'direct' : 'group',
@@ -852,7 +913,10 @@ export class DingtalkHarnessBridge {
       });
       return;
     }
+    const sessionWorkspace = typeof this.#harness.currentConversationWorkspace === 'function'
+      ? this.#harness.currentConversationWorkspace(key) : this.#harness.currentWorkspace?.();
     if (entry.workspace !== this.#harness.currentWorkspace?.()
+      || entry.sessionWorkspace !== sessionWorkspace
       || entry.sessionId !== this.#state.sessionFor(key)) {
       result = { message: t('会话或工作区已变化，菜单已刷新，请重新选择。') };
     } else if ((this.#queues.has(key) || options.pendingInteraction || this.#batchInputs.status(key).phase !== 'idle')
@@ -1029,7 +1093,7 @@ export class DingtalkHarnessBridge {
     if (quotedAt === null) return { unavailableReason: 'not-delivered' };
     const sessionId = this.#state.sessionFor(key);
     const session = typeof sessionId === 'string' && sessionId
-      ? this.#harness.workspaceSession?.(sessionId)
+      ? this.#harness.workspaceSession?.(sessionId, key)
       : null;
     const text = await recoverAssistantTextByTimestamp({
       session,
@@ -1099,6 +1163,17 @@ export class DingtalkHarnessBridge {
           || this.#approvals.hasPending(key),
         control: { owner: this, key },
         deferredDelivery: this.#deferred,
+        enhancement: captureContextEnhancementSource(
+          this.#contextEnhancement,
+          String(message.conversationType) === '1' ? 'direct' : 'group',
+          () => ({
+            channel: 'dingtalk',
+            senderId: senderStaffId(message),
+            senderName: message.senderNick,
+            conversationTitle: message.conversationTitle,
+            chatId: message.conversationId,
+          }),
+        ),
       },
     );
     if (result?.stopped) {
@@ -1258,8 +1333,12 @@ export class DingtalkHarnessBridge {
         return;
       }
 
-      let content = hasImages || hasReply
-        ? await promptContentForInboundMessage(promptMessage, { signal: this.#signal })
+      const modelMessage = prepareDingtalkReplyAttachments(message, promptMessage, {
+        api: this.#api, clientId: this.#clientId, clientSecret: this.#clientSecret,
+        signal: this.#signal,
+      });
+      let content = hasInboundImages(modelMessage) || hasReply
+        ? await promptContentForInboundMessage(modelMessage, { signal: this.#signal })
         : undefined;
       const snapshot = this.#acceptedMessageIds.get(messageId);
       let contextEnhanced = false;
@@ -1296,6 +1375,8 @@ export class DingtalkHarnessBridge {
         key,
         text,
         content,
+        titleText: batchSubmission?.title,
+        sourceGuidance: snapshot?.config?.guidance,
         contextEnhanced,
         createOptions: { signal: this.#signal },
         existsOptions: { signal: this.#signal },
@@ -1313,7 +1394,7 @@ export class DingtalkHarnessBridge {
             requiresMention: String(message.conversationType) === '2',
           }),
           onInteractionResolved: (resolution) => this.#handleInteractionResolved(resolution),
-          files: promptMessage.files,
+          files: modelMessage.files,
         },
       });
       if (batchSubmission) {

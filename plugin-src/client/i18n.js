@@ -1,9 +1,21 @@
+import weixinDiagnostics from '../../src/channels/weixin/connection-error.en.mjs';
 import * as React from 'react';
 
 export const IM_LOCALE_NAMESPACE = 'dsh-im';
 
 const EN = Object.freeze({
+  ...weixinDiagnostics,
   '$locale': 'en',
+  '修改别名': 'Edit alias',
+  '关闭修改别名': 'Close alias editor',
+  '原名称': 'Original name',
+  '别名': 'Alias',
+  '恢复原名称': 'Restore original name',
+  '例如：客服助手': 'e.g. Customer support',
+  '仅更改显示名称，留空则显示原名称。': 'Only changes the display name. Leave blank to use the original name.',
+  '别名保存失败，请重试。': 'Could not save the alias. Try again.',
+  '别名不能包含换行或控制字符，且最多 80 个字符。': 'Use at most 80 characters without line breaks or control characters.',
+  '请输入有效的别名（最多 80 个字符）。': 'Enter a valid alias (up to 80 characters).',
   ' macOS Messages 连接': ' macOS Messages connection',
   '接入 iMessage': 'Connect iMessage',
   '先在 macOS 系统设置中授予 Messages 权限。': 'Grant Messages permissions in macOS System Settings first.',
@@ -686,6 +698,12 @@ const EN = Object.freeze({
   'Slack 工作区': 'Slack workspace',
   'Bot Token 与 App Token': 'Bot Token and App Token',
   '填写 Bot Token': 'Enter Bot Token',
+  '应用平台': 'App platform',
+  'Lark（国际版）': 'Lark (international)',
+  '手动接入Lark机器人': 'Connect Lark bot manually',
+  '填写 Lark 开放平台 App ID': 'Enter the Lark Developer App ID',
+  '填写 Lark 开放平台 App Secret': 'Enter the Lark Developer App Secret',
+  'Lark 机器人凭据已绑定。': 'Lark bot credentials connected.',
   '手动接入飞书机器人': 'Connect Feishu bot manually',
   '手动接入钉钉机器人': 'Connect DingTalk bot manually',
   '手动接入企业微信机器人': 'Connect WeCom bot manually',
@@ -1008,6 +1026,14 @@ function channelName(value) {
 }
 
 function translateDynamic(text) {
+  const configMessage = /^微信配置格式错误：(config\.json|workspaces\.json)。请查看诊断详情，修复后重启 DSH。$/.exec(text);
+  if (configMessage) return EN['微信配置格式错误：{file}。请查看诊断详情，修复后重启 DSH。'].replace('{file}', configMessage[1]);
+  const configHint = /^(.*?)请检查微信渠道数据目录中的 (config\.json|workspaces\.json)，修复后重启 DSH；“重新读取”不会重新加载配置。\s*(字段位置中的序号从 0 开始，按文件中的条目顺序计数，不包含真实账号标识。)?$/.exec(text);
+  if (configHint) return [
+    localizeText(configHint[1].trim()),
+    EN['请检查微信渠道数据目录中的 {file}，修复后重启 DSH；“重新读取”不会重新加载配置。'].replace('{file}', configHint[2]),
+    configHint[3] ? localizeText(configHint[3]) : '',
+  ].filter(Boolean).join(' ');
   const guidanceLimit = /^增强提示词不得超过 (\d+) 个字符。$/.exec(text);
   if (guidanceLimit) return `Guidance must not exceed ${guidanceLimit[1]} characters.`;
   let match = /^(\d+) \/ (\d+) 在线$/.exec(text);

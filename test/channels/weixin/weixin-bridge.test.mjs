@@ -33,8 +33,8 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-async function eventually(predicate, messageText = 'condition was not met') {
-  const deadline = Date.now() + 1_000;
+async function eventually(predicate, messageText = 'condition was not met', timeoutMs = 1_000) {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 5));
@@ -434,7 +434,7 @@ test('Weixin starts a native-file download before an earlier queued turn finishe
   });
 
   const first = bridge.accept(message('weixin-prefetch-first', '先等待'));
-  await eventually(() => asks === 1);
+  await eventually(() => asks === 1, 'busy turn did not start before /batch assertion', 5_000);
   const second = bridge.accept(message('weixin-prefetch-second', '', {
     item_list: [{
       type: 4,
@@ -743,6 +743,52 @@ test('Weixin tells users to inspect the chat instead of retrying an uncertain fi
     artifactId: 'weixin-artifact-one',
     outcome: 'unknown',
     reason: 'artifact-delivery-uncertain',
+  }]);
+});
+
+test('Weixin explains that an upload timeout happened before the file was sent', async (t) => {
+  const artifact = await committedArtifact(t, 'large.zip', 'weixin-file');
+  const fixture = stateFixture();
+  fixture.sessions.set('p2p:owner-user', 'session-upload-timeout');
+  const sent = [];
+  const bridge = new WeixinHarnessBridge({
+    api: {
+      inboundImages: () => [],
+      sendText: async ({ text }) => {
+        sent.push(text);
+        return { messageId: `weixin-text-${sent.length}` };
+      },
+      sendFile: async () => {
+        throw Object.assign(new Error('private CDN URL and token'), { code: 'artifact-upload-timeout' });
+      },
+    },
+    baseUrl: 'https://ilinkai.weixin.qq.com/',
+    token: 'host-token',
+    ownerUserId: 'owner-user',
+    harness: {
+      sessionExists: async () => true,
+      ask: async (_sessionId, _text, options) => {
+        await options.onArtifact(artifact);
+        return '';
+      },
+    },
+    state: fixture.state,
+    logger: { warn() {}, error() {} },
+  });
+
+  const receipt = await bridge.accept(message('weixin-upload-timeout', '发文件'));
+  const failure = bridge.status.lastMessageError;
+  assert.match(sent.at(-1), /上传微信.*超时，文件尚未发送/);
+  assert.match(sent.at(-1), /检查网络/);
+  assert.doesNotMatch(sent.join('\n'), /private CDN URL and token/);
+  assert.equal(failure.code, 'CHANNEL_DELIVERY');
+  assert.equal(failure.reason, 'ARTIFACT_UPLOAD_TIMEOUT');
+  assert.equal(bridge.status.artifactsSent, 0);
+  assert.equal(bridge.status.artifactSendErrors, 1);
+  assert.deepEqual(receipt.artifacts, [{
+    artifactId: artifact.artifactId,
+    outcome: 'failed',
+    reason: 'artifact-upload-timeout',
   }]);
 });
 
@@ -2536,7 +2582,7 @@ test('Weixin refuses /batch while the existing conversation queue is running', a
   });
 
   const turn = bridge.accept(message('busy-turn', '正在运行'));
-  await eventually(() => asks === 1);
+  await eventually(() => asks === 1, 'busy turn did not start before /batch assertion', 5_000);
   await bridge.accept(message('busy-batch', '/batch'));
   assert.match(sent.at(-1), /正在运行的任务.*\/stop.*\/batch/s);
 

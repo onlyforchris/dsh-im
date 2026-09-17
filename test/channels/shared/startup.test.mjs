@@ -9,7 +9,7 @@ import { Context, Service } from '@deepseek-ai/cordis';
 import { createImHostPlugin } from '../../../plugin-src/host/index.mjs';
 import { installProductionChannel } from '../../../plugin-src/host/channels/shared/startup.mjs';
 import { publicChannelInitializing, publicChannelStartupError } from '../../../plugin-src/host/channels/shared/startup-error.mjs';
-import { setImHostLanguage } from '../../../src/channels/shared/i18n.mjs';
+import { getImHostLanguage, setImHostLanguage } from '../../../src/channels/shared/i18n.mjs';
 
 const channels = await Promise.all([
   ['feishu', 'PluginConfigStore', 'plugin-config-store'],
@@ -128,15 +128,26 @@ for (const { id, apply, Store, api } of channels) {
       const result = await f.call(id);
       assert.equal(result.ok, false);
       assert.equal(result.error.code, `${id}-startup-config-invalid`);
-      assert.deepEqual(result.error.details, {});
+      if (id === 'weixin') {
+        assert.equal(result.error.details.stage, 'startup.load');
+        assert.match(result.error.details.referenceId, /^WX-CONN-[A-F0-9]{8}$/);
+        assert.equal(result.error.details.file, filename === 'configPath' ? 'config.json' : 'workspaces.json');
+        assert.equal(result.error.details.resource, filename === 'configPath' ? 'account-config' : 'workspace-config');
+        assert.equal(result.error.details.reason, label === 'malformed JSON' ? 'invalid-json' : 'invalid-config');
+        if (label !== 'malformed JSON') {
+          assert.equal(result.error.details.field, 'version');
+          assert.equal(result.error.details.issue, 'unsupported-version');
+        }
+      } else assert.deepEqual(result.error.details, {});
       assert.doesNotMatch(JSON.stringify(result), /private-secret-value/);
       assert.equal(await readFile(config[filename], 'utf8'), contents);
       assert.throws(() => (api.unwrapRpcResult ?? api.unwrapOfficeRpc)(result), error => {
         assert.equal(error.code, result.error.code);
         const message = api.presentError ? api.presentError(error).message : error.message;
-        assert.match(message, /config\.json/);
+        assert.match(message, id === 'weixin' && filename === 'workspacesPath' ? /workspaces\.json/ : /config\.json/);
         assert.match(message, /重启 DSH/);
-        if (id === 'office') assert.doesNotMatch(message, /workspaces\.json/);
+        if (id === 'weixin') assert.ok(message.includes(result.error.details.file));
+        else if (id === 'office') assert.doesNotMatch(message, /workspaces\.json/);
         else assert.match(message, /workspaces\.json/);
         return true;
       });
@@ -196,7 +207,8 @@ test('the composed host serves other real channels while Feishu is loading and a
     return [key, f.config(id, { internals: { ConfigStore } })];
   }));
   const internals = Object.fromEntries([
-    'installUpdateRpc', 'installInboundTtlRpc', 'installDeliveryRpc', 'installDeliveryHttp', 'installSessionSyncCoordinator',
+    'installUpdateRpc', 'installInboundTtlRpc', 'installDeliveryRpc', 'installDeliveryHttp',
+    'installSessionSyncCoordinator', 'installHostLanguage', 'installHostLanguageRpc',
   ].map(name => [name, () => {}]));
   const fiber = f.start(createImHostPlugin(internals).apply, config);
   try {
@@ -243,6 +255,68 @@ test('startup rolls back prepared resources even when delivery cleanup fails', a
   assert.equal(closed, 1);
   assert.equal(unregistered, 1);
   assert.equal(f.routes.size, 0);
+});
+
+test('a host language change refreshes every started channel menu and releases on unload', async t => {
+  const previousLanguage = getImHostLanguage();
+  t.after(() => setImHostLanguage(previousLanguage));
+  setImHostLanguage('zh');
+  const f = await fixture(t);
+  const refreshes = [];
+  let failNext = false;
+  const fiber = f.start((ctx, config) => installProductionChannel(ctx, config, {
+    channel: 'telegram', rpcChannel: '/telegram',
+    createProduction: async () => ({
+      controller: {
+        async refreshCommandMenus() {
+          refreshes.push(getImHostLanguage());
+          if (failNext) {
+            failNext = false;
+            throw new Error('private-refresh-failure');
+          }
+          return refreshes.length;
+        },
+      },
+      async close() {},
+    }),
+    createHandler: () => async () => ({ ok: true, value: {} }),
+  }), {});
+  await fiber.await();
+  assert.deepEqual(refreshes, [], 'connecting a channel is not itself a language change');
+
+  setImHostLanguage('en');
+  await new Promise(setImmediate);
+  assert.deepEqual(refreshes, ['en']);
+
+  // A rejected refresh is contained: the next language change still refreshes.
+  failNext = true;
+  setImHostLanguage('zh');
+  await new Promise(setImmediate);
+  setImHostLanguage('en');
+  await new Promise(setImmediate);
+  assert.deepEqual(refreshes, ['en', 'zh', 'en']);
+
+  await fiber.dispose();
+  setImHostLanguage('zh');
+  await new Promise(setImmediate);
+  assert.equal(refreshes.length, 3, 'an unloaded channel no longer observes the language');
+});
+
+test('a channel without a platform-side command menu ignores language changes', async t => {
+  const previousLanguage = getImHostLanguage();
+  t.after(() => setImHostLanguage(previousLanguage));
+  setImHostLanguage('zh');
+  const f = await fixture(t);
+  const fiber = f.start((ctx, config) => installProductionChannel(ctx, config, {
+    channel: 'office', rpcChannel: '/office',
+    createProduction: async () => ({ controller: {}, async close() {} }),
+    createHandler: () => async () => ({ ok: true, value: {} }),
+  }), {});
+  await fiber.await();
+  setImHostLanguage('en');
+  await new Promise(setImmediate);
+  assert.equal((await f.call('office')).ok, true);
+  await fiber.dispose();
 });
 
 test('disposing a channel during initialization closes the late controller and removes its route', async t => {

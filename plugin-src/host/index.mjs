@@ -11,11 +11,13 @@ import { apply as applyWeixin } from './channels/weixin/index.mjs';
 import { apply as applyWhatsapp } from './channels/whatsapp/index.mjs';
 import { apply as applyIMessage } from './channels/imessage/index.mjs';
 import { installOutboundArtifactTool } from '../../src/channels/shared/semantic/artifact.mjs';
-import { setImHostLanguage } from '../../src/channels/shared/i18n.mjs';
+import { installHostLanguage } from './host-language.mjs';
+import { installHostLanguageRpc } from './host-language-rpc.mjs';
 import { installDeliveryRpc } from './delivery-rpc.mjs';
 import { installDeliveryHttp } from './delivery-http.mjs';
 import { createDeliveryService } from './delivery-service.mjs';
 import { installInboundTtlRpc } from './inbound-ttl-rpc.mjs';
+import { installInjectedContext } from './injected-context.mjs';
 import { installSessionSyncCoordinator } from './session-sync-coordinator.mjs';
 import { installSessionTitlePrefix } from './session-title-prefix.mjs';
 import { installUpdateRpc } from './update-rpc.mjs';
@@ -37,8 +39,11 @@ function channelConfig(config, name, deliveryService) {
 }
 
 export function createImHostPlugin(internals = {}) {
+  const startHostLanguage = internals.installHostLanguage ?? installHostLanguage;
+  const startHostLanguageRpc = internals.installHostLanguageRpc ?? installHostLanguageRpc;
   const startUpdate = internals.installUpdateRpc ?? installUpdateRpc;
   const startInboundTtl = internals.installInboundTtlRpc ?? installInboundTtlRpc;
+  const startInjectedContext = internals.installInjectedContext ?? installInjectedContext;
   const startDelivery = internals.installDeliveryRpc ?? installDeliveryRpc;
   const startDeliveryHttp = internals.installDeliveryHttp ?? installDeliveryHttp;
   const startSessionSync = internals.installSessionSyncCoordinator
@@ -122,7 +127,10 @@ export function createImHostPlugin(internals = {}) {
   });
 
   async function activateChannels(ctx, config, deliveryService) {
-    setImHostLanguage(config.language ?? process.env.DSH_IM_LANGUAGE);
+    // Bind the bot message language before any channel connects, so the first
+    // command menu a platform stores is already in the interface language.
+    const hostLanguage = startHostLanguage(ctx, config);
+    await hostLanguage?.ready;
     const startTitlePrefix = (titleCtx) => {
       // The installer owns its cleanup through ctx.effect(). Cordis startup
       // callbacks must not return its controller object as an effect.
@@ -146,7 +154,19 @@ export function createImHostPlugin(internals = {}) {
     const logger = typeof ctx?.logger === 'function'
       ? ctx.logger(name)
       : (ctx?.logger ?? console);
+    try {
+      startInjectedContext(ctx, { logger });
+    } catch (error) {
+      logger.error?.('[dsh-im] failed to activate injected-context pairing; prompts keep the inline prefix', error);
+    }
     if (ctx?.connection?.fetch) {
+      if (hostLanguage) {
+        try {
+          startHostLanguageRpc(ctx, hostLanguage, config.rpcAuthority);
+        } catch (error) {
+          logger.error?.('[dsh-im] failed to activate interface language mirroring; continuing with channels', error);
+        }
+      }
       try {
         startUpdate(ctx);
       } catch (error) {

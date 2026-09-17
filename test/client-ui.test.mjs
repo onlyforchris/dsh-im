@@ -70,6 +70,10 @@ import {
   GLOBAL_SETTINGS_RPC_CHANNEL,
   GlobalSettingsPanel,
 } from '../plugin-src/client/global-settings.js';
+import {
+  HOST_LANGUAGE_ENDPOINTS,
+  HOST_LANGUAGE_RPC_CHANNEL,
+} from '../plugin-src/client/interface-language.js';
 
 const STYLES_URL = new URL('../plugin-src/client/styles.js', import.meta.url);
 const FEISHU_STYLES_URL = new URL(
@@ -560,7 +564,7 @@ test('Feishu bot cards place the application identifier under the bot name', asy
     onCancelRemove() {},
   }));
 
-  assert.match(markup, /<h3[^>]*>今天是牢梁<\/h3><p[^>]*>cli_aaf4••••1234<\/p>/);
+  assert.match(markup, /<div class="dim-aliasName"><h3[^>]*>今天是牢梁<\/h3>[^]*?<\/div><p[^>]*>cli_aaf4••••1234<\/p>/);
   assert.match(markup, /data-im-channel-logo="feishu"/);
   assert.match(markup, /class="bxf-card bxf-botCard dim-botCard"/);
   assert.match(markup, /class="bxf-healthPill dim-botHealth"/);
@@ -749,6 +753,73 @@ test('credential binding is a distinct secondary action beside QR binding in fou
   assert.match(styles, /\.dim-panel \.dim-credentialButton \{[^}]*border: 1px solid #86909c;[^}]*background: var\(--dsw-alias-bg-layer-1, #fff\)/);
   assert.match(styles, /\.dim-panel \.dim-actionIcon \{[^}]*flex: 0 0 15px;/);
   assert.doesNotMatch(styles, /\.dim-panel \.dim-credentialPanel \{[^}]*border-left:/);
+});
+
+test('Feishu manual binding selects Lark, clears credentials on platform changes and locks in-flight requests', async (t) => {
+  const previousWindow = globalThis.window;
+  globalThis.window = {
+    setInterval: () => 1, clearInterval() {},
+    setTimeout: () => 1, clearTimeout() {},
+    requestAnimationFrame(callback) { queueMicrotask(callback); return 1; },
+    cancelAnimationFrame() {},
+  };
+  let renderer;
+  t.after(async () => {
+    if (renderer) await act(async () => renderer.unmount());
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+  });
+  const snapshot = { schemaVersion: 2, revision: 1, state: 'idle', bots: [] };
+  const bindings = [];
+  let finishBinding;
+  const rpcCall = async (endpoint, payload) => {
+    if (endpoint === FEISHU_ENDPOINTS.status) return { ok: true, value: snapshot };
+    assert.equal(endpoint, FEISHU_ENDPOINTS.bindCredentials);
+    bindings.push(payload);
+    if (payload.domain === 'feishu') throw new Error('Test binding rejected');
+    return new Promise((resolve) => { finishBinding = resolve; });
+  };
+  await act(async () => {
+    renderer = create(React.createElement(FeishuSettingsTab, { rpcCall }));
+    await flushTasks();
+  });
+  await act(async () => findButton(renderer, '手动接入').props.onClick());
+  const platform = () => renderer.root.findByProps({ 'aria-label': '应用平台' });
+  const inputs = () => renderer.root.findAllByType('input');
+  const fill = async () => act(async () => {
+    inputs()[0].props.onChange({ target: { value: ' cli_test ' } });
+    inputs()[1].props.onChange({ target: { value: ' test-secret ' } });
+  });
+  const submit = async () => act(async () => {
+    renderer.root.findByType('form').props.onSubmit({ preventDefault() {} });
+    await flushTasks();
+  });
+  assert.equal(platform().props.value, 'feishu');
+  assert.deepEqual(platform().findAllByType('option').map((node) => node.props.value), ['feishu', 'lark']);
+  await fill();
+  await submit();
+  assert.deepEqual(bindings[0], { appId: 'cli_test', appSecret: 'test-secret', domain: 'feishu' });
+  assert.equal(renderer.root.findAllByProps({ role: 'alert' }).length, 1);
+  await act(async () => platform().props.onChange({ target: { value: 'lark' } }));
+  assert.equal(renderer.root.findAllByProps({ role: 'alert' }).length, 0);
+  assert.ok(inputs().every((node) => node.props.value === ''), 'never reuse secrets across platforms');
+  assert.match(inputs()[0].props.placeholder, /Lark/);
+  assert.equal(inputs()[1].props.type, 'password');
+  await fill();
+  await submit();
+  assert.deepEqual(bindings[1], { appId: 'cli_test', appSecret: 'test-secret', domain: 'lark' });
+  assert.equal(platform().props.disabled, true);
+  assert.ok(inputs().every((node) => node.props.disabled));
+  assert.equal(findButton(renderer, '取消').props.disabled, true);
+  await submit();
+  assert.equal(bindings.length, 2, 'busy form cannot submit twice');
+  await act(async () => {
+    finishBinding({ ok: true, value: snapshot });
+    await flushTasks();
+  });
+  assert.equal(renderer.root.findAllByType('form').length, 0);
+  assert.match(nodeText(renderer.root), /Lark 机器人凭据已绑定/);
+  assert.equal(en['应用平台'], 'App platform');
 });
 
 test('credential form stays compact while using a protected password input', () => {
@@ -1070,8 +1141,8 @@ test('all channel bot cards use the DingTalk card treatment', async () => {
   const styles = await readFile(STYLES_URL, 'utf8');
 
   assert.match(styles, /\.dim-panel \.dim-botCard \{[^}]*border-radius: 14px;[^}]*background: var\(--dsw-alias-bg-layer-1, #fff\);[^}]*box-shadow: 0 1px 2px/);
-  assert.match(styles, /\.dim-panel \.dim-botCardBody \{[^}]*padding: 12px;/);
-  assert.match(styles, /\.dim-panel \.dim-botCardTop \{[^}]*align-items: flex-start;[^}]*gap: 12px;/);
+  assert.match(styles, /\.dim-panel \.dim-botCardBody \{[^}]*padding: 12px 8px;/);
+  assert.match(styles, /\.dim-panel \.dim-botCardTop \{[^}]*align-items: flex-start;[^}]*gap: 6px;/);
   assert.match(styles, /\.dim-panel \.dim-botAvatar \{[^}]*width: 38px;[^}]*height: 38px;[^}]*border-radius: 11px;/);
   assert.match(styles, /\.dim-panel \.dim-botName h3 \{[^}]*font-size: 15px;/);
   assert.match(styles, /\.dim-panel \.dim-botHealthGroup \{[^}]*display: grid;[^}]*justify-items: end;[^}]*gap: 5px;/);
@@ -1182,9 +1253,15 @@ test('client registers one top-level bilingual IM settings section with a direct
     rpcCalls.push(args);
     return { ok: true, value: {} };
   };
+  const localeListeners = new Set();
   const ctx = {
     effect(install, label) {
       effects.push({ install, label });
+    },
+    on(event, listener) {
+      assert.equal(event, 'locale/change');
+      localeListeners.add(listener);
+      return () => localeListeners.delete(listener);
     },
     locale: {
       bind(namespace) {
@@ -1194,6 +1271,9 @@ test('client registers one top-level bilingual IM settings section with a direct
       register(namespace, value) {
         dictionaries.push({ namespace, value });
         return () => {};
+      },
+      getLocale() {
+        return { active: 'en', locales: [], revision: 1 };
       },
     },
     connection: { rpc: { call: rpcCall } },
@@ -1260,6 +1340,22 @@ test('client registers one top-level bilingual IM settings section with a direct
       registrations[0].component,
       injected,
     ));
+    // A browser-derived interface locale reaches the Host only through this
+    // mirror, so the settings section must report it while it is mounted.
+    const mirrorEffect = effects.find((entry) =>
+      entry.label === 'im-settings: mirror the DSH interface language');
+    assert.ok(mirrorEffect, 'the interface language mirror is installed');
+    const before = rpcCalls.length;
+    const disposeMirror = mirrorEffect.install();
+    assert.deepEqual(rpcCalls.slice(before), [
+      ['/api', `dsh-im${HOST_LANGUAGE_RPC_CHANNEL}`, {
+        method: HOST_LANGUAGE_ENDPOINTS.mirror, payload: { locale: 'en' },
+      }, undefined],
+    ]);
+    assert.equal(localeListeners.size, 1);
+    disposeMirror();
+    assert.equal(localeListeners.size, 0);
+
     assert.match(markup, /Connecting DeepSeek Harness/);
     assert.match(markup, new RegExp(
       `class="dim-brandVersion">v${IM_PLUGIN_VERSION.replaceAll('.', '\\.')}<\\/span>`,
