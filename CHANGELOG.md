@@ -6,6 +6,120 @@ This file records the notable changes in each dsh-im release. Its format follows
 
 ## [Unreleased]
 
+## [4.25.0] - 2026-09-22
+
+### Added / 新增
+
+- 新增 Matrix 实验性渠道，可使用 homeserver 与访问令牌，或用户 ID 与密码接入；支持私聊、群聊提及、线程回复、HTML 白名单富文本、编辑式流式输出、输入状态及图片和结果文件回传。纳入现有机器人设置、工作区与会话绑定、访问策略和主动投递体系。感谢 [@Dong09](https://github.com/Dong09)（[#245](https://github.com/xmanrui/dsh-im/pull/245)）。
+  Added an experimental Matrix channel using a homeserver with an access token or a user ID/password. It supports DMs, room mentions, thread replies, allowlisted HTML, edit-based streaming, typing indicators, and image/result-file delivery, integrated with bot settings, workspaces, Session bindings, access policies, and proactive delivery. Thanks to [@Dong09](https://github.com/Dong09) ([#245](https://github.com/xmanrui/dsh-im/pull/245)).
+- Matrix 加入本机加密状态存储、设备密钥注册、Megolm 房间消息加解密及设备间密钥共享的实验性实现，依赖固定版本 `@matrix-org/olm@3.2.15`。配置支持 `off`、默认 `optional` 和 `required`；引擎启动失败时，optional 模式跳过收到的加密消息，required 模式拒绝启动连接。
+  Added experimental Matrix local crypto state, device-key registration, Megolm room-message encryption/decryption, and to-device key sharing using pinned `@matrix-org/olm@3.2.15`. Configuration supports `off`, default `optional`, and `required`: failed crypto startup skips incoming encrypted traffic in optional mode and prevents connection startup in required mode.
+
+### Changed / 变更
+
+- 「检查更新」改为图标按钮，通过悬停提示与无障碍标签展示检查中、可更新版本、安装中或待手动重启状态，保留原有更新对话框和确认流程。
+  Replaced the update-check text button with an icon whose tooltip and accessible label reflect checking, the available version, installation, or a required manual restart, preserving the update dialog and confirmation flow.
+- Matrix 导航明确标注「实验功能」，补充渠道标识、中英文文案、集成说明及自动化测试，并纠正 README 中「始终跳过加密房间」的旧描述。
+  Marked Matrix as experimental in navigation, added channel branding, Chinese/English copy, integration notes, and automated tests, and corrected the outdated README statement that encrypted rooms are always skipped.
+
+### Known limitations / 已知限制
+
+- Matrix 加密仍为实验性能力，本次发布验证不包含真实 homeserver／Element 互通测试；未实现交互式设备验证、密钥备份及 SSSS，媒体附件内容也未做附件级加密。请仅在非敏感测试场景试用，不要将其视为完整的端到端保密保障。
+  Matrix encryption remains experimental; release validation does not include live homeserver/Element interoperability testing. Interactive device verification, key backup, SSSS, and attachment-content encryption are not implemented. Use only for non-sensitive testing, not as a complete end-to-end confidentiality guarantee.
+
+## [4.24.1] - 2026-09-22
+
+### Fixed / 修复
+
+- 飞书话题首文在同一 AI 会话成功使用后不再重复注入；命令、拒绝消息及读取或请求失败不提前消耗首文，`/new`、会话切换或失效重建后重新附带。普通群聊和私聊的主动引用保持原有行为。感谢 [@yangzhe1991](https://github.com/yangzhe1991) 提出并实现首文去重（[#222](https://github.com/xmanrui/dsh-im/pull/222)）。
+  Feishu topic roots are no longer injected repeatedly after a successful turn in the same AI session. Commands, rejected messages, and failed lookups or requests do not consume the root; new, switched, or rebuilt sessions receive it again. Explicit quotes in ordinary groups and direct chats retain their existing behavior. Thanks to [@yangzhe1991](https://github.com/yangzhe1991) for proposing and implementing topic-root deduplication ([#222](https://github.com/xmanrui/dsh-im/pull/222)).
+
+- 修复通过终端或插件市场升级、回退后，历史更新记录持续阻止后续安装的问题。重启 Host 后，在无安装锁、当前安装校验通过且运行版本与已安装版本一致时重新判定可恢复状态；不删除历史记录，也不绕过安装锁、版本兼容性、确认有效期或手动重启要求。
+  Fixed historical update jobs blocking later installs after an external upgrade or rollback. After restarting the Host, recovery is derived from a valid current installation with no install lock and matching running/installed versions. History remains intact, and install locks, compatibility checks, confirmation expiry, and manual-restart requirements remain enforced.
+- 更新面板优先展示本次检查结果，区分「最新版本」「上次更新目标」与正在安装的「目标版本」，避免旧任务遮盖新版本或错误状态；打开符合条件的面板时重新检查更新，手动命令不再沿用可恢复历史任务的旧目标。已被旧版更新器阻塞的用户，需先通过手动命令或插件市场安装含修复的版本，再手动重启 Host。
+  The update panel now prioritizes fresh checks and distinguishes Latest version, Previous update target, and an active Target version, so old jobs cannot hide available updates or errors. Eligible panel openings check again, and manual commands ignore recoverable historical targets. Users already blocked by the old updater must first install a fixed version through the manual command or plugin market, then restart the Host manually.
+
+### Changed / 变更
+
+- 统一机器人卡片设置入口：卡片顶部使用齿轮与箭头展开或收起常用配置，「更多设置」移入展开区域；调整图标间距，保留键盘操作、展开状态提示及收起后隐藏控件的无障碍行为。
+  Unified bot-card settings entry points: a gear-and-chevron control expands or collapses common settings, with More settings inside the expanded area. Balanced icon spacing while preserving keyboard interaction, expanded-state announcements, and accessibility hiding for collapsed controls.
+- 补充飞书话题首文去重贡献者信息，并完善飞书实时直播功能对 [@ShawnKung](https://github.com/ShawnKung) 的文档致谢（[#243](https://github.com/xmanrui/dsh-im/pull/243)）。
+  Added contributor credits for Feishu topic-root deduplication and completed the documentation attribution to [@ShawnKung](https://github.com/ShawnKung) for Feishu Live process mode ([#243](https://github.com/xmanrui/dsh-im/pull/243)).
+
+## [4.24.0] - 2026-09-21
+
+### Added / 新增
+
+- 飞书任务过程展示新增「实时直播」，使用原生思考过程消息展示当前任务的推理片段、工具调用、参数及结果，最终答案仍以普通富文本消息单独发送。推理通过实时连接补充，工具进度和最终结果沿用历史轮询；过程写入采用非阻塞批处理，原生过程不可用时不影响最终答案。已有机器人不自动切换展示模式。感谢 [@ShawnKung](https://github.com/ShawnKung)（[#224](https://github.com/xmanrui/dsh-im/pull/224)）。
+  Added Feishu Live process mode, using native thinking-process messages for the current task's reasoning snippets, tool calls, arguments, and results while delivering the final answer separately as rich text. Live connections supplement reasoning; history polling remains authoritative for tool progress and final results. Process writes use non-blocking batches, and process failures do not suppress the answer. Existing bots keep their selected presentation mode. Thanks to [@ShawnKung](https://github.com/ShawnKung) ([#224](https://github.com/xmanrui/dsh-im/pull/224)).
+- Telegram 新增每机器人独立的「会话行为 → 思考过程留痕」开关，将推理摘要和工具调用摘要作为独立的 💭／🔧 消息保留，最终答案另发。默认开启（含未设置该字段的已有机器人），显式关闭后恢复原有回复方式；中间留痕发送失败不阻止最终答案，长任务继续显示输入状态。留痕可能包含工具参数摘要，请按聊天受众选择是否开启。感谢 [@gin-melodic](https://github.com/gin-melodic)（[#203](https://github.com/xmanrui/dsh-im/pull/203)、[#235](https://github.com/xmanrui/dsh-im/pull/235)）。
+  Added a per-bot Telegram Thinking traces toggle under Conversation behavior. Reasoning and tool-call summaries remain as separate 💭/🔧 messages, followed by the final answer. It defaults on, including existing bots without the field; explicitly disabling it restores the previous reply presentation. Trace-send failures do not prevent the final answer, and long-running tasks keep the typing indicator. Traces can include tool-argument summaries, so choose the setting for the chat's audience. Thanks to [@gin-melodic](https://github.com/gin-melodic) ([#203](https://github.com/xmanrui/dsh-im/pull/203), [#235](https://github.com/xmanrui/dsh-im/pull/235)).
+
+### Fixed / 修复
+
+- 飞书直播以历史记录恢复最终答案和任务结束，避免断线重连后的较新实时事件跳过尚未补回的回复。提前到达的推理采用有界暂存，确认请求与回合归属后才展示；同时处理排序、去重及结束后的迟到片段，避免排队请求混入上一轮推理。最终答复使用最后一步定稿内容，长工具参数和结果按协议限制截断。
+  Feishu live replies recover final answers and completion from history so newer events after a reconnect cannot skip missing replies. Early reasoning is buffered within fixed limits and displayed only after request/turn correlation, with ordering, deduplication, and late-frame handling that keep queued requests separate. Final replies use the last step's canonical text, and long tool arguments/results are bounded for the protocol.
+- Telegram 留痕模式的最终答案保留 Markdown、代码块及原有空行，不再按空段落预先拆分；纯文本重试保留原文，只重发明确失败的未发送部分，投递结果不确定时不自动重发。
+  Telegram thinking-mode final answers preserve Markdown, fenced code, and original blank lines without pre-splitting on empty paragraphs. Plain-text retries preserve content and resend only the definitively failed unsent tail; uncertain delivery is not automatically retried.
+- 修复邮件模型输入丢失主题等邮件头、腾讯 Agent 邮箱附件下载返回加载函数而非内容的问题；初始化收信游标只读取邮件列表摘要，不提前下载可能不在白名单内的正文。保留纯正文命令解析和现有延迟图片处理。感谢 [@C3H3-AI](https://github.com/C3H3-AI)（[#233](https://github.com/xmanrui/dsh-im/pull/233)）。
+  Fixed email model input losing subject/header context and Agent Mail attachment loaders returning functions instead of bytes. Initial receive cursors now use list summaries without fetching potentially disallowed message bodies. Plain-body command parsing and deferred image handling are preserved. Thanks to [@C3H3-AI](https://github.com/C3H3-AI) ([#233](https://github.com/xmanrui/dsh-im/pull/233)).
+- 补齐飞书原生斜杠命令面板中的工作区、会话绑定、模型、推理等级、预设、停止、补充指令、批量输入、版本及修复等现有命令入口，同步命令文档与测试。
+  Completed Feishu's native slash-command panel entries for existing workspace, Session binding, model, reasoning effort, preset, stop, steer, batch-input, version, and repair commands, with updated documentation and tests.
+
+### Changed / 变更
+
+- 设置页 GitHub 入口改用 Logo，保留链接及无障碍标签；补充飞书直播、Telegram 留痕及邮件回归测试和验证记录。移除带固定本机路径和聊天目标的 Telegram 实测脚本，并将 npm 包内的脚本收紧为明确的验证脚本清单。
+  Replaced the settings-page GitHub text button with a logo while preserving its link and accessible label, and expanded Feishu live-process, Telegram trace, and email regression coverage and verification records. Removed the machine-specific Telegram live-test script and restricted packaged scripts to an explicit verification-script allowlist.
+
+## [4.23.0] - 2026-09-20
+
+### Added / 新增
+
+- 新增邮件渠道，支持标准 IMAP/SMTP 邮箱及通过官方 `@tencent-qqmail/agently-cli` 接入腾讯 Agent 邮箱；可在设置页管理多邮箱、发件人白名单、工作区、模型和 Session 绑定，并收发邮件正文及附件（[#223](https://github.com/xmanrui/dsh-im/pull/223)，感谢 [@C3H3-AI](https://github.com/C3H3-AI)）。邮件线程与绑定持久化，补齐分页收信、失败重试、限流退避和自动回复防循环。渠道默认可用，但需自行绑定邮箱；可用 `EMAIL_CHANNEL_ENABLED=0` 或 `emailChannelEnabled: false` 关闭，保留已有配置。空白名单不接收任何发件人的请求；邮件发件人地址可被伪造，白名单不能替代身份认证，应仅接入可信来源。
+  Added an email channel for standard IMAP/SMTP mailboxes and Tencent Agent Mail through the official `@tencent-qqmail/agently-cli`, with multiple mailboxes, sender allowlists, workspace/model selection, Session bindings, and text/attachment delivery ([#223](https://github.com/xmanrui/dsh-im/pull/223), thanks to [@C3H3-AI](https://github.com/C3H3-AI)). Threads and bindings persist across restarts, with paginated polling, bounded retries, rate-limit backoff, and automatic-reply loop prevention. The channel is available by default but requires mailbox setup; `EMAIL_CHANNEL_ENABLED=0` or `emailChannelEnabled: false` disables it without deleting configuration. Empty allowlists admit nobody. Sender addresses can be spoofed, so allowlists are not identity authentication; connect only trusted sources.
+- 新增「通用设置 → 附件 → 图片输入」四项限制：原图单张大小、单条消息图片数、模型单张图片预算和模型总图片预算。默认分别为 30 MB、20 张、5 MB 和 20 MB，设置对后续消息生效，仍受平台及 Host 限制。
+  Added four Image input limits under General settings → Attachments: original image size, images per message, per-image model budget, and total model budget. Defaults are 30 MB, 20 images, 5 MB, and 20 MB respectively. Changes apply to subsequent messages and remain subject to platform and Host limits.
+
+### Changed / 变更
+
+- 图片原文件先保存到 Session 工作区并遵循附件保留设置；使用可选 `sharp` 为模型生成预算内的缩放或压缩副本。无法压缩、超出预算、缺少可选编解码器或 Host 拒绝图片输入时，按适用条件回退为工作区文件，并明确提示未直接提供给模型的图片，不丢弃已保存的原图。
+  Original images are saved to the Session workspace under attachment-retention rules before optional `sharp` resizing/compression produces model copies within budget. Images fall back to workspace files where applicable when compression is unavailable or fails, budgets are exceeded, or the Host rejects image input, with explicit notices identifying images not directly provided to the model; saved originals are retained.
+- 将连接诊断扩展到全部渠道，保留失败阶段、可识别的底层原因、HTTP 状态、时间和回滚结果，设置页可展开并复制诊断信息。诊断引用可关联 Host 日志；对外仅输出允许的诊断字段，并保留删除成功但清理失败的警告。
+  Extended connection diagnostics across all channels, preserving failure stages, recognized underlying causes, HTTP status, timing, and rollback results, with expandable/copyable details in settings. References correlate with Host logs; public diagnostics use admitted fields and retain warnings when removal succeeds but cleanup fails.
+
+### Fixed / 修复
+
+- 修复 WhatsApp 群聊中其他成员通过 LID 提及或引用回复机器人时没有响应的问题（[#221](https://github.com/xmanrui/dsh-im/issues/221)）。恢复 3.0.3 的账号别名识别，使用当前连接提供的手机号 ID 和 LID 识别提及、回复及自聊；继续遵守现有群聊访问权限。
+  Fixed WhatsApp group mentions and quoted replies from other members being ignored when they address the bot by LID ([#221](https://github.com/xmanrui/dsh-im/issues/221)). Restored the account-alias matching from 3.0.3, using the current connection's phone-number ID and LID for mentions, replies, and self-chat while preserving existing group access policies.
+- 工具已完成处理但没有文本或文件回复时，返回明确的完成提示，不再误报模型空回复；文件交付失败仍报告原错误，并为回合失败补充关联信息。
+  Completed tool-only turns without text or file replies now return an explicit completion notice instead of being misreported as empty model responses. Artifact handoff failures retain their original errors, and turn failures include correlation details.
+- 邮件渠道可用性查询补齐请求载荷，修复设置页查询失败；同步生成的客户端与 Host 产物，并补充邮件、图片输入、连接诊断和 WhatsApp 的回归测试。
+  Added the request payload to email availability queries to fix settings-page checks, synchronized generated client/Host artifacts, and expanded email, image-input, connection-diagnostic, and WhatsApp regression coverage.
+
+## [4.22.0] - 2026-09-19
+
+### Added / 新增
+
+- 新增可选客户端服务 `dshImClient` v1，宿主可通过 `render({ preferredSectionId })` 嵌入完整 IM 管理面板，并用 `setSettingsVisible(boolean)` 隐藏或恢复本客户端的设置入口；`settingsVisible()` 返回入口是否已注册（[#231](https://github.com/xmanrui/dsh-im/issues/231)）。默认仍保留「设置 → IM机器人」，不需要迁移数据或新增配置，Host 侧主动投递服务 `dshIm` 不变。
+  Added the optional `dshImClient` v1 client service so shells can embed the complete IM management panel with `render({ preferredSectionId })`, hide or restore this client's settings entry with `setSettingsVisible(boolean)`, and check its registration with `settingsVisible()` ([#231](https://github.com/xmanrui/dsh-im/issues/231)). Settings → IM bots remains the default without migration or new configuration; the Host-side `dshIm` delivery service is unchanged.
+- 嵌入面板复用现有 RPC、权限、目录选择和语言服务，保持组件身份稳定，避免重复渲染重置未保存表单；支持首次栏目选择、语言刷新及局部错误重试。入口开关只作用于当前客户端内存，不影响其他浏览器或机器人运行；不支持新服务的旧宿主继续使用原设置页。接口 v1 面向单个活跃管理面板，不提供多面板状态同步。
+  Embedded panels reuse existing RPC, permissions, directory selection, and locale services, with stable component identity to preserve unsaved forms across re-renders. Initial-section selection, locale updates, and local error recovery are supported. Visibility is in-memory and client-local, without affecting other browsers or running bots; older Hosts retain the original settings page. V1 targets one active management panel and does not synchronize multiple panels.
+
+### Changed / 变更
+
+- 新机器人默认工作目录由 Host 当前目录改为 `$DSH_HOME/im`，未设置时使用 `~/.dsh/im`，默认目录自动创建；显式 `workspace` 优先，`dshHome` 可覆盖环境变量。默认目录中的新 Session 保持「未分组」，切换到其他目录时继续使用原工作区分组机制，切回默认目录后新 Session 恢复未分组。已有机器人的目录和历史 Session 不自动迁移；各机器人仍独立保存聊天与 Session 的绑定。
+  New bots default to `$DSH_HOME/im` instead of the Host's current directory, falling back to `~/.dsh/im`; the default directory is created automatically. Explicit `workspace` takes precedence, and `dshHome` overrides the environment variable. New Sessions in the default directory remain ungrouped, while other directories retain workspace grouping. Existing bot directories and historical Sessions are not migrated, and each bot retains independent chat-to-Session bindings.
+
+### Fixed / 修复
+
+- 默认 IM 目录的 `/sessionlist`／`/sessions` 识别工作目录匹配的未分组 Session，排除已归属其他工作区分组的会话；普通未分组 Session 可按 ID 或当前列表序号绑定，重启后也能重新识别已有绑定。路径比较兼容符号链接，默认目录创建失败时直接报告错误，不退回 Host 当前目录。
+  `/sessionlist` and `/sessions` include ungrouped Sessions whose working directory matches the default IM directory, without including Sessions assigned to other workspace groups. Ordinary ungrouped Sessions can be bound by ID or current-list index, and existing bindings remain recognizable after restart. Path matching supports symbolic links; default-directory creation errors are reported instead of falling back to the Host's current directory.
+
+### Documentation / 文档
+
+- 新增中英文客户端接入文档并随 npm 包发布，记录服务契约、生命周期、权限及兼容边界；同步默认目录与会话命令说明。仓库提供独立的 `integrations/desktop-panel` 可选桌面接入示例，它不随 dsh-im npm 包发布，也不代表桌面端已内置入口。
+  Added a bilingual client integration guide to the npm package covering the service contract, lifecycle, permissions, and compatibility, and updated default-directory and Session-command guidance. The repository includes an optional standalone `integrations/desktop-panel` integration; it is excluded from the dsh-im npm package and does not imply a built-in desktop entry.
+
 ## [4.21.2] - 2026-09-17
 
 ### Fixed / 修复
@@ -1097,7 +1211,12 @@ This file records the notable changes in each dsh-im release. Its format follows
 - 改进 npm 发布包结构，保留 CLI 入口并避免安装脚本拦截。
   Improved npm package contents to preserve the CLI entry point and avoid install-script blocking.
 
-[Unreleased]: https://github.com/xmanrui/dsh-im/compare/v4.21.2...HEAD
+[Unreleased]: https://github.com/xmanrui/dsh-im/compare/v4.25.0...HEAD
+[4.25.0]: https://github.com/xmanrui/dsh-im/compare/v4.24.1...v4.25.0
+[4.24.1]: https://github.com/xmanrui/dsh-im/compare/v4.24.0...v4.24.1
+[4.24.0]: https://github.com/xmanrui/dsh-im/compare/v4.23.0...v4.24.0
+[4.23.0]: https://github.com/xmanrui/dsh-im/compare/v4.22.0...v4.23.0
+[4.22.0]: https://github.com/xmanrui/dsh-im/compare/v4.21.2...v4.22.0
 [4.21.2]: https://github.com/xmanrui/dsh-im/compare/v4.21.1...v4.21.2
 [4.21.1]: https://github.com/xmanrui/dsh-im/compare/v4.21.0...v4.21.1
 [4.21.0]: https://github.com/xmanrui/dsh-im/compare/v4.20.2...v4.21.0

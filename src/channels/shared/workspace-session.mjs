@@ -155,6 +155,7 @@ export async function askInWorkspaceSession({
   channelLabel,
   fromUserId,
   msgId,
+  prepareContent,
   titleText,
   sourceGuidance,
   contextEnhanced = false,
@@ -195,7 +196,7 @@ export async function askInWorkspaceSession({
     };
   }
 
-  const prompt = tagPromptWithChannel(text, content, channelLabel, { fromUserId, msgId });
+  const tagged = tagPromptWithChannel(text, content, channelLabel, { fromUserId, msgId });
   const initialTitle = contextEnhanced
     ? initialSessionTitle({
         text: titleText ?? text,
@@ -259,8 +260,13 @@ export async function askInWorkspaceSession({
         await originalOnArtifact?.(artifact);
       };
       let answer;
+      // Prepare session-dependent context after binding, outside the binding
+      // lock. A stale-workspace retry must prepare it for the new session too.
+      const prompt = prepareContent
+        ? await prepareContent({ sessionId: binding.sessionId, content: tagged.content, text: tagged.text })
+        : tagged.content ?? tagged.text;
       try {
-        answer = await binding.session.ask(prompt.content ?? prompt.text, artifactOptions);
+        answer = await binding.session.ask(prompt, artifactOptions);
       } catch (error) {
         if (error?.code === 'harness-reply-timeout' && deferredDelivery) {
           try {

@@ -1,3 +1,4 @@
+import { createConnectionDiagnostics, atConnectionStage } from '../shared/connection-error.mjs';
 import { WSAuthFailureError, WSClient, WSReconnectExhaustedError } from '@wecom/aibot-node-sdk';
 
 import { createWecomBridgeStatus, WecomHarnessBridge, sendWecomImage } from './wecom-bridge.mjs';
@@ -38,6 +39,7 @@ export class WecomRuntime {
   #contextEnhancement;
   #accessPolicy;
   #logger;
+  #diagnostics;
   #replyTimeoutMs;
   #connectTimeoutMs;
   #maxReconnectAttempts;
@@ -73,7 +75,7 @@ export class WecomRuntime {
     this.#state = state;
     this.#contextEnhancement = contextEnhancement;
     this.#accessPolicy = accessPolicy;
-    this.#logger = logger;
+    this.#logger = logger; this.#diagnostics = createConnectionDiagnostics({ channel: 'wecom', logger });
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#connectTimeoutMs = connectTimeoutMs;
     this.#maxReconnectAttempts = maxReconnectAttempts;
@@ -104,8 +106,8 @@ export class WecomRuntime {
     signal.throwIfAborted();
     this.#status.startedAt = new Date().toISOString();
     this.#status.wecomConnectionState = 'connecting';
-    this.#status.lastError = null;
-    await this.#harness.ensureRunning();
+    this.#status.lastError = null; this.#status.error = null; this.#diagnostics.clear();
+    await atConnectionStage('harness.check', () => this.#harness.ensureRunning());
     this.#status.harnessReachable = true;
 
     const silentSdkLogger = { debug() {}, info() {}, warn() {}, error() {} };
@@ -147,7 +149,7 @@ export class WecomRuntime {
       this.#status.wecomConnectionState = 'connected';
       this.#status.lastCheckedAt = now;
       this.#status.lastConnectedAt = now;
-      this.#status.lastError = null;
+      this.#status.lastError = null; this.#status.error = null; this.#diagnostics.clear();
       readyResolve();
     };
     const onDisconnected = () => {
@@ -170,7 +172,8 @@ export class WecomRuntime {
         this.#status.ready = false;
         this.#status.wecomConnectionState = 'failed';
       }
-      this.#status.lastError = terminal ? error.name : 'connection-error';
+      this.#status.error = this.#diagnostics.report(error, { operation: 'connection.monitor', botId: this.#config?.botId, automatic: true }).publicError;
+      this.#status.lastError = this.#status.error.message;
       this.#logger.warn?.(`[dsh-im:wecom] bot ${this.#config.botId} connection error`);
     };
     const onMessage = (frame) => this.#bridge?.accept(frame);
@@ -202,7 +205,8 @@ export class WecomRuntime {
       }
       this.#status.ready = false;
       this.#status.wecomConnectionState = 'failed';
-      this.#status.lastError = error?.message ?? String(error);
+      this.#status.error = this.#diagnostics.report(error, { operation: 'connection.monitor', botId: this.#config?.botId, automatic: true }).publicError;
+      this.#status.lastError = this.#status.error.message;
       await this.#stopActive();
       throw error;
     } finally {
