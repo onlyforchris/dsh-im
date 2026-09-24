@@ -11,6 +11,7 @@ export default {
   "模型图片总量上限 (MB)": "Model total image limit (MB)",
   "每条消息最多图片数": "Maximum images per message",
   "图片输入": "Image input",
+  "查看图片输入说明": "View image input details",
   "适用于支持图片的聊天渠道。原图按附件保留时长保存，发送给模型的副本会自动缩放或压缩；无法直接发送时交给模型按文件处理。": "Applies to chat channels that support images. Originals follow attachment retention settings. Model copies are resized or compressed automatically; images that cannot be sent directly are provided as files.",
   "保存图片设置": "Save image settings",
   "正在读取图片设置…": "Loading image settings…"

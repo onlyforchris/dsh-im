@@ -628,7 +628,7 @@ export class FeishuRuntime {
     });
   }
 
-  async sendProactiveText(target, text, { signal } = {}) {
+  async sendProactiveText(target, text, { signal, format = 'plain' } = {}) {
     if (!this.#status.ready || !this.#client) {
       const error = new Error('飞书机器人尚未连接');
       error.code = 'bot-not-connected';
@@ -646,13 +646,23 @@ export class FeishuRuntime {
       error.code = 'invalid-target';
       throw error;
     }
+    if (format !== 'plain' && format !== 'markdown') {
+      const error = new TypeError('Message format must be plain or markdown');
+      error.code = 'bad-request';
+      throw error;
+    }
     signal?.throwIfAborted();
+    // Use the same native Markdown element as chat, without opening a stream
+    // or retrying as plain text after a possibly accepted delivery.
+    const content = format === 'markdown'
+      ? { schema: '2.0', body: { elements: [{ tag: 'markdown', content: text }] } }
+      : { text };
     const response = await this.#client.im.v1.message.create({
       params: { receive_id_type: receiveIdType },
       data: {
         receive_id: receiveId,
-        msg_type: 'text',
-        content: JSON.stringify({ text }),
+        msg_type: format === 'markdown' ? 'interactive' : 'text',
+        content: JSON.stringify(content),
       },
     });
     if (response?.code && response.code !== 0) {

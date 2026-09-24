@@ -18,10 +18,16 @@ import {
   ClockSkewGuard,
   compileIgnorePatterns,
   EventDedupeRing,
+  isMatrixCommandLike,
   normalizeMatrixDeliveryTarget,
   normalizeMatrixTimelineEvent,
   resolveBangMatrixCommand,
 } from './matrix-normalize.mjs';
+import {
+  DEFAULT_ROOM_HISTORY_LIMIT,
+  formatRoomContextBlock,
+  roomContextDayStartTs,
+} from './matrix-room-history.mjs';
 import {
   applyMatrixRelations,
   buildMatrixEditContent,
@@ -38,6 +44,13 @@ const INVITE_JOIN_TIMEOUT_MS = 45_000;
 const DEFAULT_MAX_MESSAGE_LENGTH = 16_000;
 const DEFAULT_MAX_MEDIA_BYTES = 104_857_600;
 const EDIT_STREAM_INTERVAL_MS = 350;
+
+function safeInt(value, min, max, fallback) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return fallback;
+  const rounded = Math.trunc(value);
+  if (!Number.isSafeInteger(rounded)) return fallback;
+  return Math.min(Math.max(rounded, min), max);
+}
 const DEAD_ROOM_MARKERS = Object.freeze(['no servers', 'room not found']);
 const IMAGE_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
 
@@ -104,6 +117,16 @@ function inviteSenderOf(inviteRoom) {
       && typeof event.sender === 'string') return event.sender;
   }
   return null;
+}
+
+// A room is a direct chat only when the homeserver itself says so: the invite's own membership event
+// carries is_direct, or the account's m.direct listing names the room. A two-member room is an
+// ordinary room, where the mention gate must keep applying, so the joined-member count is never a signal.
+function inviteMarksDirect(inviteRoom) {
+  const events = Array.isArray(inviteRoom?.invite_state?.events) ? inviteRoom.invite_state.events : [];
+  return events.some((event) => event?.type === 'm.room.member'
+    && event?.content?.membership === 'invite'
+    && event?.content?.is_direct === true);
 }
 
 function timelineEventsOf(joinRoom) {
@@ -186,6 +209,7 @@ export class MatrixRuntime {
     createApi = (options) => new MatrixApi(options),
     cryptoStore = null,
     createCrypto = null,
+    roomHistory = null,
     isKnownCommand,
   } = {}) {
     const homeserver = validateMatrixHomeserver(config.homeserver);
@@ -233,6 +257,17 @@ export class MatrixRuntime {
       ? createCrypto
       : (options) => new MatrixCryptoEngine(options);
     this.#isKnownCommand = typeof isKnownCommand === 'function' ? isKnownCommand : () => false;
+    this.#roomHistory = roomHistory
+      && typeof roomHistory.append === 'function'
+      && typeof roomHistory.consumePending === 'function'
+      && typeof roomHistory.pending === 'function'
+      && typeof roomHistory.search === 'function'
+      ? roomHistory
+      : null;
+    this.#roomContextLimit = safeInt(config.roomContextLimit, 1, 500, 50);
+    this.#roomContextMaxChars = safeInt(config.roomContextMaxChars, 200, 200_000, 8_000);
+    this.#roomContextTzOffsetMinutes = safeInt(config.roomContextTzOffsetMinutes, -840, 840, 0);
+    this.#roomContextEnabled = config.roomContextEnabled !== false;
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#patterns = compileIgnorePatterns(config.ignoreUserPatterns);
     for (const roomId of toRoomSet(config.freeResponseRooms)) this.#freeRooms.add(roomId);
@@ -241,6 +276,11 @@ export class MatrixRuntime {
 
   #freeRooms = new Set();
   #allowedRooms = new Set();
+  #roomHistory = null;
+  #roomContextLimit = 50;
+  #roomContextMaxChars = 8_000;
+  #roomContextTzOffsetMinutes = 0;
+  #roomContextEnabled = true;
 
   get status() {
     return this.#status;
@@ -437,12 +477,13 @@ export class MatrixRuntime {
       if (!Array.isArray(list)) continue;
       for (const roomId of list) if (isMatrixRoomId(roomId)) this.#dmRooms.add(roomId);
     }
-    for (const roomId of this.#sidecar.dmRooms()) this.#dmRooms.add(roomId);
+    // A persisted direct chat survives only where the bot really routes a person to it, or where the
+    // account data above re-registers it: residue from the retired member-count rule is forgotten here.
+    const routedTo = new Set(Object.values(this.#sidecar.dmRoomByUser()).filter((roomId) => isMatrixRoomId(roomId)));
+    for (const roomId of this.#sidecar.dmRooms()) if (routedTo.has(roomId)) this.#dmRooms.add(roomId);
     for (const roomId of this.#sidecar.joinedRooms()) this.#joinedRooms.add(roomId);
-    await this.#classifyUnknownRooms();
-    for (const roomId of Object.keys(rooms.invite ?? {})) {
-      const inviter = inviteSenderOf(rooms.invite?.[roomId]);
-      this.#scheduleInviteJoin(roomId, inviter);
+    for (const [roomId, room] of Object.entries(rooms.invite ?? {})) {
+      this.#scheduleInviteJoin(roomId, inviteSenderOf(room), inviteMarksDirect(room));
     }
     // Queued to-device room keys land before the offline timeline replay so queued ciphertext can decrypt on first sight.
     await this.#dispatchToDeviceEvents(initial?.to_device?.events);
@@ -459,14 +500,6 @@ export class MatrixRuntime {
     }
     this.#status.joinedRooms = this.#joinedRooms.size;
     this.#status.encryptedRoomsSeen = this.#encryptedRooms.size;
-  }
-
-  async #classifyUnknownRooms() {
-    for (const roomId of this.#joinedRooms) {
-      if (this.#dmRooms.has(roomId)) continue;
-      const count = await this.#api.getJoinedMemberCount(roomId).catch(() => null);
-      if (count !== null && count <= 2) this.#dmRooms.add(roomId);
-    }
   }
 
   async #syncLoop(generation) {
@@ -537,7 +570,7 @@ export class MatrixRuntime {
     }
     for (const [roomId, room] of Object.entries(rooms.invite ?? {})) {
       if (!isMatrixRoomId(roomId)) continue;
-      this.#scheduleInviteJoin(roomId, inviteSenderOf(room));
+      this.#scheduleInviteJoin(roomId, inviteSenderOf(room), inviteMarksDirect(room));
     }
     if (typeof data?.next_batch === 'string' && data.next_batch) {
       this.#lastBatch = data.next_batch;
@@ -588,6 +621,7 @@ export class MatrixRuntime {
         this.#status.lastClockSkewAt = new Date().toISOString();
         this.#logger.warn?.(t('Matrix 收到的时间戳持续远落后于本机时间，检测到本机时钟超前，请校准系统时间后重启机器人。'));
       }
+      if (outcome.drop === 'mention-required') this.#recordRoomAmbient(roomId, event);
       return;
     }
     const message = { ...outcome.message };
@@ -598,12 +632,90 @@ export class MatrixRuntime {
         message.addressed = true;
       }
     }
+    if (this.#roomHistory && this.#roomContextEnabled && message.kind === 'group') {
+      if (message.addressed) {
+        const commandLike = isMatrixCommandLike(message.content);
+        const directAddress = message.mentioned === true || Boolean(message.replyToEventId);
+        this.#recordRoomHuman(message, { kind: commandLike ? 'command' : 'human', injected: true });
+        if (!commandLike && directAddress) {
+          const block = this.#consumeRoomContext(message.roomId);
+          if (block) {
+            const label = t('【下面这条才是对你的提问，请只回答它】');
+            message.content = `${block}\n\n${label}\n${message.content}`;
+          }
+        }
+      } else {
+        this.#recordRoomHuman(message, { kind: 'human', injected: false });
+      }
+    }
     void Promise.resolve(this.#bridge?.accept(message)).catch((error) => {
       this.#logger.warn?.('[dsh-im:matrix] inbound message handling failed:', error?.message ?? error);
     });
     if (message.addressed) {
       void this.#api?.setTyping(message.roomId, { typing: true, timeoutMs: 20_000 }).catch(() => undefined);
     }
+  }
+
+  #recordRoomAmbient(roomId, event) {
+    if (!this.#roomHistory || !this.#roomContextEnabled) return;
+    if (this.#dmRooms.has(roomId)) return;
+    const eventId = typeof event?.event_id === 'string' ? event.event_id : '';
+    const sender = typeof event?.sender === 'string' ? event.sender : '';
+    const body = typeof event?.content?.body === 'string' ? event.content.body.trim() : '';
+    if (!eventId || !sender || !body) return;
+    const self = this.#botUserId?.toLowerCase() ?? '';
+    if (self !== '' && sender.toLowerCase() === self) return;
+    this.#roomHistory.append({
+      roomId,
+      eventId,
+      sender,
+      text: body,
+      ts: Number.isSafeInteger(event?.origin_server_ts) ? event.origin_server_ts : Date.now(),
+      kind: 'human',
+      injected: false,
+    });
+  }
+
+  #recordRoomHuman(message, { kind = 'human', injected = false } = {}) {
+    if (!this.#roomHistory || !this.#roomContextEnabled) return;
+    const text = typeof message.content === 'string' ? message.content.trim() : '';
+    if (!text || !message.messageId || !message.senderId) return;
+    const self = this.#botUserId?.toLowerCase() ?? '';
+    if (self !== '' && message.senderId.toLowerCase() === self) return;
+    this.#roomHistory.append({
+      roomId: message.roomId,
+      eventId: message.messageId,
+      sender: message.senderId,
+      text,
+      ts: Date.now(),
+      kind,
+      injected,
+    });
+  }
+
+  #consumeRoomContext(roomId) {
+    if (!this.#roomHistory) return '';
+    const now = Date.now();
+    const selected = this.#roomHistory.consumePending({
+      roomId,
+      sinceTs: roomContextDayStartTs(now, this.#roomContextTzOffsetMinutes),
+      limit: this.#roomContextLimit,
+      maxChars: this.#roomContextMaxChars,
+      now,
+    });
+    if (selected.length === 0) return '';
+    // The room timeline echoes the bot's own messages too; showing them as other members' speech makes
+    // the model quote itself and answer its own earlier reply, so only third-party lines are presented.
+    const self = this.#botUserId?.toLowerCase() ?? '';
+    const others = selected.filter((entry) => self === '' || String(entry?.sender ?? '').toLowerCase() !== self);
+    if (others.length === 0) return '';
+    return formatRoomContextBlock(others, {
+      header: t('【群聊背景】以下各条是群里其他成员之间的发言，均未指向你。'),
+      instruction: t('这些内容只用来了解现场发生过什么。请勿逐条回应、复述、翻译或总结它们，也不要因为它们而改变下面那条提问的回答。'),
+      begin: t('—— 背景开始 ——'),
+      end: t('—— 背景结束（以上无需回应） ——'),
+      tzOffsetMinutes: this.#roomContextTzOffsetMinutes,
+    });
   }
 
   #noteEncryptedRoom(roomId) {
@@ -619,7 +731,7 @@ export class MatrixRuntime {
 
   // ---- 邀请 join ----
 
-  #scheduleInviteJoin(roomId, inviter) {
+  #scheduleInviteJoin(roomId, inviter, marksDirect = false) {
     if (this.#stopped || !isMatrixRoomId(roomId) || this.#joinedRooms.has(roomId)) return;
     if (this.#sidecar.isDeclined(roomId)) return;
     const allowed = this.#config.autoJoinInvites === 'all' || inviterAllowed(this.#accessPolicy, inviter);
@@ -633,12 +745,12 @@ export class MatrixRuntime {
     if (this.#inviteTasks.has(roomId)) return;
     const controller = new AbortController();
     this.#inviteTasks.set(roomId, controller);
-    void this.#joinInvitedRoom(roomId, inviter, controller).finally(() => {
+    void this.#joinInvitedRoom(roomId, inviter, controller, marksDirect).finally(() => {
       this.#inviteTasks.delete(roomId);
     });
   }
 
-  async #joinInvitedRoom(roomId, inviter, controller) {
+  async #joinInvitedRoom(roomId, inviter, controller, marksDirect = false) {
     const timeout = AbortSignal.timeout(INVITE_JOIN_TIMEOUT_MS);
     const signal = AbortSignal.any([controller.signal, timeout]);
     try {
@@ -646,7 +758,7 @@ export class MatrixRuntime {
       this.#joinedRooms.add(roomId);
       this.#status.joinedRooms = this.#joinedRooms.size;
       await this.#sidecar.apply({ joinedRooms: [...this.#joinedRooms] });
-      if (inviter) await this.#recordDmRoom(roomId, inviter);
+      if (inviter) await this.#recordDmRoom(roomId, inviter, marksDirect);
       this.#logger.info?.(t('Matrix 已按授权邀请加入房间 {room}。'), { room: roomId });
     } catch (error) {
       const text = String(error?.message ?? '').toLowerCase();
@@ -664,14 +776,16 @@ export class MatrixRuntime {
     }
   }
 
-  async #recordDmRoom(roomId, inviter) {
+  // The inviter's cached room stays usable for outbound routing either way; only an authoritative
+// is_direct invite registers the room as a direct chat for inbound handling.
+  async #recordDmRoom(roomId, inviter, marksDirect = false) {
     const direct = await this.#api.getAccountData('m.direct').catch(() => null);
     const map = { ...(direct && typeof direct === 'object' && !Array.isArray(direct) ? direct : {}) };
     const list = Array.isArray(map[inviter]) ? [...map[inviter]] : [];
     if (!list.includes(roomId)) list.push(roomId);
     map[inviter] = list;
     await this.#api.setAccountData('m.direct', map).catch(() => undefined);
-    this.#dmRooms.add(roomId);
+    if (marksDirect) this.#dmRooms.add(roomId);
     const dmRoomByUser = { ...this.#sidecar.dmRoomByUser(), [inviter.trim().toLowerCase()]: roomId };
     await this.#sidecar.apply({ dmRooms: [...this.#dmRooms], dmRoomByUser });
   }

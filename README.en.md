@@ -251,7 +251,9 @@ Startup configuration validation failures also include `file`, `field`, and `iss
 
 ## Local development
 
-The Web profile is verified with unmodified DSH `0.1.2-alpha.4`, `0.1.2-alpha.5`, `0.1.2-rc.1`, `0.1.3-alpha.1`, and `0.1.5-alpha.1`. All use the same dsh-im management RPC adapter through the public Connection `/api` Fetch registry; no DSH patch or rebuild is required. After upgrading the plugin, restart the Host and refresh the settings page so both sides use the same plugin build.
+The latest dsh-im follows the latest DSH, with DSH `0.1.7-alpha.1` (Session format V4) as this update's supported baseline. New features and fixes do not add compatibility branches for older DSH versions; existing unrelated compatibility code remains in place. Older hosts should use the corresponding historical plugin release. `package.json` declares only the host versions actually verified for this build, without promising support for untested future releases. After upgrading the plugin, restart the Host and refresh the settings page so both sides use the same plugin build.
+
+Source details, guidance, and quoted replies now use the V4 `plugin:dsh-im` source kind, fixing `SessionFormatError: format v4 message requires a producer-owned source kind`. Message ordering, user text, and session-level guidance deduplication retain their existing behavior. The host owns historical Session migration.
 
 ```sh
 npm install
@@ -260,6 +262,8 @@ node bin/dsh-im.mjs install --source .
 ```
 
 `npm run check` runs unit tests, builds the Host and Client artifacts, and verifies that the published package contains neither credentials nor standalone channel settings-page registrations.
+
+After building, run `node scripts/verify-injected-context.mjs /path/to/built/deepseek-harness` to exercise the bundled context hook against real DSH V4 JSONL persistence. It covers plain messages, source details, guidance, quoted replies, combined blocks, and multipart text, including reopening the log and appending another turn. The script loads components from the supplied host and cleans up its temporary Session directory; no bot credentials or model requests are needed.
 
 IM management uses Harness browser authentication and Host/Origin trust checks by default. Once Harness allows and authenticates access from your LAN address, you can view and configure IM bots without any extra dsh-im configuration.
 

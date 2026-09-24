@@ -254,7 +254,9 @@ Logo 由 dsh-im 的浏览器适配显示，无需修改 DSH。适配保留原始
 
 ## 本地开发
 
-Web profile 已验证兼容原版 DSH `0.1.2-alpha.4`、`0.1.2-alpha.5`、`0.1.2-rc.1`、`0.1.3-alpha.1` 和 `0.1.5-alpha.1`。这些版本共用 dsh-im 的管理 RPC 适配，通过 Connection 的公开 `/api` Fetch 注册接口工作，无需修改或重新编译 DSH。升级插件后重启 Host 并刷新设置页，使 Host 和客户端使用同一版插件。
+最新版 dsh-im 跟随最新版 DSH，本次支持基线为 DSH `0.1.7-alpha.1`（Session 格式 v4）。后续功能和修复不再增加旧版 DSH 的兼容分支，已有其他兼容逻辑暂时保留；旧宿主请使用对应的历史插件版本。`package.json` 只声明当前实际验证的宿主版本，不承诺未经验证的未来版本。升级插件后重启 Host 并刷新设置页，使 Host 和客户端使用同一版插件。
+
+上下文增强中的来源信息、引导词和引用回复使用 v4 的 `plugin:dsh-im` 来源字段，修复了它们触发的 `SessionFormatError: format v4 message requires a producer-owned source kind`。消息顺序、用户正文和会话级引导词去重沿用原有机制，历史会话由宿主负责迁移。
 
 ```sh
 npm install
@@ -263,6 +265,8 @@ node bin/dsh-im.mjs install --source .
 ```
 
 `npm run check` 运行单元测试、构建 Host/Client 产物，并验证发布包不包含凭据或独立渠道设置页注册。
+
+构建后运行 `node scripts/verify-injected-context.mjs /path/to/built/deepseek-harness`，验证发布产物中的上下文钩子能通过真实 DSH v4 JSONL 持久化，覆盖普通消息、来源信息、引导词、引用、组合和多段文本，以及关闭后重新读取、继续写入下一轮。脚本从指定宿主加载组件，使用并清理临时会话目录，无需机器人凭据或模型请求。
 
 IM 管理接口默认沿用 Harness 的浏览器认证和 Host／Origin 信任检查。只要 Harness 已允许并认证当前局域网访问，便可直接查看和配置 IM 机器人，无需额外修改 dsh-im 配置。
 

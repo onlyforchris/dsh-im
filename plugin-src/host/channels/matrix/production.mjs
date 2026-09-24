@@ -5,6 +5,7 @@ import { MatrixConfigStore, MatrixSidecarStore } from '../../../../src/channels/
 import { MatrixController } from '../../../../src/channels/matrix/matrix-controller.mjs';
 import { MatrixCryptoStore, matrixCryptoPathFor } from '../../../../src/channels/matrix/matrix-crypto-store.mjs';
 import { MatrixHarnessClient } from '../../../../src/channels/matrix/matrix-harness-client.mjs';
+import { MatrixRoomHistoryStore, matrixRoomHistoryPathFor } from '../../../../src/channels/matrix/matrix-room-history.mjs';
 import { MatrixRuntime } from '../../../../src/channels/matrix/matrix-runtime.mjs';
 import { ConversationStateStore } from '../../../../src/channels/shared/conversation-state-store.mjs';
 import {
@@ -63,10 +64,13 @@ export async function createProductionController(ctx, config = {}, internals = {
   const stateStores = new Map();
   const sidecarStores = new Map();
   const cryptoStores = new Map();
+  const historyStores = new Map();
+  const ResolvedRoomHistory = internals.RoomHistoryStore ?? MatrixRoomHistoryStore;
   const ResolvedCryptoStore = internals.CryptoStore ?? MatrixCryptoStore;
   const statePath = (botId) => resolve(paths.bots, botId, 'state.json');
   const sidecarPath = (botId) => resolve(paths.bots, botId, 'matrix.json');
   const cryptoPath = (botId) => matrixCryptoPathFor(resolve(paths.bots, botId));
+  const historyPath = (botId) => matrixRoomHistoryPathFor(resolve(paths.bots, botId));
   const stateFor = async (botId) => {
     let state = stateStores.get(botId);
     if (!state) {
@@ -90,6 +94,14 @@ export async function createProductionController(ctx, config = {}, internals = {
       cryptoStores.set(botId, crypto);
     }
     return crypto;
+  };
+  const historyFor = async (botId) => {
+    let history = historyStores.get(botId);
+    if (!history) {
+      history = await new ResolvedRoomHistory(historyPath(botId)).load();
+      historyStores.set(botId, history);
+    }
+    return history;
   };
   const commandExecutor = createHarnessCommandExecutor(ctx, internals.commandExecutor);
   const inboundTtl = internals.inboundTtl ?? getInboundTtlRuntime(ctx, config);
@@ -137,6 +149,7 @@ export async function createProductionController(ctx, config = {}, internals = {
       });
       const e2eeMode = String(botConfig?.e2eeMode ?? 'optional').trim().toLowerCase();
       const cryptoStore = e2eeMode === 'off' ? null : await cryptoFor(botId);
+      const roomHistory = await historyFor(botId);
       return new ResolvedRuntime({
         config: botConfig,
         ...(accessToken ? { accessToken } : {}),
@@ -145,6 +158,7 @@ export async function createProductionController(ctx, config = {}, internals = {
         harness: workspaceScope.harness,
         state: workspaceScope.state,
         sidecar,
+        roomHistory,
         ...(cryptoStore ? { cryptoStore } : {}),
         contextEnhancement: { botId, getSettings: () => workspaces.contextEnhancementFor(botId) },
         accessPolicy: accessPolicyProvider(workspaces, botId, {

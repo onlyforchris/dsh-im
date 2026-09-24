@@ -13,6 +13,9 @@ const E2EE_MODES = new Set(['off', 'optional', 'required']);
 const AUTO_JOIN_MODES = new Set(['authorized', 'all']);
 const MAX_MESSAGE_LENGTH_BOUNDS = Object.freeze({ min: 500, max: 65_535 });
 const MAX_MEDIA_BYTES_CEILING = 104_857_600;
+const ROOM_CONTEXT_LIMIT_BOUNDS = Object.freeze({ min: 1, max: 500 });
+const ROOM_CONTEXT_CHARS_BOUNDS = Object.freeze({ min: 200, max: 200_000 });
+const ROOM_CONTEXT_TZ_BOUNDS = Object.freeze({ min: -840, max: 840 });
 
 function cleanString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
@@ -179,10 +182,15 @@ export class MatrixConfigStore {
     const allowedRooms = roomIdList(value.allowedRooms);
     const freeResponseRooms = roomIdList(value.freeResponseRooms);
     const ignoreUserPatterns = patternList(value.ignoreUserPatterns);
+    const roomContextLimit = boundedInteger(value.roomContextLimit, ROOM_CONTEXT_LIMIT_BOUNDS);
+    const roomContextMaxChars = boundedInteger(value.roomContextMaxChars, ROOM_CONTEXT_CHARS_BOUNDS);
+    const roomContextTzOffsetMinutes = boundedInteger(value.roomContextTzOffsetMinutes, ROOM_CONTEXT_TZ_BOUNDS);
     if (!E2EE_MODES.has(e2eeMode) || !AUTO_JOIN_MODES.has(autoJoinInvites)
       || maxMessageLength === null || maxMediaBytes === null
-      || allowedRooms === null || freeResponseRooms === null || ignoreUserPatterns === null) return null;
-    for (const key of ['requireMention', 'processNotices', 'allowRoomMentions', 'reactions']) {
+      || allowedRooms === null || freeResponseRooms === null || ignoreUserPatterns === null
+      || roomContextLimit === null || roomContextMaxChars === null
+      || roomContextTzOffsetMinutes === null) return null;
+    for (const key of ['requireMention', 'processNotices', 'allowRoomMentions', 'reactions', 'roomContextEnabled']) {
       if (value?.[key] !== undefined && typeof value[key] !== 'boolean') return null;
     }
     return Object.freeze({
@@ -208,6 +216,10 @@ export class MatrixConfigStore {
       ...(allowedRooms !== undefined ? { allowedRooms: Object.freeze(allowedRooms) } : {}),
       ...(freeResponseRooms !== undefined ? { freeResponseRooms: Object.freeze(freeResponseRooms) } : {}),
       ...(ignoreUserPatterns !== undefined ? { ignoreUserPatterns: Object.freeze(ignoreUserPatterns) } : {}),
+      ...(typeof value.roomContextEnabled === 'boolean' ? { roomContextEnabled: value.roomContextEnabled } : {}),
+      ...(roomContextLimit !== undefined ? { roomContextLimit } : {}),
+      ...(roomContextMaxChars !== undefined ? { roomContextMaxChars } : {}),
+      ...(roomContextTzOffsetMinutes !== undefined ? { roomContextTzOffsetMinutes } : {}),
     });
   }
 

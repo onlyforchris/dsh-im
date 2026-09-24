@@ -613,6 +613,20 @@ const CSS = String.raw`
 .dim-generalSettingsTab:focus-visible { outline: 2px solid var(--dim-blue); outline-offset: -2px; border-radius: 5px; }
 .dim-generalSettingsTabPanel { min-width: 0; padding-top: 14px; }
 .dim-globalSection { min-width: 0; padding: 14px 16px; border: 1px solid var(--dsw-alias-border-l2, #dfe1e5); border-radius: 12px; background: var(--dsw-alias-bg-layer-3, #fff); }
+.dim-globalSection + .dim-globalSection { margin-top: 12px; }
+.dim-imageSettings { container-type: inline-size; }
+.dim-imageSettings .dim-globalHead { position: relative; }
+.dim-imageSettings .dim-globalTtlHelp { position: static; }
+.dim-globalTtlTooltip.dim-imageSettingsTooltip { width: min(320px, 100%); max-width: none; color: var(--dsw-alias-label-secondary, #646a73); font-size: 11px; line-height: 17px; white-space: normal; overflow-wrap: anywhere; }
+.dim-imageSettingsFields { min-width: 0; display: grid; gap: 12px; margin-top: 12px; }
+.dim-imageSettingsField { min-width: 0; display: grid; grid-template-columns: minmax(0, 220px) minmax(0, 160px); align-items: center; gap: 6px 16px; }
+.dim-imageSettingsField label { min-width: 0; color: var(--dsw-alias-label-secondary, #646a73); font-size: 13px; line-height: 20px; overflow-wrap: anywhere; }
+.dim-imageSettingsField .dim-globalTtlInput { width: 100%; min-width: 0; }
+.dim-imageSettingsActions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.dim-globalInline.dim-imageSettingsFeedback { margin: 10px 0 0; }
+@container (max-width: 380px) {
+  .dim-imageSettingsField { grid-template-columns: minmax(0, 1fr); }
+}
 .dim-globalHead { min-width: 0; display: flex; align-items: center; }
 .dim-globalHeadTitle { min-width: 0; display: inline-flex; align-items: center; gap: 6px; }
 .dim-globalHead h3 { min-width: 0; overflow: hidden; margin: 0; color: var(--dsw-alias-label-primary, #1f2329); font-size: 15px; line-height: 22px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }

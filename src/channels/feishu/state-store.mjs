@@ -202,12 +202,13 @@ export class StateStore {
 
   async #persist() {
     const snapshot = JSON.stringify(this.#state, null, 2) + '\n';
-    this.#writeQueue = this.#writeQueue.then(async () => {
+    const operation = this.#writeQueue.then(async () => {
       await mkdir(dirname(this.#path), { recursive: true, mode: 0o700 });
       const temporary = `${this.#path}.tmp`;
       await writeFile(temporary, snapshot, { encoding: 'utf8', mode: 0o600 });
       await rename(temporary, this.#path);
     });
-    await this.#writeQueue;
+    this.#writeQueue = operation.then(() => undefined, () => undefined);
+    await operation;
   }
 }

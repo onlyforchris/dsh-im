@@ -7,6 +7,7 @@ import { deepStrictEqual, equal, match, ok, rejects } from 'node:assert';
 import { MatrixRuntime } from '../../../src/channels/matrix/matrix-runtime.mjs';
 import { MatrixSidecarStore } from '../../../src/channels/matrix/matrix-config-store.mjs';
 import { MatrixApiError } from '../../../src/channels/matrix/matrix-api.mjs';
+import { MatrixRoomHistoryStore } from '../../../src/channels/matrix/matrix-room-history.mjs';
 
 const HOME = 'https://matrix.example.org';
 const BOT = '@bot:example.org';
@@ -184,6 +185,7 @@ async function createContext(options = {}) {
     harness,
     state,
     sidecar,
+    roomHistory: options.roomHistory ?? null,
     accessPolicy,
     logger,
     createApi: () => fake,
@@ -206,6 +208,85 @@ const sentReactions = (fake) => fake.calls.filter((call) => call.op === 'send' &
 const deliveredAnswers = (fake, answer) => sentMessages(fake).some((call) =>
   call.content['m.new_content']?.body === answer || call.content.body === answer);
 
+test('a two-member room stays an ordinary room: unaddressed chatter is ignored and only a mention answers', async () => {
+  const plain = messageEvent({ sender: '@carol:example.org', body: '二人小群的闲聊' });
+  const mentioned = messageEvent({
+    sender: '@carol:example.org',
+    body: '帮帮我 <@BOT:Example.org>',
+    content: { 'm.mentions': { user_ids: ['@Bot:Example.org'] } },
+  });
+  const context = await createContext({
+    apiOptions: {
+      memberCounts: { '!group:example.org': 2 },
+      initial: {
+        next_batch: 'b0',
+        rooms: { join: { '!group:example.org': { timeline: { events: [plain, mentioned] } } } },
+      },
+    },
+  });
+  try {
+    await context.runtime.start();
+    await eventually(() => deliveredAnswers(context.fake, '好的'));
+    deepStrictEqual(context.runtime.status.messagesReceived, 1,
+      'the joined member count alone must not classify the room as a direct chat');
+    deepStrictEqual(context.sidecar.dmRooms().includes('!group:example.org'), false);
+    ok(sentMessages(context.fake).every((call) => call.roomId === '!group:example.org'));
+  } finally {
+    await context.stop();
+  }
+});
+
+test('a room the retired member-count rule had recorded as a direct chat is forgotten on load', async () => {
+  const plain = messageEvent({ sender: '@carol:example.org', body: '群里随口一句' });
+  const context = await createContext({
+    apiOptions: {
+      initial: {
+        next_batch: 'b0',
+        rooms: { join: { '!group:example.org': { timeline: { events: [plain] } } } },
+      },
+    },
+  });
+  try {
+    await context.sidecar.apply({ dmRooms: ['!group:example.org'], joinedRooms: ['!group:example.org'] });
+    await context.runtime.start();
+    await new Promise((resolve) => setTimeout(resolve, 160));
+    deepStrictEqual(context.runtime.status.messagesReceived, 0,
+      'the stale direct-chat record alone must not let unaddressed room chatter through the gate');
+    deepStrictEqual(context.sidecar.dmRooms().includes('!group:example.org'), false,
+      'the stale direct-chat record is dropped once the runtime persists its classification again');
+  } finally {
+    await context.stop();
+  }
+});
+
+test('an invite whose membership event carries is_direct registers a direct room', async () => {
+  const context = await createContext({
+    apiOptions: {
+      initial: {
+        next_batch: 'b0',
+        rooms: {
+          invite: {
+            '!dm-invite:example.org': {
+              invite_state: { events: [{
+                type: 'm.room.member',
+                sender: '@owner:example.org',
+                state_key: '@bot:example.org',
+                content: { membership: 'invite', is_direct: true },
+              }] },
+            },
+          },
+        },
+      },
+    },
+  });
+  try {
+    await context.runtime.start();
+    await eventually(() => context.sidecar.dmRooms().includes('!dm-invite:example.org'),
+      'the authoritative is_direct invite registers the room as a direct chat');
+  } finally {
+    await context.stop();
+  }
+});
 test('the DM round trip reaches the harness and streams the answer with typing, preview and reaction', async () => {
   const event = messageEvent();
   const context = await createContext({
@@ -352,9 +433,14 @@ test('the dedupe ring swallows replayed events inside one runtime lifetime', asy
 });
 
 test('invites honor the access policy, decline dead rooms permanently and respect the all mode', async () => {
-  const inviteState = (sender) => ({
+  const inviteState = (sender, { isDirect = false } = {}) => ({
     '!inv:example.org': {
-      invite_state: { events: [{ type: 'm.room.member', sender, content: { membership: 'invite' }, state_key: '@victim:example.org' }] },
+      invite_state: { events: [{
+        type: 'm.room.member',
+        sender,
+        content: { membership: 'invite', ...(isDirect ? { is_direct: true } : {}) },
+        state_key: '@victim:example.org',
+      }] },
     },
   });
   const allowlisted = {
@@ -386,8 +472,9 @@ test('invites honor the access policy, decline dead rooms permanently and respec
     await eventually(() => joined.fake.calls.some((call) => call.op === 'join' && call.roomId === '!inv:example.org'));
     await eventually(() => joined.sidecar.dmRoomByUser()['@owner:example.org'] === '!inv:example.org');
     deepStrictEqual(joined.sidecar.dmRoomByUser()['@owner:example.org'], '!inv:example.org',
-      'the inviter gains a cached dm room so replies route there');
-    deepStrictEqual(joined.sidecar.dmRooms().includes('!inv:example.org'), true);
+      'the inviter gains a cached room so outbound replies route there');
+    deepStrictEqual(joined.sidecar.dmRooms().includes('!inv:example.org'), false,
+      'an invite without an authoritative direct flag stays an ordinary room, so the mention gate keeps applying');
   } finally {
     await joined.stop();
   }
@@ -786,6 +873,89 @@ test('a live crypto engine decrypts inbound megolm traffic, seals outbound sends
 
     await context.stop();
     ok(engine.stopped, 'stopping the runtime stops the crypto engine');
+  } finally {
+    await context.stop();
+  }
+});
+
+test('the bot own room messages are neither recorded nor presented as other member speech', async () => {
+  const own = messageEvent({ sender: BOT, body: '我上一轮答过的内容' });
+  const ambient = messageEvent({ sender: '@carol:example.org', body: '今天的构建报错了' });
+  const mention = messageEvent({
+    sender: '@alice:example.org',
+    body: '@bot:example.org 怎么办',
+    content: { 'm.mentions': { user_ids: [BOT] } },
+  });
+  const directory = await makeTempDirectory('dsh-im-matrix-history-own-');
+  const history = await new MatrixRoomHistoryStore(join(directory, 'matrix-history.json')).load();
+  const context = await createContext({
+    roomHistory: history,
+    apiOptions: {
+      initial: {
+        next_batch: 's1',
+        rooms: { join: { '!group:example.org': { timeline: { events: [own, ambient, mention] } } } },
+      },
+    },
+  });
+  try {
+    await context.runtime.start();
+    await eventually(() => context.harness.prompts.some((prompt) => prompt.includes('怎么办')),
+      'the mention reaches the harness');
+    const prompt = context.harness.prompts.at(-1);
+    ok(prompt.includes('今天的构建报错了'), 'third-party chatter is still offered as background');
+    ok(!prompt.includes('我上一轮答过的内容'), 'the bot own echoed message is not presented as other member speech');
+    deepStrictEqual(history.search({ roomId: '!group:example.org', query: '我上一轮答过的内容' }), [],
+      'the bot own message stays out of the shared room record');
+  } finally {
+    await context.stop();
+  }
+});
+test('a mentioned group reply is conditioned on unaddressed same-day room chatter', async () => {
+  const ambient = messageEvent({ sender: '@carol:example.org', body: '今天的构建报错了' });
+  const mention = messageEvent({
+    sender: '@alice:example.org',
+    body: '@bot:example.org 帮我看看怎么办',
+    content: { 'm.mentions': { user_ids: [BOT] } },
+  });
+  const directory = await makeTempDirectory('dsh-im-matrix-history-');
+  const history = await new MatrixRoomHistoryStore(join(directory, 'matrix-history.json')).load();
+  const context = await createContext({
+    roomHistory: history,
+    apiOptions: {
+      initial: {
+        next_batch: 's1',
+        rooms: { join: { '!group:example.org': { timeline: { events: [ambient, mention] } } } } },
+    },
+  });
+  try {
+    await context.runtime.start();
+    await eventually(() => context.harness.prompts.some((prompt) => prompt.includes('帮我看看怎么办')),
+      'the mention reaches the harness');
+    deepStrictEqual(context.harness.prompts.length, 1,
+      'the unaddressed chatter alone never triggers a harness turn');
+    const prompt = context.harness.prompts[0];
+    ok(prompt.includes('今天的构建报错了'), 'the unaddressed same-day chatter is injected as context');
+    ok(prompt.includes('【群聊背景】'), 'the injected history is labelled as third-party background');
+    ok(prompt.includes('请勿逐条回应'), 'the block states that the background must not be answered line by line');
+    ok(prompt.includes('—— 背景开始 ——') && prompt.includes('—— 背景结束'), 'the background run is fenced');
+    ok(prompt.indexOf('—— 背景结束') < prompt.indexOf('【下面这条才是对你的提问'),
+      'the fenced background closes before the addressed question is introduced');
+    ok(prompt.indexOf('【下面这条才是对你的提问') < prompt.indexOf('帮我看看怎么办'),
+      'the addressed question follows its own label and stays outside the background fences');
+    ok(prompt.includes('carol'), 'the injected context attributes the earlier speaker');
+    ok(prompt.indexOf('今天的构建报错了') < prompt.indexOf('帮我看看怎么办'),
+      'the injected context precedes the addressed turn');
+    const retained = history.search({ roomId: '!group:example.org', query: '构建' });
+    ok(retained.some((entry) => entry.kind === 'human' && entry.text === '今天的构建报错了'),
+      'the room record retains the shared unaddressed message for later search');
+    const mentionedRecord = history.search({ roomId: '!group:example.org', query: '帮我看看怎么办' });
+    ok(mentionedRecord.length === 1 && mentionedRecord[0].injected === true,
+      'the addressed turn is retained as already consumed, without the injected block leaking into it');
+    deepStrictEqual(history.pending({ roomId: '!group:example.org' }), [],
+      'injected chatter is consumed and is not re-sent on a later turn');
+    ok(sentMessages(context.fake).some((call) => call.roomId === '!group:example.org'
+      && (call.content.body === '好的' || call.content['m.new_content']?.body === '好的')),
+      'the reply is delivered back to the room that triggered it');
   } finally {
     await context.stop();
   }

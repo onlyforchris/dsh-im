@@ -252,7 +252,7 @@ export function splitLeadingInjectedContext(text, options = {}) {
 }
 
 /**
- * Build the plugin-sourced context message for one parsed block.
+ * Build one context message with the producer-owned source kind required by V4.
  * @param block - one parsed block.
  * @param newId - identity factory for the new message.
  * @param plugin - source plugin name recorded on it.
@@ -260,8 +260,8 @@ export function splitLeadingInjectedContext(text, options = {}) {
  */
 function contextMessage(block, newId, plugin) {
   const source = block.form === 'notice' && typeof block.summary === 'string'
-    ? { kind: 'plugin', plugin, form: 'notice', summary: block.summary }
-    : { kind: 'plugin', plugin, form: block.form };
+    ? { kind: `plugin:${plugin}`, form: 'notice', summary: block.summary }
+    : { kind: `plugin:${plugin}`, form: block.form };
   return {
     id: newId(),
     role: 'user',

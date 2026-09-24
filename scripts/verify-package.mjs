@@ -23,6 +23,7 @@ const required = [
   'lib/client.js',
   'bin/dsh-im.mjs',
   'cordis.patch.yml',
+  'scripts/verify-injected-context.mjs',
   'README.md',
   'README.en.md',
   'PROACTIVE_DELIVERY.md',
