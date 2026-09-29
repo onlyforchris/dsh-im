@@ -30,6 +30,11 @@ import {
   isFeishuStepPushMode,
   normalizeFeishuStepPushMode,
 } from '../../../../src/channels/feishu/step-push-mode.mjs';
+import { normalizeFeishuVoiceConfig } from '../../../../src/channels/feishu/voice-config.mjs';
+import {
+  isSlashPanelConfig,
+  normalizeSlashPanelConfig,
+} from '../../../../src/channels/feishu/slash-command-panel.mjs';
 import {
   FEISHU_ENDPOINTS as FEISHU_CLIENT_ENDPOINTS,
   FEISHU_RPC_CHANNEL,
@@ -304,9 +309,11 @@ function publicBotEntry(entry) {
     contextEnhancement: normalizeContextEnhancementConfig(source.contextEnhancement),
     accessPolicy: normalizeAccessPolicy(source.accessPolicy),
     groupResponseMode: normalizeFeishuGroupResponseMode(source.groupResponseMode),
-    groupTopicReply: source.groupTopicReply === true,
+    mentionTopicReply: source.mentionTopicReply !== false,
     stepPush: source.stepPush === true,
     stepPushMode: normalizeFeishuStepPushMode(source.stepPushMode),
+    voice: normalizeFeishuVoiceConfig(source.voice),
+    slashPanel: normalizeSlashPanelConfig(source.slashPanel),
     groupMessagePermissionGranted: source.groupMessagePermissionGranted === true,
     bot: publicBot(source.bot),
     health: publicHealth(source, connected),
@@ -469,10 +476,10 @@ function validPayload(endpoint, payload) {
       ? null
       : '请选择群聊响应方式。';
   }
-  if (endpoint === FEISHU_ENDPOINTS.setGroupTopicReply) {
-    return hasOnlyKeys(payload, new Set(['botId', 'groupTopicReply']))
+  if (endpoint === FEISHU_ENDPOINTS.setMentionTopicReply) {
+    return hasOnlyKeys(payload, new Set(['botId', 'mentionTopicReply']))
       && safeOpaqueId(payload.botId)
-      && typeof payload.groupTopicReply === 'boolean'
+      && typeof payload.mentionTopicReply === 'boolean'
       ? null
       : '请选择是否以话题方式回复。';
   }
@@ -489,6 +496,24 @@ function validPayload(endpoint, payload) {
       && isFeishuStepPushMode(payload.stepPushMode)
       ? null
       : '请选择分步直推的呈现方式。';
+  }
+  if (endpoint === FEISHU_ENDPOINTS.setVoice) {
+    const voice = payload?.voice;
+    const validVoice = voice === null
+      || (typeof voice === 'object' && !Array.isArray(voice)
+        && (voice.enabled === false || normalizeFeishuVoiceConfig(voice) !== null));
+    return hasOnlyKeys(payload, new Set(['botId', 'voice']))
+      && safeOpaqueId(payload.botId)
+      && validVoice
+      ? null
+      : '语音配置无效。';
+  }
+  if (endpoint === FEISHU_ENDPOINTS.setSlashPanel) {
+    return hasOnlyKeys(payload, new Set(['botId', 'slashPanel']))
+      && safeOpaqueId(payload.botId)
+      && isSlashPanelConfig(payload.slashPanel)
+      ? null
+      : '请选择面板要显示的指令与顺序。';
   }
   return 'Unknown Feishu endpoint.';
 }
@@ -773,12 +798,12 @@ export function createFeishuRpcHandler(controller, { encodeQr = qrCodeDataUrl } 
           await controller.updateGroupResponseMode(payload.botId, payload.groupResponseMode),
           { encodeQr: cachedEncodeQr },
         );
-      } else if (endpoint === FEISHU_ENDPOINTS.setGroupTopicReply) {
-        if (typeof controller.updateGroupTopicReply !== 'function') {
-          throw new Error('Group topic reply update is unavailable');
+      } else if (endpoint === FEISHU_ENDPOINTS.setMentionTopicReply) {
+        if (typeof controller.updateMentionTopicReply !== 'function') {
+          throw new Error('Mention topic reply update is unavailable');
         }
         value = await toPublicFeishuStatus(
-          await controller.updateGroupTopicReply(payload.botId, payload.groupTopicReply),
+          await controller.updateMentionTopicReply(payload.botId, payload.mentionTopicReply),
           { encodeQr: cachedEncodeQr },
         );
       } else if (endpoint === FEISHU_ENDPOINTS.setStepPush) {
@@ -795,6 +820,22 @@ export function createFeishuRpcHandler(controller, { encodeQr = qrCodeDataUrl } 
         }
         value = await toPublicFeishuStatus(
           await controller.updateStepPushMode(payload.botId, payload.stepPushMode),
+          { encodeQr: cachedEncodeQr },
+        );
+      } else if (endpoint === FEISHU_ENDPOINTS.setVoice) {
+        if (typeof controller.updateVoice !== 'function') {
+          throw new Error('Voice update is unavailable');
+        }
+        value = await toPublicFeishuStatus(
+          await controller.updateVoice(payload.botId, payload.voice),
+          { encodeQr: cachedEncodeQr },
+        );
+      } else if (endpoint === FEISHU_ENDPOINTS.setSlashPanel) {
+        if (typeof controller.updateSlashPanel !== 'function') {
+          throw new Error('Slash panel update is unavailable');
+        }
+        value = await toPublicFeishuStatus(
+          await controller.updateSlashPanel(payload.botId, payload.slashPanel),
           { encodeQr: cachedEncodeQr },
         );
       } else {

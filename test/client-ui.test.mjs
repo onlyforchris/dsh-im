@@ -645,7 +645,7 @@ test('Feishu bot settings render one step-push select with four presentations', 
       state: 'connected',
       connected: true,
       groupResponseMode: 'mention',
-      groupTopicReply: false,
+      mentionTopicReply: false,
       stepPush,
       stepPushMode,
       bot: { name: '分步直推机器人', appIdMasked: 'cli_step••••push' },
@@ -685,8 +685,7 @@ test('Feishu bot settings render one step-push select with four presentations', 
   const helpNodes = renderer.root.findAll(
     (node) => node.props?.className === 'dim-feishuGroupHelp',
   );
-  assert.equal(helpNodes.length, 1);
-  assert.match(nodeText(helpNodes[0]), /只回复最终结果/);
+  assert.equal(helpNodes.filter((node) => /只回复最终结果/.test(nodeText(node))).length, 1);
 
   // off -> streaming_card: the flag write must land before the mode write so
   // the runtime never sees a mode without step push enabled.

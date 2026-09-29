@@ -122,7 +122,7 @@ export async function createProductionController(ctx, config = {}, internals = {
   const { defaultWorkspace, ungroupedWorkspace } = await prepareBotWorkspace(config);
   const WorkspaceStore = internals.WorkspaceStore ?? BotWorkspaceStore;
   const workspaces = internals.workspaces
-    ?? await new WorkspaceStore(paths.workspaces, { defaultWorkspace }).load();
+    ?? await new WorkspaceStore(paths.workspaces, { defaultWorkspace, ungroupedWorkspace }).load();
   const canListConfiguredBots = typeof configStore.list === 'function';
   const listConfiguredBots = () => canListConfiguredBots ? configStore.list() : [];
   const configuredBots = listConfiguredBots();
@@ -234,6 +234,16 @@ export async function createProductionController(ctx, config = {}, internals = {
       const workspaceScope = createBotWorkspaceScope(harness, {
         botId: id, workspaces, state, agentPresetCatalog,
       });
+      // 语音是可选渠道能力:凭据读取失败时静默禁用,不阻断机器人连接。
+      let voiceSource = null;
+      if (botConfig.voice) {
+        try {
+          const resolved = await ctx.credentials.resolve(botConfig.voice.secretRef);
+          if (resolved?.value) voiceSource = { config: botConfig.voice, secret: resolved.value };
+        } catch (error) {
+          logger.warn?.('[dsh-feishu-voice] 语音凭据读取失败,语音已禁用:', error?.message ?? String(error));
+        }
+      }
       return new Runtime({
         lark,
         botId: id,
@@ -243,9 +253,10 @@ export async function createProductionController(ctx, config = {}, internals = {
         domain: botConfig.domain,
         botOpenId: botConfig.botOpenId,
         groupResponseMode: botConfig.groupResponseMode,
-        groupTopicReply: botConfig.groupTopicReply,
+        mentionTopicReply: botConfig.mentionTopicReply,
         stepPush: botConfig.stepPush,
         stepPushMode: botConfig.stepPushMode,
+        voice: voiceSource,
         sessionSyncTargetsFor: sessionSyncTargetsFor,
         ownerOpenIds: botConfig.ownerOpenIds ?? [botConfig.ownerOpenId],
         harness: workspaceScope.harness,
@@ -256,6 +267,7 @@ export async function createProductionController(ctx, config = {}, internals = {
         }),
         replyTimeoutMs: config.replyTimeoutMs ?? 600_000,
         slashCommands: config.slashCommands !== false,
+        slashPanel: botConfig.slashPanel,
         ...(wsAgent ? { wsAgent } : {}),
         logger: {
           error: (...args) => logger.error?.(`[${botId ?? botConfig.id}]`, ...args),

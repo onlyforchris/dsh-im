@@ -31,18 +31,18 @@ test('PluginConfigStore persists non-secret onboarding facts', async () => {
     ...store.get(),
     groupResponseMode: 'all',
     groupMessagePermissionGranted: true,
-    groupTopicReply: true,
+    mentionTopicReply: true,
   });
   const reloaded = (await new PluginConfigStore(path).load()).get();
   assert.equal(reloaded.groupResponseMode, 'all');
   assert.equal(reloaded.groupMessagePermissionGranted, true);
-  assert.equal(reloaded.groupTopicReply, true);
+  assert.equal(reloaded.mentionTopicReply, true);
 
   await store.clear();
   assert.equal(store.get(), null);
 });
 
-test('PluginConfigStore defaults groupTopicReply off and only persists a literal true', async () => {
+test('PluginConfigStore defaults mentionTopicReply on and only a literal false turns it off', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-feishu-config-topic-'));
   const path = join(dir, 'config.json');
   const store = await new PluginConfigStore(path).load();
@@ -51,12 +51,12 @@ test('PluginConfigStore defaults groupTopicReply off and only persists a literal
     appId: 'cli_topic',
     ownerOpenId: 'ou_owner',
     domain: 'feishu',
-    groupTopicReply: 'yes', // must not be accepted as true
+    mentionTopicReply: 'no', // anything but a literal false keeps the default
   });
-  assert.equal(store.get().groupTopicReply, false);
+  assert.equal(store.get().mentionTopicReply, true);
 
-  await store.save({ ...store.get(), groupTopicReply: true });
-  assert.equal((await new PluginConfigStore(path).load()).get().groupTopicReply, true);
+  await store.save({ ...store.get(), mentionTopicReply: false });
+  assert.equal((await new PluginConfigStore(path).load()).get().mentionTopicReply, false);
 
   await store.clear();
 });
@@ -76,6 +76,35 @@ test('PluginConfigStore defaults stepPush off and only persists a literal true',
 
   await store.save({ ...store.get(), stepPush: true });
   assert.equal((await new PluginConfigStore(path).load()).get().stepPush, true);
+
+  await store.clear();
+});
+
+test('PluginConfigStore defaults the slash panel to the manifest and normalizes damaged values', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-feishu-config-slash-panel-'));
+  const path = join(dir, 'config.json');
+  const store = await new PluginConfigStore(path).load();
+
+  assert.deepEqual(store.get()?.slashPanel, undefined);
+  await store.save({
+    appId: 'cli_slash_panel',
+    ownerOpenId: 'ou_owner',
+    domain: 'feishu',
+    slashPanel: { mode: 'custom', order: ['/new', 'stop', 'new', 'nope'] },
+  });
+  // Unknown names and duplicates never reach the panel; a leading slash is how
+  // users write a command, not how it is stored.
+  assert.deepEqual(store.get().slashPanel, { mode: 'custom', order: ['new', 'stop'] });
+  assert.deepEqual(
+    (await new PluginConfigStore(path).load()).get().slashPanel,
+    { mode: 'custom', order: ['new', 'stop'] },
+  );
+
+  await store.save({ ...store.get(), slashPanel: { mode: 'default', order: ['new'] } });
+  assert.deepEqual(store.get().slashPanel, { mode: 'default', order: [] });
+
+  await store.save({ ...store.get(), slashPanel: 'custom' });
+  assert.deepEqual(store.get().slashPanel, { mode: 'default', order: [] });
 
   await store.clear();
 });
@@ -198,5 +227,44 @@ test('PluginConfigStore preserves old step-push settings when loading missing mo
   }
   const reloaded = await new PluginConfigStore(path).load();
   assert.deepEqual(reloaded.list(), store.list());
+  await store.clear();
+});
+
+test('PluginConfigStore normalizes per-bot voice config and stores only the credential reference', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-feishu-config-voice-'));
+  const path = join(dir, 'config.json');
+  const store = await new PluginConfigStore(path).load();
+
+  // 未配置的机器人语音为 null(与历史行为一致)
+  await store.save({
+    appId: 'cli_voice_off',
+    ownerOpenId: 'ou_owner',
+    domain: 'feishu',
+  });
+  assert.equal(store.get().voice, null);
+
+  await store.save({
+    ...store.get(),
+    voice: { enabled: true, secretRef: 'DASHSCOPE_API_KEY', ttsVoice: 'Cherry' },
+  });
+  const voice = store.get().voice;
+  assert.deepEqual(Object.keys(voice).sort(), [
+    'asrBaseUrl', 'asrModel', 'enabled', 'ffmpeg', 'secretRef', 'ttsModel', 'ttsVoice',
+  ]);
+  assert.equal(voice.enabled, true);
+  assert.equal(voice.secretRef, 'DASHSCOPE_API_KEY');
+  assert.equal(voice.asrModel, 'qwen3-asr-flash');
+  assert.equal(voice.ttsModel, 'qwen3-tts-flash');
+  assert.equal(voice.ttsVoice, 'Cherry');
+  assert.equal(voice.ffmpeg, null);
+  assert.equal((await new PluginConfigStore(path).load()).get().voice.ttsVoice, 'Cherry');
+
+  // 关闭或残缺的语音配置归一化为 null,行为与未配置完全一致
+  await store.save({ ...store.get(), voice: { enabled: false, secretRef: 'DASHSCOPE_API_KEY' } });
+  assert.equal((await new PluginConfigStore(path).load()).get().voice, null);
+
+  await store.save({ ...store.get(), voice: { enabled: true, secretRef: 'BAD-KEY' } });
+  assert.equal((await new PluginConfigStore(path).load()).get().voice, null);
+
   await store.clear();
 });

@@ -1,12 +1,14 @@
 import QRCode from 'qrcode';
 import {
   conversationKey,
+  conversationScope,
   extractInboundMessage,
   extractText,
   isAllowedSender,
   isBotSender,
-  isTopicGroupKey,
-  managedGroupKey,
+  isTopicKey,
+  managedTopicKey,
+  managedTopicRoot,
   splitText,
 } from './message-utils.mjs';
 import {
@@ -331,6 +333,26 @@ function isBareMentionMenuRequest(event, text, {
   return !String(text ?? '').trim();
 }
 
+/**
+ * A message that is nothing but a mention of the bot, with no body of its own.
+ * There is no question to answer — a direct chat opens the menu card for it and
+ * a group gets the "text, image and file only" notice — so it must not open a
+ * topic either: an empty topic would leave an empty session behind, and every
+ * look at the menu would create another one.
+ *
+ * Mirrors the reply-reference test (`feishuReplyTargetId`): an explicit quote
+ * keeps the message a real question even when the mention is all the text it
+ * carries.
+ */
+function isBareMentionMessage(event) {
+  if (event?.message?.message_type !== 'text') return false;
+  const messageId = nonEmptyString(event?.message?.message_id);
+  const parentId = nonEmptyString(event?.message?.parent_id);
+  const rootId = nonEmptyString(event?.message?.root_id);
+  if (parentId || (rootId && rootId !== messageId)) return false;
+  return !String(extractText(event) ?? '').trim();
+}
+
 /** Canonical workspace/session help advertised by every bridge family. */
 const WORKSPACE_HELP_LINES = [
   '/workspace 工作区序号或绝对路径  切换工作区',
@@ -628,11 +650,24 @@ export class FeishuHarnessBridge {
   #logger;
   #signal;
   #botId;
+  /** Optional voice capability (语音输入/语音回复); null disables all voice paths. */
+  #voice = null;
+  /**
+   * Pending voice turns: session key → { replyTo }, consumed when the full
+   * answer lands. Keyed by the same session key as the message queue so
+   * concurrent topics of one group chat never share a voice slot.
+   */
+  #voiceTurns = new Map();
   #appId;
   #botOpenId;
   #groupResponseMode;
-  /** When true, group replies that belong to a Feishu topic ask reply_in_thread. */
-  #groupTopicReply = false;
+  /**
+   * When true (the default), a question addressed to the bot opens a Feishu
+   * topic of its own — in groups and in direct chats alike — and the answer
+   * stays inside it. Turning it off keeps every question in the chat's main
+   * session and answers it in the main feed.
+   */
+  #mentionTopicReply = true;
   /** When true, streaming turns push tool calls and interim notes as discrete messages. */
   #stepPush = false;
   /** Step push presentation: discrete posts, a CardKit card, or native live CoT. */
@@ -698,7 +733,7 @@ export class FeishuHarnessBridge {
     appId,
     botOpenId,
     groupResponseMode = FEISHU_GROUP_RESPONSE_MODES.ALL,
-    groupTopicReply = false,
+    mentionTopicReply = true,
     stepPush = false,
     stepPushMode = FEISHU_STEP_PUSH_MODES.POST,
     stepPushClock = null,
@@ -710,6 +745,7 @@ export class FeishuHarnessBridge {
     interactionCards = true,
     sessionSyncTargetsFor = null,
     logger = console,
+    voice = null,
     signal,
   }) {
     if (!client || !harness || !state || !status) {
@@ -736,6 +772,13 @@ export class FeishuHarnessBridge {
         || typeof stepPushClock.delay !== 'function')) {
       throw new TypeError('Feishu step push clock requires now and delay functions');
     }
+    if (voice !== null && voice !== undefined
+      && (typeof voice !== 'object' || Array.isArray(voice)
+        || (voice.enabled !== false
+          && (typeof voice.transcribeIncoming !== 'function'
+            || typeof voice.synthesize !== 'function')))) {
+      throw new TypeError('Feishu voice capability requires transcribeIncoming and synthesize functions');
+    }
     this.#client = client;
     this.#channel = channel;
     this.#harness = harness;
@@ -748,10 +791,11 @@ export class FeishuHarnessBridge {
     this.#appId = nonEmptyString(appId);
     this.#botOpenId = nonEmptyString(botOpenId);
     this.#groupResponseMode = normalizeFeishuGroupResponseMode(groupResponseMode);
-    this.#groupTopicReply = groupTopicReply === true;
+    this.#mentionTopicReply = mentionTopicReply !== false;
     this.#stepPush = stepPush === true;
     this.#stepPushMode = normalizeFeishuStepPushMode(stepPushMode);
     this.#stepPushClock = stepPushClock ?? DEFAULT_STEP_PUSH_CLOCK;
+    this.#voice = voice ?? null;
     this.#repair = repair ?? null;
     this.#repairPollIntervalMs = repairPollIntervalMs;
     this.#repairLinkWaitMs = repairLinkWaitMs;
@@ -833,8 +877,8 @@ export class FeishuHarnessBridge {
     this.#groupResponseMode = normalizeFeishuGroupResponseMode(value);
   }
 
-  setGroupTopicReply(value) {
-    this.#groupTopicReply = value === true;
+  setMentionTopicReply(value) {
+    this.#mentionTopicReply = value !== false;
   }
 
   setStepPush(value) {
@@ -845,12 +889,26 @@ export class FeishuHarnessBridge {
     this.#stepPushMode = normalizeFeishuStepPushMode(value);
   }
 
+  setVoice(voice) {
+    this.#voice = voice ?? null;
+  }
+
   get stepPushMode() {
     return this.#stepPushMode;
   }
 
   #isAddressed(event) {
     if (event?.message?.chat_type === 'p2p') return true;
+    return this.#isMentioned(event);
+  }
+
+  /**
+   * Whether this message mentions the bot. Unlike #isAddressed — which answers
+   * "does this chat expect a reply at all" and is therefore always true in a
+   * direct chat — this asks the literal question, so a topic is only opened for
+   * a message the reader actually addressed to the bot.
+   */
+  #isMentioned(event) {
     const mentions = Array.isArray(event?.message?.mentions) ? event.message.mentions : [];
     if (!this.#botOpenId) return mentions.length > 0;
     return mentions.some((mention) => mention?.id?.open_id === this.#botOpenId
@@ -858,27 +916,31 @@ export class FeishuHarnessBridge {
   }
 
   /**
-   * Conversation key for one inbound event. When group-topic replies are on,
-   * a main-feed question addressed to the bot opens a fresh managed topic
-   * session instead of joining the shared group session, and messages inside
-   * a topic we already opened resolve back to that same managed session.
+   * Conversation key for one inbound event, for groups and direct chats alike.
+   *
+   * - A message inside a topic resolves back to the managed key when the bot
+   *   rooted that topic, so the whole topic keeps one session; every other
+   *   thread keeps the key the channel would have used without managed topics.
+   * - A main-feed message that mentions the bot opens a fresh managed topic
+   *   session instead of joining the chat's shared session. A bare "@bot" is
+   *   excluded: it is a menu request, not a question.
+   * - Everything else stays in the chat's shared session.
    */
   #resolveKey(event) {
-    const chatType = event?.message?.chat_type;
-    const chatId = nonEmptyString(event?.message?.chat_id);
-    if (chatType !== 'group') return conversationKey(event);
     const messageId = nonEmptyString(event?.message?.message_id);
     const threadId = nonEmptyString(event?.message?.thread_id);
     if (threadId) {
       const root = this.#state?.topicRootFor?.(threadId) ?? null;
-      return root && chatId
-        ? managedGroupKey(chatId, root.rootMessageId)
-        : `group:${chatId}:thread:${threadId}`;
+      if (root) return managedTopicKey(conversationScope(event), root.rootMessageId);
+      return conversationKey(event);
     }
-    if (this.#groupTopicReply && chatId && messageId && this.#isAddressed(event)) {
-      return managedGroupKey(chatId, messageId);
+    if (this.#mentionTopicReply
+      && messageId
+      && this.#isMentioned(event)
+      && !isBareMentionMessage(event)) {
+      return managedTopicKey(conversationScope(event), messageId);
     }
-    return `group:${chatId}`;
+    return conversationKey(event);
   }
 
   /**
@@ -890,7 +952,7 @@ export class FeishuHarnessBridge {
    */
   #rememberTopicReply(messageId, key) {
     if (!nonEmptyString(messageId)) return;
-    this.#anchorTopicReply.set(messageId, isTopicGroupKey(key));
+    this.#anchorTopicReply.set(messageId, isTopicKey(key));
     if (this.#anchorTopicReply.size > 2048) {
       const oldest = this.#anchorTopicReply.keys().next().value;
       if (oldest !== undefined) this.#anchorTopicReply.delete(oldest);
@@ -939,13 +1001,62 @@ export class FeishuHarnessBridge {
 
   /** Persist thread_id once Feishu auto-opened a topic from a managed root. */
   async #registerTopicFromReply(replyTo, chatId, response) {
-    const threadId = nonEmptyString(response?.data?.thread_id);
+    await this.#registerTopicReply(replyTo, chatId, response?.data?.thread_id);
+  }
+
+  /**
+   * Record the topic for a root this bot asked Feishu to open. The reply
+   * response carries the thread_id in most cases; when it does not — we have
+   * seen a topic come back without one — read it back from the message we
+   * replied to. Feishu opened the topic either way, and a topic left
+   * unrecorded would answer its follow-ups from the chat's own session instead
+   * of the topic's.
+   */
+  async #registerTopicReply(rootMessageId, chatId, threadId) {
+    const known = nonEmptyString(threadId);
+    if (known) {
+      await this.#registerTopicThreadId(known, rootMessageId, chatId);
+      return;
+    }
+    await this.#ensureTopicRegistered(rootMessageId, chatId);
+  }
+
+  /**
+   * Fallback for a threaded reply that reported no thread_id: ask Feishu which
+   * topic the replied-to message now belongs to. Only runs while that message
+   * is still a pending root candidate, so a topic already recorded — or a
+   * conversation that has no topics at all — costs no extra API call.
+   */
+  async #ensureTopicRegistered(rootMessageId, chatId) {
+    this.#pruneRootCandidates();
+    if (!nonEmptyString(rootMessageId) || !this.#rootCandidates.has(rootMessageId)) return;
+    const threadId = await this.#readTopicThreadId(rootMessageId);
     if (threadId) {
-      await this.#registerTopicThreadId(threadId, replyTo, chatId);
-    } else {
-      // No thread_id means the topic did not open; drop the candidate so a
-      // later addressed question opens a fresh session, not a stale slot.
-      this.#forgetTopicRoot(replyTo);
+      await this.#registerTopicThreadId(threadId, rootMessageId, chatId);
+      return;
+    }
+    // Still no topic: drop the candidate so a later addressed question opens a
+    // fresh session rather than reusing a stale slot.
+    this.#forgetTopicRoot(rootMessageId);
+  }
+
+  /** The topic a message belongs to, or null when it is not in one. */
+  async #readTopicThreadId(messageId) {
+    const read = this.#client?.im?.v1?.message?.get;
+    if (typeof read !== 'function') return null;
+    try {
+      const response = await read({ path: { message_id: messageId } });
+      if (response?.code && response.code !== 0) return null;
+      const items = Array.isArray(response?.data?.items) ? response.data.items : [];
+      const item = items.find((candidate) => nonEmptyString(candidate?.message_id) === messageId)
+        ?? items[0];
+      return nonEmptyString(item?.thread_id);
+    } catch (error) {
+      this.#logger.warn?.(
+        '[dsh-feishu] could not read the topic of a replied-to message:',
+        error?.message ?? String(error),
+      );
+      return null;
     }
   }
 
@@ -1032,10 +1143,9 @@ export class FeishuHarnessBridge {
     }
     // Register a managed-topic root only after access is allowed, so a
     // rejected or ignored question never reserves a candidate slot.
-    if (this.#groupTopicReply
-      && event?.message?.chat_type === 'group'
+    if (this.#mentionTopicReply
       && !nonEmptyString(event?.message?.thread_id)
-      && isTopicGroupKey(key)
+      && isTopicKey(key)
       && key.includes(':managed:')) {
       this.#rememberTopicRoot(messageId);
     }
@@ -1154,7 +1264,7 @@ export class FeishuHarnessBridge {
       this.#commandTasks.add(current);
       return current;
     }
-    if (this.#isResolvedQuestionReply(event, key)) {
+    if (!hasImages && this.#isResolvedQuestionReply(event, key)) {
       const current = Promise.resolve()
         .then(() => this.#discardResolvedInteractionReply(event, messageId))
         .then(() => this.#finishReaction(messageId, processingReaction, 'DONE'))
@@ -1205,6 +1315,19 @@ export class FeishuHarnessBridge {
       return current;
     }
     if (pending && senderOpenId(event) !== pending.actor) {
+      return this.#enqueueMessage(event, messageId, key, processingReaction);
+    }
+    if (pending && hasImages) {
+      const previous = pending.queue ?? Promise.resolve();
+      const interruption = previous.catch(() => undefined)
+        .then(() => this.#interruptQuestionForImage(event, key, pending))
+        .finally(() => {
+          if (pending.queue === interruption) pending.queue = null;
+          this.#interactionTasks.delete(interruption);
+        });
+      pending.queue = interruption;
+      this.#interactionTasks.add(interruption);
+      // Reserve the image's FIFO position before stopping releases the original turn.
       return this.#enqueueMessage(event, messageId, key, processingReaction);
     }
     if (pending?.submitting || pending?.claimedReplyMessageId) {
@@ -1494,10 +1617,57 @@ export class FeishuHarnessBridge {
     }
 
     const message = extractInboundMessage(event, this.#client);
-    const text = message.content;
+    let text = message.content;
+    let voiceTurnReplyTo = null;
+    // 语音输入(渠道能力):音频消息先转写成文字并写回 message.content——
+    // 下方命令识别与 #answerWithStream 都从 content 取文本。转写失败(或返回
+    // 空文本)时保持原语义,走"仅支持文字、图片和文件"的明确降级提示。
+    if (event.message.message_type === 'audio' && this.#voice?.enabled) {
+      try {
+        const transcript = await this.#voice.transcribeIncoming(event, this.#client);
+        if (transcript) {
+          text = transcript;
+          message.content = transcript;
+          voiceTurnReplyTo = event.message.message_id;
+        }
+      } catch (error) {
+        this.#logger.warn?.('[dsh-feishu-voice] 语音转写失败:', error?.message ?? String(error));
+      }
+    }
     const hasImages = hasInboundImages(message);
     const hasFiles = hasInboundFiles(message);
     const hasReply = hasReplyReference(message);
+    // 语音转写后的命令权限复检:accept() 的访问判定发生在转写前,音频消息
+    // 没有命令文本,按普通消息放行;转写得到的文本可能包含命令,须用与
+    // accept() 相同的命令识别与权限规则再校验一次,防止"允许聊天、禁止命令"
+    // 的用户经语音入口绕过 canExecuteCommands——文字与语音入口行为一致。
+    // 仅"命令不允许"给用户提示(与文字路径同文案),其余拒绝原因静默丢弃。
+    if (voiceTurnReplyTo) {
+      const transcribedAccess = evaluateInboundAccess(this.#accessPolicy, {
+        conversationType: event.message.chat_type === 'p2p' ? 'direct'
+          : event.message.chat_type === 'group' ? 'group' : null,
+        senderIds: senderOpenId(event),
+        text,
+        hasImages,
+        hasFiles,
+        isCommand: isSharedLocalCommand(text, { hasImages, hasFiles })
+          || isFeishuLocalCommand(text, { hasImages, hasFiles })
+          || (!hasImages && !hasFiles && NUMBER_REPLY.test(text) && this.#menus.has(key)),
+      });
+      if (!transcribedAccess.allowed) {
+        if (transcribedAccess.reason === 'command-not-allowed') {
+          await this.#send(
+            event.message.chat_id,
+            t(COMMAND_PERMISSION_DENIED_MESSAGE),
+            { replyTo: event.message.message_id },
+          );
+          this.#status.messagesReplied += 1;
+          this.#status.lastReplyAt = new Date().toISOString();
+        }
+        this.#status.lastError = null;
+        return;
+      }
+    }
     // 命令识别对 text 与纯文本 post 一视同仁：post 富文本若仅含单个
     // 文本段落（如复制粘贴的 /new），同样按命令处理；带图片/文件不认。
     // accept() 侧已用 nonEmptyString(content) 判定，两侧保持一致。
@@ -1637,6 +1807,15 @@ export class FeishuHarnessBridge {
     }
 
     this.#logger.info?.(`[dsh-feishu] processing ${event.message.chat_type} message ${messageId}`);
+    // 语音回合状态在进入正常问答路径前才登记:上方命令分支(/help、菜单、
+    // 会话列表等)与空内容分支均提前返回,提前登记会让状态遗留到下一回合,
+    // 导致后续普通文字消息的答案被合成为音频并回复到旧的语音消息。
+    // 本路径的 finally 统一清理回合状态。状态以会话 key 登记——与消息队列
+    // 同粒度:同群不同话题的 key 不同、可并行处理,共用 chat_id 槽位会让
+    // 后登记的回合覆盖先登记的,先完成的回合合成到后一条语音消息上。
+    if (voiceTurnReplyTo) {
+      this.#voiceTurns.set(key, { replyTo: voiceTurnReplyTo });
+    }
     const batchSubmission = event.batchSubmission ?? null;
     let batchAskCompleted = false;
     try {
@@ -1682,6 +1861,7 @@ export class FeishuHarnessBridge {
     } finally {
       await this.#cancelPendingInteraction(key);
       await this.#approvals.closeRoute(key);
+      this.#voiceTurns.delete(key);
     }
   }
 
@@ -2839,7 +3019,7 @@ export class FeishuHarnessBridge {
   }
 
   /**
-   * issue #162：已答状态卡的原地替换。patch 失败仅记录警告并明确降级——
+   * 已处理交互卡的原地替换。patch 失败仅记录警告并明确降级——
    * 回执缺失不应影响答案提交，也不得像 #sendCard 那样回退成发送新卡。
    */
   async #patchCardMessage(chatId, messageId, cardJson) {
@@ -2854,7 +3034,7 @@ export class FeishuHarnessBridge {
       }
       return messageId;
     } catch (error) {
-      this.#logger.warn?.('[dsh-feishu] answered-state card patch failed:', error?.message ?? error);
+      this.#logger.warn?.('[dsh-feishu] resolved interaction card patch failed:', error?.message ?? error);
       return null;
     }
   }
@@ -3370,7 +3550,9 @@ export class FeishuHarnessBridge {
 
   async #deliverDeferredOutcome(entry, outcome) {
     this.#rememberTopicReply(entry.replyToMessageId, entry.key);
-    if (entry.key === managedGroupKey(entry.chatId, entry.replyToMessageId)) {
+    // A late answer still has to open the topic it was rooted at, so re-arm the
+    // root candidate: the key alone says whether this route was a managed topic.
+    if (managedTopicRoot(entry.key) === nonEmptyString(entry.replyToMessageId)) {
       this.#rememberTopicRoot(entry.replyToMessageId);
     }
     const text = deferredOutcomeText(outcome);
@@ -3392,10 +3574,10 @@ export class FeishuHarnessBridge {
           ...(replyToMessageId ? { replyTo: replyToMessageId } : {}),
           ...(this.#replyInThreadFor(replyToMessageId) ? {
             replyInThread: true,
-            onReplyThreadId: async (threadId) => this.#registerTopicThreadId(
-              threadId,
+            onReplyThreadId: async (threadId) => this.#registerTopicReply(
               replyToMessageId,
               chatId,
+              threadId,
             ),
           } : {}),
         });
@@ -4142,6 +4324,53 @@ export class FeishuHarnessBridge {
     });
   }
 
+  // 语音回复(渠道能力):同回合转写过语音消息的会话,在完整答案投递后追加
+  // 音频回复。回合按会话 key 登记并消费——同群不同话题各自只消费自己的
+  // 回合;登记随消息处理结束(finally)清除,命令类回复(菜单、会话列表等)
+  // 与延迟交付不触发语音;此处失败只告警,不影响文字投递。
+  async #maybeSendVoiceReply(key, chatId, answer, replyTo = null) {
+    const voiceTurn = this.#voiceTurns.get(key);
+    if (!voiceTurn) return;
+    this.#voiceTurns.delete(key);
+    try {
+      await this.#sendVoiceAnswer(chatId, answer, voiceTurn.replyTo ?? replyTo);
+    } catch (error) {
+      this.#logger.warn?.('[dsh-feishu-voice] 语音回复失败:', error?.message ?? String(error));
+    }
+  }
+
+  // 文本 → qwen TTS → opus 上传 → 音频消息;优先回复原语音消息,
+  // reply 不可用时明确降级为普通音频消息。
+  async #sendVoiceAnswer(chatId, text, replyTo = null) {
+    const opus = await this.#voice.synthesize(text);
+    if (!opus) return null;
+    const upload = await this.#client.im.v1.file.create({
+      data: { file_type: 'opus', file_name: 'dsh-im-voice-reply.opus', file: opus },
+    });
+    const fileKey = upload?.file_key ?? upload?.data?.file_key;
+    if (!fileKey) throw new Error('音频上传无 file_key');
+    const content = JSON.stringify({ file_key: fileKey });
+    if (replyTo) {
+      try {
+        const response = await this.#client.im.v1.message.reply({
+          path: { message_id: replyTo },
+          data: { msg_type: 'audio', content },
+        });
+        if (!response?.code || response.code === 0) return response?.data?.message_id ?? null;
+      } catch (error) {
+        this.#logger.warn?.('[dsh-feishu-voice] 音频回复失败,改发普通消息:', error?.message ?? String(error));
+      }
+    }
+    const response = await this.#client.im.v1.message.create({
+      params: { receive_id_type: 'chat_id' },
+      data: { receive_id: chatId, msg_type: 'audio', content },
+    });
+    if (response?.code && response.code !== 0) {
+      throw new Error(`Feishu audio send failed: ${response.msg || response.code}`);
+    }
+    return nonEmptyString(response?.data?.message_id);
+  }
+
   async #deliverArtifacts(chatId, replyTo, artifacts = [], baseReceipt) {
     const delivery = await deliverOutboundArtifacts({
       artifacts,
@@ -4155,7 +4384,7 @@ export class FeishuHarnessBridge {
             replyTo,
             signal: this.#signal,
             ...(this.#replyInThreadFor(replyTo)
-              ? { replyInThread: true, onReplyThreadId: async (threadId) => this.#registerTopicThreadId(threadId, replyTo, chatId) }
+              ? { replyInThread: true, onReplyThreadId: async (threadId) => this.#registerTopicReply(replyTo, chatId, threadId) }
               : {}),
           })
         : undefined,
@@ -4164,7 +4393,7 @@ export class FeishuHarnessBridge {
             replyTo,
             signal: this.#signal,
             ...(this.#replyInThreadFor(replyTo)
-              ? { replyInThread: true, onReplyThreadId: async (threadId) => this.#registerTopicThreadId(threadId, replyTo, chatId) }
+              ? { replyInThread: true, onReplyThreadId: async (threadId) => this.#registerTopicReply(replyTo, chatId, threadId) }
               : {}),
           })
         : undefined,
@@ -4707,10 +4936,11 @@ export class FeishuHarnessBridge {
       error.feishuCode = response.code;
       throw error;
     }
-    const threadId = nonEmptyString(response?.data?.thread_id);
-    if (threadId) {
-      await this.#registerTopicThreadId(threadId, messageId, chatId);
-    }
+    // 与其他回复路径同一条登记逻辑：响应通常带 thread_id，没带就回读被回复的消息
+    // （#registerTopicReply → #ensureTopicRegistered）。逐步消息以前只认响应，
+    // 于是话题开出来了却没登记，话题内的追问会从托管键掉回聊天自己的会话。
+    // 两个分支都以「该消息仍是待开话题的候选根」为前提，不是候选就是空操作。
+    await this.#registerTopicReply(messageId, chatId, response?.data?.thread_id);
     return response;
   }
 
@@ -4980,8 +5210,14 @@ export class FeishuHarnessBridge {
     });
     // 流式卡片模式：每轮一张过程卡（原地 patch），过程与最终答案都进卡；
     // post 模式维持逐条直推。先预建卡片状态，纯问答回合也能在收尾时开卡。
-    const streamingCard = this.#stepPushMode === FEISHU_STEP_PUSH_MODES.STREAMING_CARD;
+    // 飞书原生思考过程按 chat_id 创建，不会落进话题（#244）；话题内的回合改用
+    // 实时过程卡（以 reply_in_thread 回复留在话题内），避免过程出现在话题外。
+    const liveCotInTopic = this.#stepPushMode === FEISHU_STEP_PUSH_MODES.LIVE_COT
+      && this.#replyInThreadFor(messageId);
+    const streamingCard = this.#stepPushMode === FEISHU_STEP_PUSH_MODES.STREAMING_CARD
+      || liveCotInTopic;
     const liveCot = this.#stepPushMode === FEISHU_STEP_PUSH_MODES.LIVE_COT
+      && !liveCotInTopic
       && typeof this.#channel?.createCot === 'function'
       && typeof this.#channel?.writeCotEvents === 'function';
     const cot = liveCot
@@ -5162,6 +5398,9 @@ export class FeishuHarnessBridge {
           providerMessageIds: seal.cardIds,
         });
         this.#status.streamResponses = (this.#status.streamResponses ?? 0) + 1;
+        // 流式卡封存成功也是完整答案投递:文本进了卡片,语音回合同样要
+        // 在此消费并合成音频回复——否则语音消息只得到卡片、没有声音。
+        await this.#maybeSendVoiceReply(key, chatId, deliveryText, messageId);
         const delivery = await this.#deliverArtifacts(
           chatId,
           messageId,
@@ -5211,6 +5450,7 @@ export class FeishuHarnessBridge {
         providerMessageIds,
       });
       this.#status.streamResponses = (this.#status.streamResponses ?? 0) + 1;
+      await this.#maybeSendVoiceReply(key, chatId, deliveryText, messageId);
     } catch (error) {
       this.#status.streamErrors = (this.#status.streamErrors ?? 0) + 1;
       this.#logger.warn?.('[dsh-feishu] step push post failed; sending final text:', error.message);
@@ -5261,8 +5501,10 @@ export class FeishuHarnessBridge {
         setLastMessageFailure(this.#status, textSendError);
       }
       this.#status.streamFallbacks = (this.#status.streamFallbacks ?? 0) + 1;
+      await this.#maybeSendVoiceReply(key, chatId, deliveryText, messageId);
       return { ...delivery, textDeliveryErrors: textSendError ? 1 : 0 };
     }
+    await this.#maybeSendVoiceReply(key, chatId, deliveryText, messageId);
     const delivery = await this.#deliverArtifacts(
       chatId,
       messageId,
@@ -5330,6 +5572,7 @@ export class FeishuHarnessBridge {
           error,
         );
       }
+      await this.#maybeSendVoiceReply(key, chatId, answerTextForDelivery(answer, artifacts), messageId);
       const delivery = await this.#deliverArtifacts(chatId, messageId, artifacts, textReceipt);
       const artifactDispatched = delivery.receipt.artifacts.some(
         ({ outcome }) => outcome === 'sent' || outcome === 'unknown',
@@ -5396,11 +5639,12 @@ export class FeishuHarnessBridge {
           completedAnswer = completed.answer;
           completedArtifacts = completed.artifacts ?? [];
           await controller.setContent(answerTextForDelivery(completedAnswer, completedArtifacts));
+          await this.#maybeSendVoiceReply(key, chatId, answerTextForDelivery(completedAnswer, completedArtifacts), messageId);
         },
       }, {
         replyTo: messageId,
         ...(this.#replyInThreadFor(messageId)
-          ? { replyInThread: true, onReplyThreadId: async (threadId) => this.#registerTopicThreadId(threadId, messageId, chatId) }
+          ? { replyInThread: true, onReplyThreadId: async (threadId) => this.#registerTopicReply(messageId, chatId, threadId) }
           : {}),
       });
     } catch (error) {
@@ -5429,6 +5673,7 @@ export class FeishuHarnessBridge {
             fallbackError,
           );
         }
+        await this.#maybeSendVoiceReply(key, chatId, answerTextForDelivery(completedAnswer, completedArtifacts), messageId);
         const delivery = await this.#deliverArtifacts(
           chatId,
           messageId,
@@ -5485,6 +5730,7 @@ export class FeishuHarnessBridge {
           fallbackError,
         );
       }
+      await this.#maybeSendVoiceReply(key, chatId, answerTextForDelivery(answer, artifacts), messageId);
       const delivery = await this.#deliverArtifacts(chatId, messageId, artifacts, textReceipt);
       const artifactDispatched = delivery.receipt.artifacts.some(
         ({ outcome }) => outcome === 'sent' || outcome === 'unknown',
@@ -5576,6 +5822,40 @@ export class FeishuHarnessBridge {
     });
   }
 
+  async #interruptQuestionForImage(event, key, pending) {
+    if (this.#signal?.aborted || this.#pendingInteractions.get(key) !== pending) return;
+    const question = pending.questions[pending.index];
+    const questionMessageId = pending.questionCardMessageId;
+    const index = pending.index;
+    const wasSubmitting = pending.submitting;
+    pending.submitting = true;
+    try {
+      await runControlCommand('/stop', this.#harness, this.#state, key, {
+        signal: this.#signal,
+        control: { owner: this, key },
+      });
+    } catch (error) {
+      if (this.#pendingInteractions.get(key) === pending) pending.submitting = wasSubmitting;
+      this.#logger.warn?.('[dsh-feishu] could not stop the question turn for an image:', error.message);
+      await this.#send(event.message.chat_id,
+        t('图片已排队，但暂时无法结束当前提问。请先回答问题或发送 /stop，结束后会继续处理图片。'),
+        { replyTo: event.message.message_id }).catch(() => undefined);
+      return;
+    }
+    await this.#cancelPendingInteraction(key, pending.interactionId);
+    const resolvedText = t('已结束本轮提问，将在当前会话中继续处理图片。');
+    if (questionMessageId) {
+      await this.#patchCardMessage(event.message.chat_id, questionMessageId, questionCard({
+        ...question,
+        interactionId: pending.interactionId,
+        index,
+        total: pending.questions.length,
+        resolvedText,
+      }));
+    }
+    await this.#send(event.message.chat_id, resolvedText, { replyTo: event.message.message_id }).catch(() => undefined);
+  }
+
   async #submitQuestionAnswer(pending, answerText, { chatId, messageId, questionMessageId } = {}) {
     const question = pending.questions[pending.index];
     if (!question) return;
@@ -5664,6 +5944,8 @@ export class FeishuHarnessBridge {
     requiresMention,
     replyToMessageId,
   }) {
+    let approvalCardMessageId = null;
+    let approvalCardData = null;
     if (await this.#approvals.handleRequested(interaction, {
       key,
       actor,
@@ -5675,15 +5957,16 @@ export class FeishuHarnessBridge {
       ...(this.#interactionCards
         ? {
             render: async (pending) => {
-              // Show the approval as an interactive card with approve/reject buttons.
-              await this.#sendCard(
+              // Keep the original card details and id with this approval's callbacks.
+              approvalCardData = {
+                toolName: pending.toolCall?.name ?? pending.interaction.payload.toolName,
+                operation: operationArguments(pending.toolCall),
+                reason: pending.interaction.payload.reason,
+                approvalId: pending.approvalId,
+              };
+              approvalCardMessageId = await this.#sendCard(
                 chatId,
-                approvalCard({
-                  toolName: pending.toolCall?.name ?? pending.payload?.toolName,
-                  operation: operationArguments(pending.toolCall),
-                  reason: pending.payload?.reason,
-                  approvalId: pending.approvalId,
-                }),
+                approvalCard(approvalCardData),
                 { key, replyTo: replyToMessageId },
               ).catch(async () => {
                 // Fall back to the plain-text approval if the card cannot be
@@ -5691,7 +5974,16 @@ export class FeishuHarnessBridge {
                 // the pending approval is not marked as presented and the
                 // existing retry/reconnect logic can run.
                 await this.#send(chatId, pending.text, { replyTo: replyToMessageId });
+                return null;
               });
+            },
+            onResolved: async (resolvedText) => {
+              if (!approvalCardMessageId) return;
+              await this.#patchCardMessage(
+                chatId,
+                approvalCardMessageId,
+                approvalCard({ ...approvalCardData, resolvedText }),
+              );
             },
           }
         : {}),
@@ -5901,8 +6193,8 @@ export class FeishuHarnessBridge {
     return this.#takePendingInteraction(key, interactionId) !== null;
   }
 
-  async #cancelPendingInteraction(key) {
-    const pending = this.#takePendingInteraction(key);
+  async #cancelPendingInteraction(key, interactionId) {
+    const pending = this.#takePendingInteraction(key, interactionId);
     if (!pending || pending.kind !== 'question') return;
     this.#rememberResolvedInteraction(key, pending);
     try {

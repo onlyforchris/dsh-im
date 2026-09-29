@@ -1,6 +1,15 @@
 export const IM_STYLE_ID = 'onlyforchris-dsh-im-settings';
 
 const CSS = String.raw`
+.dim-pluginOpen { display: inline-flex; align-items: center; justify-content: center; min-height: 36px; padding: 7px 14px; border: 1px solid var(--dsw-alias-border-l2, #dfe1e5); border-radius: 8px; color: var(--dsw-alias-label-primary, #1f2329); background: var(--dsw-alias-bg-layer-1, #fff); font: inherit; font-size: 13px; line-height: 20px; cursor: pointer; }
+.dim-pluginOpen:hover { background: var(--dsw-alias-interactive-bg-hover, #f7f8fa); }
+.dim-pluginOpen:focus-visible, .dim-pluginBack:focus-visible { outline: 2px solid var(--dsw-alias-state-business-primary, #3370ff); outline-offset: 3px; }
+.dim-pluginPage { height: 100%; min-height: 0; overflow: auto; box-sizing: border-box; padding: 24px clamp(16px, 4vw, 48px) 32px; color: var(--dsw-alias-label-primary, #1f2329); }
+.dim-pluginPageContent { max-width: 1080px; margin: 0 auto; }
+.dim-pluginBack { display: inline-flex; align-items: center; gap: 8px; min-height: 36px; margin: 0 0 24px; padding: 6px 8px; border: 0; border-radius: 8px; color: var(--dsw-alias-label-secondary, #646a73); background: transparent; font: inherit; font-size: 13px; line-height: 20px; cursor: pointer; }
+.dim-pluginBack:hover { color: var(--dsw-alias-label-primary, #1f2329); background: var(--dsw-alias-interactive-bg-hover, #f7f8fa); }
+.dim-pluginBack > span { font-size: 22px; line-height: 20px; }
+@media (pointer: coarse) { .dim-pluginOpen, .dim-pluginBack { min-height: 44px; } }
 .dim-connectionDiagnostic { min-width: 0; width: 100%; color: var(--dsw-alias-label-secondary, #646a73); overflow-wrap: anywhere; font-size: 13px; line-height: 1.6; }
 .dim-connectionDiagnostic[data-warning="true"] { color: var(--dsw-alias-state-warn-primary, #d97706); }
 .dim-connectionDiagnostic p { margin: 4px 0; }
@@ -479,10 +488,30 @@ const CSS = String.raw`
 .dim-feishuGroupSelect:focus-visible { outline: none; border-color: var(--dsw-alias-state-business-primary, #3370ff); box-shadow: 0 0 0 2px color-mix(in srgb, var(--dsw-alias-state-business-primary, #3370ff) 15%, transparent); }
 .dim-feishuGroupSelect:disabled { cursor: not-allowed; opacity: .55; }
 .dim-feishuGroupHelp { margin: -2px 0 0; color: var(--dsw-alias-label-tertiary, #8f959e); font-size: 12px; line-height: 19px; }
+.dim-feishuVoiceForm { min-width: 0; display: grid; gap: 10px; }
+.dim-feishuVoiceField { min-width: 0; display: grid; gap: 5px; }
+.dim-feishuVoiceLabel { color: var(--dsw-alias-label-secondary, #646a73); font-size: 12px; line-height: 18px; }
+.dim-feishuVoiceInput { min-width: 0; width: 100%; height: 36px; padding: 0 11px; border: 1px solid var(--dsw-alias-border-l2, #dfe1e5); border-radius: 8px; color: var(--dsw-alias-label-primary, #1f2329); background: var(--dsw-alias-bg-layer-1, #fff); font: inherit; font-size: 13px; line-height: 36px; transition: border-color .15s ease, box-shadow .15s ease; }
+.dim-feishuVoiceInput:hover:not(:disabled) { border-color: color-mix(in srgb, var(--dsw-alias-state-business-primary, #3370ff) 42%, var(--dsw-alias-border-l2, #dfe1e5)); }
+.dim-feishuVoiceInput:focus-visible { outline: none; border-color: var(--dsw-alias-state-business-primary, #3370ff); box-shadow: 0 0 0 2px color-mix(in srgb, var(--dsw-alias-state-business-primary, #3370ff) 15%, transparent); }
+.dim-feishuVoiceInput:disabled { cursor: not-allowed; opacity: .55; }
+.dim-feishuVoiceActions { display: flex; justify-content: flex-start; }
+.dim-feishuVoiceSave { height: 34px; padding: 0 15px; border: 1px solid var(--dsw-alias-state-business-primary, #3370ff); border-radius: 8px; color: var(--dsw-alias-state-business-primary, #3370ff); background: var(--dsw-alias-bg-layer-1, #fff); font: inherit; font-size: 13px; line-height: 32px; cursor: pointer; transition: border-color .15s ease, color .15s ease, background .15s ease; }
+.dim-feishuVoiceSave:hover:not(:disabled) { color: #0f5fce; border-color: #0f5fce; background: color-mix(in srgb, #3370ff 6%, var(--dsw-alias-bg-layer-1, #fff)); }
+.dim-feishuVoiceSave:disabled { cursor: not-allowed; opacity: .55; }
 .dim-feishuGroupPermissionAction { display: flex; justify-content: flex-start; }
 .dim-feishuGroupPermissionAction .dim-deliveryButton { color: var(--dsw-alias-state-business-primary, #3370ff); border-color: color-mix(in srgb, var(--dsw-alias-state-business-primary, #3370ff) 30%, var(--dsw-alias-border-l2, #dfe1e5)); }
 .dim-feishuGroupError, .dim-feishuGroupRefreshError { margin: 0; padding: 9px 11px; border-radius: 8px; font-size: 12px; line-height: 18px; }
 .dim-feishuGroupError, .dim-feishuGroupRefreshError { color: var(--dsw-alias-state-error-primary, #d54941); background: color-mix(in srgb, var(--dsw-alias-state-error-primary, #d54941) 7%, var(--dsw-alias-bg-layer-1, #fff)); }
+.dim-feishuPanelList { display: grid; gap: 7px; margin: 0; padding: 0; list-style: none; }
+.dim-feishuPanelRow { min-width: 0; display: grid; grid-template-columns: max-content minmax(0, 1fr) max-content; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--dsw-alias-border-l1, #eef0f3); border-radius: 9px; background: var(--dsw-alias-bg-module-platform, #f7f8fa); }
+.dim-feishuPanelIndex { min-width: 18px; color: var(--dsw-alias-label-tertiary, #8f959e); font-size: 11px; line-height: 17px; text-align: right; }
+.dim-feishuPanelCommand { min-width: 0; color: var(--dsw-alias-label-primary, #1f2329); font-size: 12px; line-height: 18px; overflow-wrap: anywhere; }
+.dim-feishuPanelRowActions, .dim-feishuPanelAdd { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.dim-feishuPanelRow .dim-deliveryButton { min-height: 28px; padding: 0 9px; font-size: 12px; }
+.dim-feishuPanelAdd { margin-top: 2px; }
+.dim-feishuPanelAdd .dim-feishuGroupSelect { flex: 1 1 220px; width: auto; }
+.dim-feishuPanelFooter { display: flex; justify-content: flex-start; }
 .dim-feishuGroupAuthorization { min-width: 0; display: grid; grid-template-columns: 184px minmax(0, 1fr); align-items: start; gap: 24px; padding: 18px; border: 1px solid color-mix(in srgb, var(--dsw-alias-state-business-primary, #3370ff) 30%, var(--dsw-alias-border-l2, #dfe1e5)); border-radius: 12px; background: color-mix(in srgb, var(--dsw-alias-state-business-primary, #3370ff) 2.5%, var(--dsw-alias-bg-layer-3, #fff)); }
 .dim-feishuGroupAuthorizationState { min-height: 126px; grid-template-columns: 32px minmax(0, 1fr); align-items: center; }
 .dim-feishuGroupAuthorizationState h3, .dim-feishuGroupAuthorizationError h3, .dim-feishuGroupAuthorizationCopy h3 { margin: 0; color: var(--dsw-alias-label-primary, #1f2329); font-size: 16px; line-height: 24px; font-weight: 650; }

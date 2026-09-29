@@ -21,6 +21,11 @@ import {
   isFeishuStepPushMode,
   normalizeFeishuStepPushMode,
 } from './step-push-mode.mjs';
+import { normalizeFeishuVoiceConfig } from './voice-config.mjs';
+import {
+  isSlashPanelConfig,
+  normalizeSlashPanelConfig,
+} from './slash-command-panel.mjs';
 
 const ACTIVE_REGISTRATION_STATES = new Set([
   'starting', 'qr_ready', 'polling', 'slow_down', 'domain_switched',
@@ -96,9 +101,11 @@ function configuredBotFingerprint(config) {
     botOpenId: config.botOpenId,
     activated: config.activated,
     groupResponseMode: normalizeFeishuGroupResponseMode(config.groupResponseMode),
-    groupTopicReply: config.groupTopicReply === true,
+    mentionTopicReply: config.mentionTopicReply !== false,
     stepPush: config.stepPush === true,
     stepPushMode: normalizeFeishuStepPushMode(config.stepPushMode),
+    voice: config.voice,
+    slashPanel: normalizeSlashPanelConfig(config.slashPanel),
     groupMessagePermissionGranted: config.groupMessagePermissionGranted === true,
     deletionPending: config.deletionPending === true,
     connectedAt: config.connectedAt ?? null,
@@ -603,15 +610,31 @@ export class MultiBotDshFeishuController {
     }));
   }
 
-  async updateGroupTopicReply(botId, groupTopicReply) {
+  async updateMentionTopicReply(botId, mentionTopicReply) {
     this.#assertOpen();
-    if (typeof groupTopicReply !== 'boolean') {
-      throw new TypeError('Invalid Feishu group topic reply flag');
+    if (typeof mentionTopicReply !== 'boolean') {
+      throw new TypeError('Invalid Feishu mention topic reply flag');
     }
     return this.#serializeConfig(() => this.#withBotTransition(botId, async () => {
       const config = this.#requireBot(botId);
-      const saved = await this.#configStore.saveBot({ ...config, groupTopicReply });
-      this.#runtimes.get(botId)?.setGroupTopicReply?.(saved.groupTopicReply);
+      const saved = await this.#configStore.saveBot({ ...config, mentionTopicReply });
+      this.#runtimes.get(botId)?.setMentionTopicReply?.(saved.mentionTopicReply);
+      this.#touch();
+      return this.status(botId);
+    }));
+  }
+
+  async updateSlashPanel(botId, slashPanel) {
+    this.#assertOpen();
+    if (!isSlashPanelConfig(slashPanel)) {
+      throw new TypeError('Invalid Feishu slash panel config');
+    }
+    return this.#serializeConfig(() => this.#withBotTransition(botId, async () => {
+      const config = this.#requireBot(botId);
+      const saved = await this.#configStore.saveBot({ ...config, slashPanel });
+      // The panel lives on Feishu's side, so the runtime re-syncs it in the
+      // background; this call only records what the panel should be.
+      this.#runtimes.get(botId)?.setSlashPanel?.(saved.slashPanel);
       this.#touch();
       return this.status(botId);
     }));
@@ -640,6 +663,25 @@ export class MultiBotDshFeishuController {
       const config = this.#requireBot(botId);
       const saved = await this.#configStore.saveBot({ ...config, stepPushMode });
       this.#runtimes.get(botId)?.setStepPushMode?.(saved.stepPushMode);
+      this.#touch();
+      return this.status(botId);
+    }));
+  }
+
+  async updateVoice(botId, voice) {
+    this.#assertOpen();
+    if (voice !== null && (typeof voice !== 'object' || Array.isArray(voice))) {
+      throw new TypeError('Invalid Feishu voice configuration');
+    }
+    const normalized = normalizeFeishuVoiceConfig(voice);
+    return this.#serializeConfig(() => this.#withBotTransition(botId, async () => {
+      const config = this.#requireBot(botId);
+      const saved = await this.#configStore.saveBot({ ...config, voice: normalized });
+      // 语音是可选的渠道能力:凭据缺失时静默降级为禁用,不打断配置保存。
+      const secret = normalized
+        ? await atConnectionStage('credential.read', () => this.#credentials.resolve(normalized.secretRef), 'credential-store').catch(() => null)
+        : null;
+      this.#runtimes.get(botId)?.setVoice?.({ config: normalized, secret: secret?.value ?? null });
       this.#touch();
       return this.status(botId);
     }));
@@ -707,9 +749,11 @@ export class MultiBotDshFeishuController {
         connected,
         configured: true,
         groupResponseMode: normalizeFeishuGroupResponseMode(config.groupResponseMode),
-        groupTopicReply: config.groupTopicReply === true,
+        mentionTopicReply: config.mentionTopicReply !== false,
         stepPush: config.stepPush === true,
         stepPushMode: normalizeFeishuStepPushMode(config.stepPushMode),
+        voice: normalizeFeishuVoiceConfig(config.voice),
+        slashPanel: normalizeSlashPanelConfig(config.slashPanel),
         groupMessagePermissionGranted: config.groupMessagePermissionGranted === true,
         bot: publicBot(config),
         connection,

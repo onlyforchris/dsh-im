@@ -265,7 +265,7 @@ test('Host validates and updates the Feishu group topic reply flag', async () =>
       connected: true,
       configured: true,
       groupResponseMode: 'mention',
-      groupTopicReply: topicReply,
+      mentionTopicReply: topicReply,
       bot: { name: '话题机器人', domain: 'feishu' },
       connection: {
         ready: true,
@@ -279,7 +279,7 @@ test('Host validates and updates the Feishu group topic reply flag', async () =>
     startRegistration: async () => current(),
     cancelRegistration: async () => current(),
     disconnect: async () => status(),
-    updateGroupTopicReply: async (botId, value) => {
+    updateMentionTopicReply: async (botId, value) => {
       assert.equal(botId, 'bot_topic');
       topicReply = value;
       return current();
@@ -288,16 +288,16 @@ test('Host validates and updates the Feishu group topic reply flag', async () =>
   const fx = await rpcFixture(controller);
 
   const updated = await fx.registration.handler(
-    FEISHU_ENDPOINTS.setGroupTopicReply,
-    { botId: 'bot_topic', groupTopicReply: true },
+    FEISHU_ENDPOINTS.setMentionTopicReply,
+    { botId: 'bot_topic', mentionTopicReply: true },
     signal(),
   );
   assert.equal(updated.ok, true);
-  assert.equal(updated.value.bots[0].groupTopicReply, true);
+  assert.equal(updated.value.bots[0].mentionTopicReply, true);
 
   const invalid = await fx.registration.handler(
-    FEISHU_ENDPOINTS.setGroupTopicReply,
-    { botId: 'bot_topic', groupTopicReply: 'sometimes' },
+    FEISHU_ENDPOINTS.setMentionTopicReply,
+    { botId: 'bot_topic', mentionTopicReply: 'sometimes' },
     signal(),
   );
   assert.equal(invalid.ok, false);
@@ -317,7 +317,7 @@ test('Host validates and updates the Feishu step push flag', async () => {
       connected: true,
       configured: true,
       groupResponseMode: 'mention',
-      groupTopicReply: false,
+      mentionTopicReply: false,
       stepPush,
       bot: { name: '分步直推机器人', domain: 'feishu' },
       connection: {
@@ -355,6 +355,64 @@ test('Host validates and updates the Feishu step push flag', async () => {
   );
   assert.equal(invalid.ok, false);
   assert.equal(invalid.error.code, 'bad-request');
+  await fx.dispose();
+});
+
+test('Host validates and updates the Feishu command panel', async () => {
+  let slashPanel = { mode: 'default', order: [] };
+  const current = () => status({
+    schemaVersion: 2,
+    revision: 6,
+    configured: true,
+    bots: [{
+      botId: 'bot_panel',
+      phase: 'connected',
+      connected: true,
+      configured: true,
+      slashPanel,
+      bot: { name: '指令面板机器人', domain: 'feishu' },
+      connection: {
+        ready: true,
+        feishuLongConnectionState: 'connected',
+        harnessReachable: true,
+      },
+    }],
+  });
+  const controller = {
+    status: async () => current(),
+    startRegistration: async () => current(),
+    cancelRegistration: async () => current(),
+    disconnect: async () => status(),
+    updateSlashPanel: async (botId, value) => {
+      assert.equal(botId, 'bot_panel');
+      slashPanel = value;
+      return current();
+    },
+  };
+  const fx = await rpcFixture(controller);
+
+  const updated = await fx.registration.handler(
+    FEISHU_ENDPOINTS.setSlashPanel,
+    { botId: 'bot_panel', slashPanel: { mode: 'custom', order: ['new', 'stop'] } },
+    signal(),
+  );
+  assert.equal(updated.ok, true);
+  assert.deepEqual(updated.value.bots[0].slashPanel, { mode: 'custom', order: ['new', 'stop'] });
+
+  for (const damaged of [
+    { mode: 'custom', order: ['nope'] },
+    { mode: 'custom', order: ['/new'] },
+    { mode: 'custom', order: ['new', 'new'] },
+    { mode: 'default', order: ['new'] },
+  ]) {
+    const invalid = await fx.registration.handler(
+      FEISHU_ENDPOINTS.setSlashPanel,
+      { botId: 'bot_panel', slashPanel: damaged },
+      signal(),
+    );
+    assert.equal(invalid.ok, false);
+    assert.equal(invalid.error.code, 'bad-request');
+  }
   await fx.dispose();
 });
 

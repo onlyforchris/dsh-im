@@ -6,6 +6,134 @@ This file records the notable changes in each dsh-im release. Its format follows
 
 ## [Unreleased]
 
+## [4.32.0] - 2026-09-29
+
+### Added / 新增
+
+- 支持插件详情操作按钮的 DSH 中，dsh-im 插件详情页新增「打开 IM机器人」按钮，可在主区域打开已有 IM 管理面板，并通过「返回插件详情」返回当前插件。按钮及返回入口支持中英文。
+  On DSH versions that support plugin detail actions, the dsh-im details page adds **Open IM bots** to open the existing IM management panel in the main area, with **Back to plugin details** returning to this plugin. Both actions support Chinese and English.
+- 新增中英文插件描述资源，并随 npm 包发布、导出 `locale/*.json`，供 Host 根据界面语言显示插件说明。
+  Added Chinese and English plugin-description resources, published and exported as `locale/*.json` so the Host can display the description in the interface language.
+
+### Notes / 使用说明
+
+- 新入口按需接入可选的 `layout`、`pluginNavigation` 服务和 `plugins.detail.actions` 槽位；缺少相关能力的旧版 DSH 仍可通过「设置 → IM机器人」访问，无需迁移配置。入口注册不会提前加载管理面板，相关服务或槽位撤销时会清理注册。
+  The new entry uses the optional `layout` and `pluginNavigation` services and the `plugins.detail.actions` slot. Older DSH versions without these capabilities retain **Settings → IM bots**, with no configuration migration. Registration does not mount the panel early, and registrations are cleaned up when the relevant services or slots are withdrawn.
+- 本次不改变渠道配置及消息处理行为；DSH 兼容性声明仍为 `0.1.7-alpha.1`，插件详情入口仅在 Host 提供上述能力时可用。
+  This release does not change channel configuration or message processing. The declared DSH compatibility remains `0.1.7-alpha.1`; the plugin-details entry is available only when the Host provides the capabilities above.
+
+## [4.31.0] - 2026-09-29
+
+### Added / 新增
+
+- 上下文增强新增可选来源字段「发送时间」`sentAt`，目前由微信渠道提供：优先使用平台发送时间，平台未提供时从消息 ID 解析，按 Host 本机时区输出 `YYYY-MM-DD HH:mm:ss`。无法取得有效时间时省略该字段，不用当前时间代替。感谢 [@Pegasus02](https://github.com/Pegasus02)（[#279](https://github.com/xmanrui/dsh-im/pull/279)）。
+  Context enhancement adds an optional Sent at source field, `sentAt`, currently supplied by WeChat. It uses the platform send time, or decodes the message ID when that time is absent, and renders `YYYY-MM-DD HH:mm:ss` in the Host's local time zone. An unavailable or invalid time is omitted rather than replaced with the current time. Thanks to [@Pegasus02](https://github.com/Pegasus02) ([#279](https://github.com/xmanrui/dsh-im/pull/279)).
+
+### Fixed / 修复
+
+- 飞书等待用户回答时，提问发起人发送图片或图文消息会结束本轮追问，并在原会话按顺序处理图片，避免图片被丢弃且流程持续等待文字；原提问卡同步移除按钮。连续发图、图片消息去重和普通文字回答沿用既有机制。（[#208](https://github.com/xmanrui/dsh-im/issues/208)）
+  When a Feishu question is pending, images and image posts from its initiating user end the question turn and are processed in order in the same Session. Images are no longer discarded while the flow waits for text, and the question card removes its buttons. Existing queueing, deduplication, and text-answer behavior are preserved. ([#208](https://github.com/xmanrui/dsh-im/issues/208))
+- 发送时间仅在已启用的上下文增强实际选中并输出该字段时读取；关闭增强、未选择字段或执行本地命令时不读取，时间读取失败不阻断消息处理。
+  Send time is read only when an enabled context-enhancement block actually selects and renders the field. Disabled enhancement, unselected fields, and local commands do not read it; an unreadable time does not block message processing.
+
+### Security / 安全
+
+- 将生产依赖 `undici` 从 7.29.0 更新到官方安全修复版 7.29.1，修复本次安装审计报告的 [GHSA-3wwx-pv8p-q78v](https://github.com/advisories/GHSA-3wwx-pv8p-q78v)。这只更新插件依赖，不替代 Node.js 自带网络组件的安全升级。
+  Updated the production dependency `undici` from 7.29.0 to the upstream security release 7.29.1, addressing [GHSA-3wwx-pv8p-q78v](https://github.com/advisories/GHSA-3wwx-pv8p-q78v) reported by the release install audit. This updates the plugin dependency, not Node.js's bundled networking components.
+
+### Notes / 使用说明
+
+- 不自动开启上下文增强，也不自动给已有配置添加 `sentAt`。启用并勾选后，发送时间会作为消息上下文提供给模型；时间文本不带时区偏移，可在增强提示词中注明 Host 时区。其他渠道暂不提供该字段。
+  Context enhancement is not enabled automatically, and existing field selections do not gain `sentAt` automatically. When enabled and selected, send time is supplied to the model as message context. The text contains no time-zone offset; name the Host time zone in the guidance if needed. Other channels do not currently supply this field.
+- 飞书图片接续只由当前提问的发起人触发；若停止提问失败，图片保留在队列中并提示先回答问题或发送 `/stop`，不会伪造文字答案。DSH 0.1.7-alpha.1 兼容性声明保持不变；升级后重启 Host 并刷新设置页。
+  Only the initiating user's image interrupts a pending Feishu question. If stopping fails, the image remains queued and the bot asks the user to answer or send `/stop`; no text answer is fabricated. The DSH 0.1.7-alpha.1 compatibility declaration remains unchanged. Restart the Host and refresh settings after upgrading.
+
+## [4.30.0] - 2026-09-28
+
+### Upgrade notes / 升级注意事项
+
+- 飞书「被 @ 时以话题方式回复」现在默认开启，群聊和私聊都会在主时间线中被 @ 提问的消息下创建独立话题；这也会改变已有机器人的默认行为。需要保留平铺回复时，请在机器人卡片「更多设置 → 群聊」中关闭该开关（`mentionTopicReply: false`）。
+  Feishu's Reply as a topic when mentioned setting is now on by default in both groups and direct chats, including existing bots. A question mentioning the bot in the main timeline starts a dedicated topic. To retain flat replies, disable the setting under the bot card's More Settings → Group (`mentionTopicReply: false`).
+- 旧字段 `groupTopicReply` 不会迁移为新开关的取值，下次保存时会被忽略。相关设置端点由 `bot.group-topic-reply.set` 更名为 `bot.mention-topic-reply.set`；自行接入该端点的客户端需同步调整。升级后请重启 Host 并刷新设置页。
+  The old `groupTopicReply` value is not migrated to the new setting and is ignored on the next save. The setting endpoint changes from `bot.group-topic-reply.set` to `bot.mention-topic-reply.set`; custom clients using it must update accordingly. Restart the Host and refresh settings after upgrading.
+
+### Added / 新增
+
+- 飞书由机器人开启的话题对应独立的 DSH 会话，话题内后续消息继续使用同一会话；仅发送 @机器人 不创建话题，没有 @ 的普通消息沿用原有会话及回复规则。感谢 [@yangzhe1991](https://github.com/yangzhe1991)（[#275](https://github.com/xmanrui/dsh-im/pull/275)）。
+  Bot-created Feishu topics map to independent DSH Sessions, with follow-up messages staying in the same Session. A bare bot mention does not create a topic, and ordinary messages without a mention retain existing conversation and reply rules. Thanks to [@yangzhe1991](https://github.com/yangzhe1991) ([#275](https://github.com/xmanrui/dsh-im/pull/275)).
+- 飞书机器人「更多设置 → 指令面板」可选择跟随插件默认清单，或自定义输入框“/”面板中的内置指令及顺序；支持增删、上下移动，以及确认后将当前配置保存并复制到同渠道其他机器人。离线机器人在下次启动时同步。感谢 [@yangzhe1991](https://github.com/yangzhe1991)（[#274](https://github.com/xmanrui/dsh-im/pull/274)）。
+  Feishu More Settings → Command Panel now supports following the shipped defaults or selecting and ordering built-in commands in the input box's slash panel. Commands can be added, removed, and moved up or down; after confirmation, the current configuration can be saved and copied to other bots on the channel. Offline bots synchronize on their next start. Thanks to [@yangzhe1991](https://github.com/yangzhe1991) ([#274](https://github.com/xmanrui/dsh-im/pull/274)).
+
+### Fixed / 修复
+
+- 飞书回复未返回 `thread_id` 时回读根消息并登记话题，包含逐步消息模式，避免话题内追问错误回到主会话。
+  Feishu topic registration reads back the root message when a reply omits `thread_id`, including step-by-step message mode, preventing topic follow-ups from falling back to the main conversation.
+- 同一机器人的指令面板同步串行执行，新配置使旧同步在后续检查点停止，避免新旧计划交错写入；保存后设置页和后续复制操作使用已保存的新列表，不再回显旧配置。
+  Command-panel synchronization runs serially per bot. New settings stop superseded work at subsequent checkpoints to prevent interleaved writes. The settings page and later copy actions retain the newly saved list instead of reverting to stale configuration.
+
+### Notes / 使用说明
+
+- 隐藏面板指令不等于禁用该命令，手动输入仍遵循现有处理及权限规则。默认模式仅补齐缺少项，不删除、不重排已有项；自定义模式按需重建插件清单内的指令，不删除清单外的指令。后台同步可能需要数十秒，保存配置成功不代表飞书面板已经更新完成。
+  Hiding a panel entry does not disable the command; typed commands retain existing handling and permission rules. Default mode only adds missing entries without deleting or reordering existing ones. Custom mode rebuilds commands from the plugin manifest when needed and leaves commands outside that manifest untouched. Background synchronization may take tens of seconds; saving settings does not mean the Feishu panel has finished updating.
+- 宿主兼容性声明保持 DSH 0.1.7-alpha.1，依赖声明未变。
+  Host compatibility remains declared for DSH 0.1.7-alpha.1, and dependency declarations are unchanged.
+
+## [4.29.1] - 2026-09-28
+
+### Changed / 变更
+
+- 新增渐变消息连接图标，并通过 `package.json` 的 `icon` 字段声明；图标资源随 npm 包发布，供支持该元数据的插件界面展示。
+  Added a gradient message-link icon declared through the `icon` field in `package.json`. The asset is included in the npm package for plugin interfaces that support this metadata.
+
+### Compatibility / 兼容性
+
+- 本次仅更新插件图标与包元数据，不改变渠道行为、配置、依赖声明或宿主兼容性范围；DSH 兼容性声明保持 0.1.7-alpha.1。
+  This release only updates the plugin icon and package metadata. Channel behavior, configuration, dependency declarations, and the Host compatibility range are unchanged; DSH compatibility remains declared for 0.1.7-alpha.1.
+
+## [4.29.0] - 2026-09-28
+
+### Added / 新增
+
+- 飞书新增默认关闭、按机器人启用的语音交互：语音提问经 ASR 转写后进入现有文字处理流程，同回合答案在保留文字回复的同时可合成为语音，包含分步流式卡片完成后的语音回复。转写后继续执行命令权限检查，语音回合按会话隔离，避免同群不同话题之间串音。感谢 [@rosalynthompson32-a11y](https://github.com/rosalynthompson32-a11y)（[#271](https://github.com/xmanrui/dsh-im/pull/271)）。
+  Added optional, per-bot Feishu voice interaction, disabled by default. ASR transcripts enter the existing text pipeline, and the same turn's answer can be spoken alongside its text reply, including after step-streaming cards finish. Transcribed commands retain permission checks, while voice turns are isolated per Session to prevent cross-topic replies. Thanks to [@rosalynthompson32-a11y](https://github.com/rosalynthompson32-a11y) ([#271](https://github.com/xmanrui/dsh-im/pull/271)).
+- 飞书机器人「更多设置」新增「语音交互」页，可配置凭据引用、ASR/TTS 模型和音色；刷新后恢复已保存配置，关闭开关立即保存。密钥由宿主凭据库解析，配置只保存引用名称。
+  Added a Voice Interaction tab in Feishu bot More Settings for the credential reference, ASR/TTS models, and voice. Saved settings survive refresh, disabling is persisted immediately, and configuration stores only a reference to the credential resolved by the Host.
+
+### Fixed / 修复
+
+- 飞书审批在批准、拒绝或已处理后更新原卡片，用结果文字替换操作按钮并保留工具、参数和原因；按钮与文字审批均生效，继续保留原有文字回执。卡片更新失败不会重新提交审批，也不阻断后续审批（[#273](https://github.com/xmanrui/dsh-im/issues/273)）。
+  Feishu approvals now update the original card after approval, rejection, or resolution, replacing action buttons with the outcome while retaining tool details, arguments, and reason. Both button and text decisions retain the existing text receipt. Card-update failures neither resubmit the decision nor block later approvals ([#273](https://github.com/xmanrui/dsh-im/issues/273)).
+- 邮件审批等待场景的回归测试改为等待实际轮询条件，减少繁忙环境下固定延时造成的偶发失败（[#272](https://github.com/xmanrui/dsh-im/pull/272)）。
+  The email pending-approval regression now waits for the actual polling condition, reducing timing-related failures caused by a fixed delay under load ([#272](https://github.com/xmanrui/dsh-im/pull/272)).
+
+### Notes / 使用说明
+
+- 语音交互需要自行准备可用的 ffmpeg 和 DashScope 凭据；默认使用 `qwen3-asr-flash`、`qwen3-tts-flash` 与 `Momo` 音色。启用后，音频会发往所配置的 ASR 服务，回复文本会发往 DashScope TTS；TTS 仅取空白归一化后的前 600 个字符。转写失败时保留不支持类型提示，语音合成失败不影响已发送的文字回复；缺失 ffmpeg 不会导致宿主进程崩溃。npm 安装不会自动安装 ffmpeg。
+  Voice interaction requires an available ffmpeg installation and DashScope credential. Defaults are `qwen3-asr-flash`, `qwen3-tts-flash`, and the `Momo` voice. When enabled, audio is sent to the configured ASR service and reply text to DashScope TTS; speech uses only the first 600 characters after whitespace normalization. Transcription failures retain the unsupported-type notice, speech failures leave delivered text intact, and missing ffmpeg does not crash the Host. npm installation does not install ffmpeg.
+- 审批卡修复不批量更新旧版本或进程重启前已发出的历史卡片。宿主兼容性声明仍为 DSH 0.1.7-alpha.1；升级后请重启 Host 并刷新设置页。
+  The approval fix does not retroactively update cards from older versions or before a process restart. Host compatibility remains declared for DSH 0.1.7-alpha.1; restart the Host and refresh settings after upgrading.
+
+## [4.28.1] - 2026-09-25
+
+### Fixed / 修复
+
+- 默认 IM 工作区改为按实际选择创建：仅加载渠道或使用自定义工作区时，不再生成未使用的 `$DSH_HOME/im` 空目录；机器人或会话选用默认目录、切回默认目录，以及恢复相关 Session 时按需准备目录。已有工作区选择与未分组 Session 行为不变，不自动删除历史目录，也不自动创建任意自定义路径（[#259](https://github.com/xmanrui/dsh-im/issues/259)、[#260](https://github.com/xmanrui/dsh-im/pull/260)）。
+  The default IM workspace is now created when selected, rather than generating an unused `$DSH_HOME/im` directory while loading channels or using a custom workspace. Bot/conversation selection, switching back, and relevant Session recovery prepare the directory as needed. Existing workspace choices and ungrouped Session behavior are preserved; old directories are not deleted and arbitrary custom paths are not created automatically ([#259](https://github.com/xmanrui/dsh-im/issues/259), [#260](https://github.com/xmanrui/dsh-im/pull/260)).
+- 飞书「实时直播」在需要话题内回复的回合自动使用实时过程卡，让过程和最终答案留在同一话题，避免原生思考过程出现在群聊主时间线。私聊和非话题群聊继续使用原生思考过程，不修改机器人的已保存展示模式。感谢 [@TonyWu2333](https://github.com/TonyWu2333)（[#244](https://github.com/xmanrui/dsh-im/issues/244)、[#265](https://github.com/xmanrui/dsh-im/pull/265)）。
+  Feishu Live process mode now uses a streaming process card for turns that must reply inside a topic, keeping progress and the final answer in that topic instead of posting native thinking progress to the main group timeline. Private and non-topic chats retain native thinking messages, and saved bot presentation settings are unchanged. Thanks to [@TonyWu2333](https://github.com/TonyWu2333) ([#244](https://github.com/xmanrui/dsh-im/issues/244), [#265](https://github.com/xmanrui/dsh-im/pull/265)).
+- 微信图片与文件的 CDN 上传使用延迟创建、独立管理的网络分发器，避免宿主全局分发器导致成功响应缺少 `x-encrypted-param` 而上传失败；继续遵循环境代理配置，控制器关闭时释放资源，保留现有 JSON 请求和上传重试行为（[#270](https://github.com/xmanrui/dsh-im/issues/270)）。
+  Weixin image/file CDN uploads now use a lazy, privately managed dispatcher, avoiding failures when the Host's global dispatcher loses `x-encrypted-param` from otherwise successful responses. Environment proxy settings remain honored, resources are released on controller close, and existing JSON requests and upload retry behavior are preserved ([#270](https://github.com/xmanrui/dsh-im/issues/270)).
+
+### Changed / 变更
+
+- CI 增加 Windows 工作区回归检查，覆盖默认目录创建、工作区切换、绑定恢复及相关并发场景；同步中英文 README 的官方 Token 赞助说明。
+  Added Windows CI regression coverage for workspace creation, switching, binding recovery, and related concurrency cases, and clarified official token sponsorship wording in both READMEs.
+
+### Compatibility / 兼容性
+
+- 插件宿主兼容性元数据保持 DSH 0.1.7-alpha.1，不扩大为未经验证的版本范围。升级插件后请重启 Host 并刷新设置页。
+  Host compatibility metadata remains declared for DSH 0.1.7-alpha.1 without expanding to unverified versions. Restart the Host and refresh settings after upgrading.
+
 ## [4.28.0] - 2026-09-24
 
 ### Fixed / 修复
@@ -1283,7 +1411,13 @@ This file records the notable changes in each dsh-im release. Its format follows
 - 改进 npm 发布包结构，保留 CLI 入口并避免安装脚本拦截。
   Improved npm package contents to preserve the CLI entry point and avoid install-script blocking.
 
-[Unreleased]: https://github.com/xmanrui/dsh-im/compare/v4.28.0...HEAD
+[Unreleased]: https://github.com/xmanrui/dsh-im/compare/v4.32.0...HEAD
+[4.32.0]: https://github.com/xmanrui/dsh-im/compare/v4.31.0...v4.32.0
+[4.31.0]: https://github.com/xmanrui/dsh-im/compare/v4.30.0...v4.31.0
+[4.30.0]: https://github.com/xmanrui/dsh-im/compare/v4.29.1...v4.30.0
+[4.29.1]: https://github.com/xmanrui/dsh-im/compare/v4.29.0...v4.29.1
+[4.29.0]: https://github.com/xmanrui/dsh-im/compare/v4.28.1...v4.29.0
+[4.28.1]: https://github.com/xmanrui/dsh-im/compare/v4.28.0...v4.28.1
 [4.28.0]: https://github.com/xmanrui/dsh-im/compare/v4.27.0...v4.28.0
 [4.27.0]: https://github.com/xmanrui/dsh-im/compare/v4.26.0...v4.27.0
 [4.26.0]: https://github.com/xmanrui/dsh-im/compare/v4.25.0...v4.26.0

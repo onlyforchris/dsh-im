@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { MultiBotDshFeishuController } from '../../../src/channels/feishu/multi-bot-controller.mjs';
+import { normalizeFeishuVoiceConfig } from '../../../src/channels/feishu/voice-config.mjs';
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
@@ -110,6 +111,7 @@ function fixture({
         proactiveSends: [],
         probes: [],
         responseModes: [],
+        voiceCalls: [],
         repair,
         get status() { return structuredClone(status); },
         async start() {
@@ -135,6 +137,9 @@ function fixture({
         setGroupResponseMode(mode) {
           runtime.responseModes.push(mode);
           runtime.config.groupResponseMode = mode;
+        },
+        setVoice(config) {
+          runtime.voiceCalls.push(structuredClone(config));
         },
         async beginCardActionProbe(options) {
           runtime.probes.push(structuredClone(options));
@@ -224,7 +229,7 @@ test('group response mode defaults to mention and updates the live runtime witho
   await fx.controller.close();
 });
 
-test('groupTopicReply persists and reaches the live runtime without reconnecting', async () => {
+test('mentionTopicReply persists and reaches the live runtime without reconnecting', async () => {
   const existing = bot('bot_topic_reply', 'topic_reply');
   const fx = fixture({
     bots: [existing],
@@ -232,19 +237,19 @@ test('groupTopicReply persists and reaches the live runtime without reconnecting
   });
   await fx.controller.initialize();
 
-  assert.equal(fx.controller.status().bots[0].groupTopicReply, false);
+  assert.equal(fx.controller.status().bots[0].mentionTopicReply, true);
   const runtime = fx.runtimes.get(existing.id)[0];
   const topicReplies = [];
-  runtime.setGroupTopicReply = (value) => topicReplies.push(value);
-  const updated = await fx.controller.updateGroupTopicReply(existing.id, true);
+  runtime.setMentionTopicReply = (value) => topicReplies.push(value);
+  const updated = await fx.controller.updateMentionTopicReply(existing.id, false);
 
-  assert.equal(updated.bots[0].groupTopicReply, true);
-  assert.equal(fx.configStore.getBot(existing.id).groupTopicReply, true);
-  assert.deepEqual(topicReplies, [true]);
+  assert.equal(updated.bots[0].mentionTopicReply, false);
+  assert.equal(fx.configStore.getBot(existing.id).mentionTopicReply, false);
+  assert.deepEqual(topicReplies, [false]);
   assert.equal(fx.runtimes.get(existing.id).length, 1);
   await assert.rejects(
-    fx.controller.updateGroupTopicReply(existing.id, 'yes'),
-    /Invalid Feishu group topic reply flag/,
+    fx.controller.updateMentionTopicReply(existing.id, 'yes'),
+    /Invalid Feishu mention topic reply flag/,
   );
   await fx.controller.close();
 });
@@ -270,6 +275,40 @@ test('stepPush persists and reaches the live runtime without reconnecting', asyn
   await assert.rejects(
     fx.controller.updateStepPush(existing.id, 'yes'),
     /Invalid Feishu step push/,
+  );
+  await fx.controller.close();
+});
+
+test('slashPanel persists, normalizes, and reaches the live runtime without reconnecting', async () => {
+  const existing = bot('bot_slash_panel', 'slash_panel');
+  const fx = fixture({
+    bots: [existing],
+    secrets: { [existing.secretRef]: 'stable-secret' },
+  });
+  await fx.controller.initialize();
+
+  // A bot that never configured the panel follows the shipped manifest.
+  assert.deepEqual(fx.controller.status().bots[0].slashPanel, { mode: 'default', order: [] });
+  const runtime = fx.runtimes.get(existing.id)[0];
+  const panels = [];
+  runtime.setSlashPanel = (value) => panels.push(value);
+  const updated = await fx.controller.updateSlashPanel(existing.id, {
+    mode: 'custom',
+    order: ['new', 'stop'],
+  });
+
+  assert.deepEqual(updated.bots[0].slashPanel, { mode: 'custom', order: ['new', 'stop'] });
+  assert.deepEqual(fx.configStore.getBot(existing.id).slashPanel, { mode: 'custom', order: ['new', 'stop'] });
+  assert.deepEqual(panels, [{ mode: 'custom', order: ['new', 'stop'] }]);
+  // The panel lives on Feishu's side: recording it must not bounce the bot.
+  assert.equal(fx.runtimes.get(existing.id).length, 1);
+  await assert.rejects(
+    fx.controller.updateSlashPanel(existing.id, { mode: 'custom', order: ['nope'] }),
+    /Invalid Feishu slash panel config/,
+  );
+  await assert.rejects(
+    fx.controller.updateSlashPanel(existing.id, { mode: 'default', order: ['new'] }),
+    /Invalid Feishu slash panel config/,
   );
   await fx.controller.close();
 });
@@ -300,6 +339,41 @@ test('stepPushMode persists, normalizes, and reaches the live runtime without re
   await assert.rejects(
     fx.controller.updateStepPushMode(existing.id, 'bubble'),
     /Invalid Feishu step push mode/,
+  );
+  await fx.controller.close();
+});
+
+test('voice persists, normalizes, and reaches the live runtime without reconnecting', async () => {
+  const existing = bot('bot_voice', 'voice');
+  const fx = fixture({
+    bots: [existing],
+    secrets: { [existing.secretRef]: 'stable-secret', MY_KEY: 'dashscope-key' },
+  });
+  await fx.controller.initialize();
+
+  // 未配置时不返回语音配置,页面据此回显“关闭”,与后台实际状态一致。
+  assert.equal(fx.controller.status().bots[0].voice, null);
+  const runtime = fx.runtimes.get(existing.id)[0];
+
+  const normalized = normalizeFeishuVoiceConfig({ enabled: true, secretRef: 'MY_KEY', ttsVoice: 'Cherry' });
+  const updated = await fx.controller.updateVoice(existing.id, {
+    enabled: true, secretRef: 'MY_KEY', ttsVoice: 'Cherry',
+  });
+
+  // 保存 → 状态查询 → 页面回显:状态必须携带归一化后的 voice,刷新后仍显示开启。
+  assert.deepEqual(updated.bots[0].voice, normalized);
+  assert.equal(fx.configStore.getBot(existing.id).voice.ttsVoice, 'Cherry');
+  assert.deepEqual(runtime.voiceCalls, [{ config: normalized, secret: 'dashscope-key' }]);
+  assert.equal(fx.runtimes.get(existing.id).length, 1);
+
+  const off = await fx.controller.updateVoice(existing.id, null);
+  assert.equal(off.bots[0].voice, null);
+  assert.equal(fx.configStore.getBot(existing.id).voice, null);
+  assert.deepEqual(runtime.voiceCalls[1], { config: null, secret: null });
+
+  await assert.rejects(
+    fx.controller.updateVoice(existing.id, 'yes'),
+    /Invalid Feishu voice configuration/,
   );
   await fx.controller.close();
 });

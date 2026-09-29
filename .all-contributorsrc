@@ -563,6 +563,22 @@
       ]
     },
     {
+      "login": "Pegasus02",
+      "name": "Tianjun Cai",
+      "avatar_url": "https://avatars.githubusercontent.com/u/102945996",
+      "profile": "https://github.com/Pegasus02",
+      "contributions": [
+        {
+          "type": "code",
+          "url": "https://github.com/xmanrui/dsh-im/pull/279"
+        },
+        {
+          "type": "test",
+          "url": "https://github.com/xmanrui/dsh-im/pull/279"
+        }
+      ]
+    },
+    {
       "login": "penggaolai",
       "name": "penggaolai",
       "avatar_url": "https://avatars.githubusercontent.com/u/44097312",
@@ -587,6 +603,26 @@
         {
           "type": "doc",
           "url": "https://github.com/xmanrui/dsh-im/commit/64b9ac8b6e4ba760bc0e182f700cc5be7fffb94f"
+        }
+      ]
+    },
+    {
+      "login": "rosalynthompson32-a11y",
+      "name": "Biertolovisk",
+      "avatar_url": "https://avatars.githubusercontent.com/u/313334391",
+      "profile": "https://github.com/rosalynthompson32-a11y",
+      "contributions": [
+        {
+          "type": "code",
+          "url": "https://github.com/xmanrui/dsh-im/pull/271"
+        },
+        {
+          "type": "doc",
+          "url": "https://github.com/xmanrui/dsh-im/pull/271"
+        },
+        {
+          "type": "test",
+          "url": "https://github.com/xmanrui/dsh-im/pull/271"
         }
       ]
     },
@@ -690,11 +726,15 @@
       "contributions": [
         {
           "type": "code",
-          "url": "https://github.com/xmanrui/dsh-im/pull/222"
+          "url": "https://github.com/xmanrui/dsh-im/commits/main/?author=yangzhe1991"
+        },
+        {
+          "type": "doc",
+          "url": "https://github.com/xmanrui/dsh-im/commits/main/?author=yangzhe1991"
         },
         {
           "type": "test",
-          "url": "https://github.com/xmanrui/dsh-im/pull/222"
+          "url": "https://github.com/xmanrui/dsh-im/commits/main/?author=yangzhe1991"
         }
       ]
     },

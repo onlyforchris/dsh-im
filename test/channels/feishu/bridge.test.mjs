@@ -815,6 +815,9 @@ test('mention response mode ignores unaddressed groups and only accepts this bot
     allowedSenderOpenIds: new Set(['ou_user']),
     botOpenId: 'ou_bot',
     groupResponseMode: 'mention',
+    // This test is about which messages get a reply at all; topic routing is
+    // covered by the dedicated mention-topic tests below.
+    mentionTopicReply: false,
   });
 
   await bridge.accept(event('group-unaddressed', '普通群消息', {
@@ -862,6 +865,8 @@ for (const groupResponseMode of ['mention', 'all']) {
       allowedSenderOpenIds: new Set(['ou_peer_bot']),
       botOpenId: 'ou_bot',
       groupResponseMode,
+      // Acceptance and deduplication only; topic routing is covered elsewhere.
+      mentionTopicReply: false,
     });
 
     const message = botEvent('bot-mention', '@_bot 帮忙检查', {
@@ -941,6 +946,8 @@ test('bot group mentions still obey the group allowlist and command permissions'
     status: bridgeStatus(),
     accessPolicy,
     botOpenId: 'ou_bot',
+    // Allowlist and command permissions only; topic routing is covered elsewhere.
+    mentionTopicReply: false,
   });
   const group = {
     chat_type: 'group', chat_id: 'oc_bot_group',
@@ -1393,6 +1400,8 @@ test('bridge sends Feishu post text and all embedded images as one structured pr
     state: fixture.state,
     status: bridgeStatus(),
     allowedSenderOpenIds: new Set(['ou_user']),
+    // Structured prompt assembly only; topic routing is covered elsewhere.
+    mentionTopicReply: false,
   });
   const postEvent = event('om_post_input', '', {
     message_type: 'post',
@@ -2077,11 +2086,12 @@ test('Feishu handles approval replies on the fast lane and presents approvals in
 test('an approval is presented as an interactive card with approve and reject buttons by default', async () => {
   const fixture = stateFixture([['p2p:ou_user', 'session-approval-card']]);
   const sent = [];
+  const patches = [];
   const decisions = [];
   const decided = deferred();
   const bridge = new FeishuHarnessBridge({
     // No interactionCards option: the default (cards on) is under test.
-    client: cardClient(async (outgoing) => sent.push(outgoing)),
+    client: cardClient(async (outgoing) => sent.push(outgoing), async (request) => { patches.push(request); }),
     harness: {
       sessionExists: async () => true,
       createSession: async () => assert.fail('the existing session should be reused'),
@@ -2152,15 +2162,26 @@ test('an approval is presented as an interactive card with approve and reject bu
       outcome: 'allowed-once',
     },
   }]);
+  assert.equal(patches.length, 1);
+  assert.equal(patches[0].path.message_id, 'om_card_1');
+  const resolvedCard = JSON.parse(patches[0].data.content);
+  assert.deepEqual(buttonsFromCard(resolvedCard), []);
+  assert.ok(collectVisibleCardText(resolvedCard).includes('已批准，仅对本次操作有效。'));
+  assert.ok(collectVisibleCardText(resolvedCard).includes('需要执行一个危险命令'));
+  await bridge.onCardAction(cardActionEvent('om_card_1', 'reject:approval-card-id', 'ou_user'));
+  assert.equal(decisions.length, 1);
+  assert.equal(patches.length, 1);
+  assert.match(sent.at(-1).content, /该审批已处理或不存在/);
 });
 
 test('approval card reject button submits a rejected outcome', async () => {
   const fixture = stateFixture([['p2p:ou_user', 'session-approval-reject']]);
   const sent = [];
+  const patches = [];
   const decisions = [];
   const decided = deferred();
   const bridge = new FeishuHarnessBridge({
-    client: cardClient(async (outgoing) => sent.push(outgoing)),
+    client: cardClient(async (outgoing) => sent.push(outgoing), async (request) => { patches.push(request); }),
     harness: {
       sessionExists: async () => true,
       createSession: async () => assert.fail('the existing session should be reused'),
@@ -2220,6 +2241,129 @@ test('approval card reject button submits a rejected outcome', async () => {
       outcome: 'rejected',
     },
   }]);
+  assert.equal(patches.length, 1);
+  assert.equal(patches[0].path.message_id, 'om_card_1');
+  const resolvedCard = JSON.parse(patches[0].data.content);
+  assert.deepEqual(buttonsFromCard(resolvedCard), []);
+  assert.ok(collectVisibleCardText(resolvedCard).includes('已拒绝此次操作。'));
+});
+
+test('issue #273: approval completion patches the original card across reply and failure paths', async (t) => {
+  for (const scenario of [
+    { name: 'text approval', textReply: true },
+    { name: 'failed submission remains pending until retry', retry: true },
+    { name: 'already handled result is not assumed approved', alreadyHandled: true },
+    { name: 'remote rejection', remote: true },
+    { name: 'patch throws', patchFailure: 'throw' },
+    { name: 'patch returns an error', patchFailure: 'response' },
+    { name: 'queued approvals retain their own card ids', count: 2 },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const sent = [];
+      const patches = [];
+      const decisions = [];
+      const warnings = [];
+      const finished = deferred();
+      const ready = deferred();
+      let attempts = 0;
+      let interactionOptions;
+      const count = scenario.count ?? 1;
+      const bridge = new FeishuHarnessBridge({
+        client: cardClient(async (outgoing) => { sent.push(outgoing); }, async (request) => {
+          patches.push(request);
+          if (scenario.patchFailure === 'throw') throw new Error('patch failed');
+          return { code: scenario.patchFailure === 'response' ? 999 : 0 };
+        }),
+        harness: {
+          sessionExists: async () => true,
+          ask: async (sessionId, _text, options) => {
+            interactionOptions = options;
+            for (let index = 0; index < count; index++) {
+              const id = `approval-273-${index}`;
+              await options.onInteraction({
+                kind: 'approval', interactionId: id, rpcId: `rpc-${id}`, sessionId,
+                payload: {
+                  type: 'approval/requested', sessionId, approvalId: id,
+                  toolName: 'write', callId: `call-${id}`, reason: `reason-${index}`,
+                },
+                toolCall: {
+                  callId: `call-${id}`, name: 'write',
+                  arguments: JSON.stringify({ file_path: `/tmp/approval-${index}.txt`, content: 'hello' }),
+                },
+                respond: async (result) => {
+                  attempts += 1;
+                  if (scenario.retry && attempts === 1) throw new Error('temporary submission failure');
+                  if (scenario.alreadyHandled) {
+                    throw Object.assign(new Error('resolved elsewhere'), { code: 'interaction-not-pending' });
+                  }
+                  decisions.push(result);
+                },
+              });
+            }
+            ready.resolve();
+            await finished.promise;
+            return 'done';
+          },
+        },
+        state: stateFixture([['p2p:ou_user', 'session-273']]).state,
+        status: bridgeStatus(),
+        allowedSenderOpenIds: new Set(['ou_user']),
+        logger: { info() {}, warn: (...args) => warnings.push(args), error() {} },
+      });
+      const turn = bridge.accept(event('approval-273-start', 'request approval'));
+      try {
+        await ready.promise;
+        assert.equal(cards(sent).length, 1, 'only the head approval is presented');
+        for (let index = 0; index < count; index++) {
+          const id = `approval-273-${index}`;
+          // cardClient assigns message ids to both text and card messages.
+          const messageId = `om_card_${sent.findIndex(({ content, msgType }) => (
+            msgType === 'interactive' && JSON.stringify(content).includes(`approve:${id}`)
+          )) + 1}`;
+          const click = (action) => bridge.onCardAction(cardActionEvent(messageId, `${action}:${id}`, 'ou_user'));
+          if (scenario.retry) {
+            await click('approve');
+            assert.equal(attempts, 1);
+            assert.deepEqual(decisions, []);
+            assert.deepEqual(patches, [], 'failed submission must not mark the card approved');
+            assert.match(sent.at(-1).content, /审批提交失败/);
+          }
+          const expected = scenario.remote || index > 0 ? '已拒绝此次操作。'
+            : scenario.alreadyHandled ? '该审批已处理，无需再次回复。'
+              : '已批准，仅对本次操作有效。';
+          if (scenario.textReply) {
+            await bridge.accept(event('approval-273-text', '批准'));
+          } else if (scenario.remote) {
+            await interactionOptions.onInteractionResolved({ kind: 'approval', interactionId: id, outcome: 'rejected' });
+          } else {
+            await click(index > 0 ? 'reject' : 'approve');
+          }
+          assert.equal(patches.length, index + 1);
+          assert.equal(patches[index].path.message_id, messageId);
+          const updated = JSON.parse(patches[index].data.content);
+          assert.deepEqual(buttonsFromCard(updated), []);
+          const visible = collectVisibleCardText(updated);
+          assert.ok(visible.includes(expected));
+          assert.ok(visible.includes(`reason-${index}`));
+          assert.ok(visible.includes(`/tmp/approval-${index}.txt`));
+          assert.ok(sent.some(({ msgType, content }) => msgType === 'text' && JSON.parse(content).text === expected));
+          const decisionCount = decisions.length;
+          await click('reject');
+          assert.equal(decisions.length, decisionCount, 'a stale click must not decide the next approval');
+          assert.equal(patches.length, index + 1);
+          assert.match(sent.at(-1).content, /该审批已处理或不存在/);
+        }
+        assert.equal(decisions.length, scenario.remote || scenario.alreadyHandled ? 0 : count);
+        assert.equal(cards(sent).length, count, 'patch failure must not create a replacement card');
+        if (scenario.patchFailure) {
+          assert.ok(warnings.some((args) => args[0].includes('resolved interaction card patch failed')));
+        }
+      } finally {
+        finished.resolve();
+        await turn;
+      }
+    });
+  }
 });
 
 test('a single-choice question is presented as a card with option buttons by default', async () => {
@@ -2300,10 +2444,12 @@ test('a single-choice question is presented as a card with option buttons by def
 test('an interaction card falls back to plain text when the card send fails', async () => {
   const fixture = stateFixture([['p2p:ou_user', 'session-approval-fallback']]);
   const sent = [];
+  const patches = [];
   const decisions = [];
   const decided = deferred();
   const failingCard = {
     im: { v1: { message: {
+      patch: async (request) => { patches.push(request); return { code: 0 }; },
       create: async (request) => {
         if (request.data.msg_type === 'interactive') {
           throw new Error('card disabled');
@@ -2371,6 +2517,7 @@ test('an interaction card falls back to plain text when the card send fails', as
       outcome: 'allowed-once',
     },
   }]);
+  assert.deepEqual(patches, []);
 });
 
 test('a resolved question remembers the text fallback message after its card send fails', async () => {
@@ -2456,10 +2603,11 @@ test('a resolved question remembers the text fallback message after its card sen
 test('a different allowed group member cannot approve or answer an interaction card', async () => {
   const fixture = stateFixture([['group:oc_group', 'session-group-actor']]);
   const sent = [];
+  const patches = [];
   const decisions = [];
   const decided = deferred();
   const bridge = new FeishuHarnessBridge({
-    client: cardClient(async (outgoing) => sent.push(outgoing)),
+    client: cardClient(async (outgoing) => sent.push(outgoing), async (request) => { patches.push(request); }),
     harness: {
       sessionExists: async () => true,
       createSession: async () => assert.fail('the existing session should be reused'),
@@ -2491,6 +2639,8 @@ test('a different allowed group member cannot approve or answer an interaction c
     state: fixture.state,
     status: bridgeStatus(),
     allowedSenderOpenIds: new Set(['ou_owner', 'ou_member']),
+    // Actor binding only; topic routing is covered elsewhere.
+    mentionTopicReply: false,
   });
 
   const turn = bridge.accept(event('actor-bound-start', '发起审批', {
@@ -2509,6 +2659,7 @@ test('a different allowed group member cannot approve or answer an interaction c
     cardActionEvent('om_card_1', 'approve:approval-actor-bound', 'ou_member'),
   );
   assert.deepEqual(decisions, [], 'another allowed member must not approve');
+  assert.deepEqual(patches, [], 'another allowed member must not update the card');
 
   // The originating actor's click does go through.
   await bridge.onCardAction(
@@ -2523,6 +2674,11 @@ test('a different allowed group member cannot approve or answer an interaction c
       outcome: 'allowed-once',
     },
   }]);
+  assert.equal(patches.length, 1);
+  assert.equal(patches[0].path.message_id, 'om_card_1');
+  const resolvedCard = JSON.parse(patches[0].data.content);
+  assert.deepEqual(buttonsFromCard(resolvedCard), []);
+  assert.ok(collectVisibleCardText(resolvedCard).includes('已批准，仅对本次操作有效。'));
 });
 
 test('a stale question card cannot answer the next question in a multi-question interaction', async () => {
@@ -2815,7 +2971,7 @@ test('a queued next prompt stays separate while a failed interaction response is
   assert.deepEqual(sent.slice(-2).map(({ text }) => text), ['第一轮完成', '第二轮完成']);
 });
 
-test('a rich-post pending reply does not block the valid text answer behind it', async () => {
+test('a text-only rich-post pending reply does not block the valid text answer behind it', async () => {
   const fixture = stateFixture([['p2p:ou_user', 'session-invalid-reply']]);
   const sent = [];
   const invalidNoticeStarted = deferred();
@@ -2866,7 +3022,6 @@ test('a rich-post pending reply does not block the valid text answer behind it',
     content: JSON.stringify({
       content: [
         [{ tag: 'text', text: '这不是文字回答' }],
-        [{ tag: 'img', image_key: 'img-test' }],
       ],
     }),
   }));
@@ -2881,6 +3036,207 @@ test('a rich-post pending reply does not block the valid text answer behind it',
     custom: '真正的答案',
   }]);
   assert.equal(sent.at(-1).text, '有效答案已收到');
+});
+
+async function imageQuestionFixture({ interactionCards = true, stop, patch, respond, group = false } = {}) {
+  const key = group ? 'group:oc_chat' : 'p2p:ou_user';
+  const fixture = stateFixture([[key, 'session-image-question']]);
+  const sent = [], patches = [], asked = [], responses = [], downloads = [], stops = [];
+  const ready = deferred(), finished = deferred();
+  const input = (id, text, overrides = {}) => event(id, text, {
+    ...(group ? { chat_type: 'group' } : {}), ...overrides,
+  });
+  const client = cardClient(async message => sent.push(message), async request => {
+    patches.push(request);
+    return patch?.(request);
+  });
+  client.im.v1.messageResource = { get: async request => {
+    downloads.push(request.path.file_key);
+    return {
+      headers: { 'content-length': String(PNG_1X1.length) },
+      getReadableStream: () => Readable.from([PNG_1X1]),
+    };
+  } };
+  const harness = {
+    workspaceSession: sessionId => ({
+      sessionExists: async () => true,
+      stopActiveTurn: async control => {
+        stops.push({ sessionId, control });
+        await stop?.();
+        finished.resolve('stopped');
+        return true;
+      },
+      ask: async (content, options) => {
+        asked.push({ sessionId, content: await loadDeferredImages(content, options) });
+        if (asked.length > 1) return '图片已收到';
+        await options.onInteraction({
+          kind: 'question', interactionId: 'image-question', rpcId: 'image-question', sessionId,
+          payload: { type: 'question/requested', sessionId, questions: [
+            { id: 'q1', question: '图片编号？', options: [{ label: 'A' }, { label: 'B' }] },
+            { id: 'q2', question: '图片形状？', options: [{ label: '圆形' }, { label: '方形' }] },
+          ] },
+          respond: async result => {
+            responses.push(result);
+            await respond?.(result);
+            finished.resolve('answered');
+            return { accepted: true };
+          },
+        });
+        ready.resolve();
+        if (await finished.promise === 'stopped') {
+          throw Object.assign(new Error('stopped'), { code: 'turn-stopped' });
+        }
+        return '文字答案已收到';
+      },
+    }),
+  };
+  const bridge = new FeishuHarnessBridge({
+    client, channel: {}, harness, state: fixture.state, status: bridgeStatus(), interactionCards,
+    allowedSenderOpenIds: new Set(['ou_user', 'ou_other']), groupResponseMode: 'all',
+    logger: { info() {}, warn() {}, error() {} },
+  });
+  const turn = bridge.accept(input('image-question-start', '请提问'));
+  await ready.promise;
+  const image = (id, overrides = {}) => input(id, '', {
+    message_type: 'image', content: JSON.stringify({ image_key: id }), ...overrides,
+  });
+  return { ...fixture, bridge, input, image, turn, sent, patches, asked, responses, downloads, stops };
+}
+
+test('images close pending Feishu questions and reach the same session once with or without cards', async t => {
+  for (const interactionCards of [true, false]) await t.test(String(interactionCards), async () => {
+    const f = await imageQuestionFixture({ interactionCards });
+    const incoming = f.image('image-answer');
+    await Promise.all([f.bridge.accept(incoming), f.bridge.accept(incoming), f.turn]);
+    await f.bridge.waitForIdle();
+    assert.equal(f.stops.length, 1);
+    assert.equal(f.stops[0].control.key, 'p2p:ou_user');
+    assert.equal(f.responses.length, 1);
+    assert.equal(f.responses[0].error.code, 'cancelled');
+    assert.deepEqual(f.downloads, ['image-answer']);
+    assert.equal(f.asked.length, 2);
+    assert.equal(f.asked[1].sessionId, 'session-image-question');
+    assert.ok(f.asked[1].content.some(part => part.type === 'image'));
+    assert.ok(f.seen.has('image-answer'));
+    if (interactionCards) {
+      const closed = JSON.parse(f.patches.at(-1).data.content);
+      assert.deepEqual(buttonsFromCard(closed), []);
+      assert.match(JSON.stringify(closed), /提问已结束/);
+      await f.bridge.onCardAction(cardActionEvent('om_card_1', 'answer:image-question:0:A', 'ou_user'));
+      assert.equal(f.responses.length, 1, 'an old card cannot submit an answer after cancellation');
+    }
+    await f.bridge.accept(f.input('next-message', '继续'));
+    assert.equal(f.asked.length, 3);
+  });
+});
+
+test('an image post preserves its text and every image after a text answer advances to question two', async () => {
+  const f = await imageQuestionFixture();
+  const firstAnswer = f.bridge.accept(f.input('answer-one', 'A'));
+  const imageAnswer = f.bridge.accept(f.input('image-post', '', {
+    message_type: 'post', content: JSON.stringify({ content: [
+      [{ tag: 'text', text: '请比较这两张图' }],
+      [{ tag: 'img', image_key: 'post-a' }, { tag: 'img', image_key: 'post-b' }],
+    ] }),
+  }));
+  await Promise.all([firstAnswer, imageAnswer, f.turn]);
+  await f.bridge.waitForIdle();
+  assert.deepEqual(f.downloads, ['post-a', 'post-b']);
+  assert.ok(f.asked[1].content.some(part => part.type === 'text' && part.text.includes('请比较这两张图')));
+  assert.equal(f.asked[1].content.filter(part => part.type === 'image').length, 2);
+  assert.match(f.patches.at(-1).data.content, /提问已结束（2\/2）/);
+  assert.equal(f.responses[0].ok, false, 'do not fabricate the missing second answer');
+});
+
+test('images arriving during cancellation keep FIFO order, including replies to the closed question', async () => {
+  const stopStarted = deferred(), releaseStop = deferred();
+  const f = await imageQuestionFixture({ stop: async () => {
+    stopStarted.resolve(); await releaseStop.promise;
+  } });
+  const a = f.bridge.accept(f.image('first-image', { parent_id: 'om_card_1' }));
+  await stopStarted.promise;
+  const b = f.bridge.accept(f.image('second-image', { parent_id: 'om_card_1' }));
+  const c = f.bridge.accept(f.input('followup', '补充说明'));
+  releaseStop.resolve();
+  await Promise.all([a, b, c, f.turn]);
+  await f.bridge.waitForIdle();
+  const late = f.bridge.accept(f.image('late-image', { parent_id: 'om_card_1' }));
+  await late;
+  assert.deepEqual(f.downloads, ['first-image', 'second-image', 'late-image']);
+  assert.equal(f.stops.length, 1);
+  assert.equal(f.asked.length, 5);
+  assert.equal(f.asked[3].content, '补充说明');
+  await f.bridge.accept(f.input('stale-text', 'A', { parent_id: 'om_card_1' }));
+  assert.equal(f.asked.length, 5, 'stale text answers still stay out of the normal conversation');
+});
+
+test('a failed image-triggered stop keeps the question answerable and delivers the queued image afterward', async () => {
+  const f = await imageQuestionFixture({ stop: async () => { throw new Error('temporarily unavailable'); } });
+  const imageAnswer = f.bridge.accept(f.image('queued-image'));
+  await eventually(() => f.sent.some(m => String(m.content).includes('图片已排队')));
+  assert.equal(f.asked.length, 1);
+  assert.equal(f.responses.length, 0);
+  await f.bridge.accept(f.input('fallback-one', 'A'));
+  await f.bridge.accept(f.input('fallback-two', '圆形'));
+  await Promise.all([imageAnswer, f.turn]);
+  await f.bridge.waitForIdle();
+  assert.deepEqual(f.downloads, ['queued-image']);
+  assert.equal(f.responses[0].ok, true);
+  assert.equal(f.responses[0].value.answer.answers.length, 2);
+});
+
+test('failure to update the closed question card does not lose an image', async () => {
+  const f = await imageQuestionFixture({ patch: async () => { throw new Error('card unavailable'); } });
+  await Promise.all([f.bridge.accept(f.image('patch-failure-image')), f.turn]);
+  await f.bridge.waitForIdle();
+  assert.deepEqual(f.downloads, ['patch-failure-image']);
+  assert.equal(f.responses[0].error.code, 'cancelled');
+});
+
+test('another group member cannot interrupt the question with an image', async () => {
+  const f = await imageQuestionFixture({ group: true });
+  const other = f.bridge.accept(f.image('other-image', { senderOpenId: 'ou_other' }));
+  assert.equal(f.stops.length, 0);
+  await f.bridge.accept(f.input('owner-one', 'A'));
+  await f.bridge.accept(f.input('owner-two', '圆形'));
+  await Promise.all([other, f.turn]);
+  await f.bridge.waitForIdle();
+  assert.equal(f.stops.length, 0);
+  assert.equal(f.responses[0].ok, true);
+  assert.deepEqual(f.downloads, ['other-image']);
+});
+
+test('an image in a different conversation leaves the original question waiting', async () => {
+  const f = await imageQuestionFixture();
+  f.sessions.set('p2p:ou_other', 'session-other');
+  await f.bridge.accept(f.image('other-conversation-image', { senderOpenId: 'ou_other' }));
+  assert.equal(f.stops.length, 0);
+  assert.equal(f.responses.length, 0);
+  assert.equal(f.asked[1].sessionId, 'session-other');
+  await f.bridge.accept(f.input('original-one', 'A'));
+  await f.bridge.accept(f.input('original-two', '圆形'));
+  await f.turn;
+  assert.equal(f.responses[0].ok, true);
+});
+
+test('a failed image stop preserves an in-flight card submission and queues following text', async () => {
+  const submitting = deferred(), release = deferred();
+  const f = await imageQuestionFixture({
+    stop: async () => { throw new Error('stop unavailable'); },
+    respond: async result => { if (result.ok) { submitting.resolve(); await release.promise; } },
+  });
+  await f.bridge.accept(f.input('first-answer', 'A'));
+  const answer = f.bridge.onCardAction(cardActionEvent('om_card_2', 'answer:image-question:1:圆形', 'ou_user'));
+  await submitting.promise;
+  const picture = f.bridge.accept(f.image('during-submit'));
+  await eventually(() => f.sent.some(m => String(m.content).includes('图片已排队')));
+  const followup = f.bridge.accept(f.input('after-failed-stop', '新的补充消息'));
+  release.resolve();
+  await Promise.all([answer, picture, followup, f.turn]);
+  await f.bridge.waitForIdle();
+  assert.equal(f.responses.length, 1);
+  assert.equal(f.asked.length, 3);
+  assert.equal(f.asked[2].content, '新的补充消息');
 });
 
 test('an answer resolved elsewhere is not reinterpreted as a later prompt', async () => {
@@ -3457,6 +3813,8 @@ test('a group interaction question tells the user to mention the bot again', asy
     // covered by the dedicated card tests below.
     interactionCards: false,
     allowedSenderOpenIds: new Set(['ou_a']),
+    // The mention reminder only; topic routing is covered elsewhere.
+    mentionTopicReply: false,
   });
 
   await bridge.accept(event('group-mention-start', '@机器人 请先提问', {
@@ -7583,6 +7941,7 @@ test('pending question blocks card steer and card stop cancels the question', as
 test('pending approval blocks card steer and card stop rejects the approval', async () => {
   const fixture = stateFixture([['p2p:ou_owner', 'session-active']]);
   const sent = [];
+  const patches = [];
   const approvalReady = deferred();
   const decided = deferred();
   const { calls, harness } = activeTurnHarness();
@@ -7617,7 +7976,7 @@ test('pending approval blocks card steer and card stop rejects the approval', as
     throw error;
   };
   const bridge = new FeishuHarnessBridge({
-    client: cardClient(async (outgoing) => sent.push(outgoing)),
+    client: cardClient(async (outgoing) => sent.push(outgoing), async (request) => { patches.push(request); }),
     channel: {},
     harness,
     state: fixture.state,
@@ -7650,6 +8009,11 @@ test('pending approval blocks card steer and card stop rejects the approval', as
       outcome: 'rejected',
     },
   });
+  assert.equal(patches.length, 1);
+  assert.equal(patches[0].path.message_id, 'om_card_2');
+  const resolvedCard = JSON.parse(patches[0].data.content);
+  assert.deepEqual(buttonsFromCard(resolvedCard), []);
+  assert.ok(collectVisibleCardText(resolvedCard).includes('已拒绝此次操作。'));
 });
 
 test('menu stop button stops the bound active turn without touching the model', async () => {
@@ -7834,7 +8198,7 @@ test('menu stop and steer reply friendly when no session is bound', async () => 
   assert.match(JSON.parse(sent.at(-1).content).text, /没有绑定会话/);
 });
 
-function topicReplyFixture({ groupTopicReply = false } = {}) {
+function topicReplyFixture({ mentionTopicReply } = {}) {
   const topics = new Map();
   const replies = [];
   const creates = [];
@@ -7877,7 +8241,8 @@ function topicReplyFixture({ groupTopicReply = false } = {}) {
     status: bridgeStatus(),
     allowedSenderOpenIds: new Set(['ou_user']),
     botOpenId: 'ou_bot',
-    groupTopicReply,
+    // Omitted entirely in the tests that exercise the shipped default.
+    ...(mentionTopicReply === undefined ? {} : { mentionTopicReply }),
     logger: { info() {}, warn() {}, error() {} },
   });
   return { bridge, topics, replies, creates };
@@ -7895,8 +8260,17 @@ function groupHelpEvent(messageId, { mention = true, threadId } = {}) {
   });
 }
 
-test('groupTopicReply auto-opens a topic for an addressed main-feed question and registers it', async () => {
-  const { bridge, topics, replies, creates } = topicReplyFixture({ groupTopicReply: true });
+/** A direct-chat message that mentions the bot, with no group around it. */
+function directMentionEvent(messageId, text, extra = {}) {
+  return event(messageId, text, {
+    senderOpenId: 'ou_user',
+    mentions: [{ key: '@_bot', id: { open_id: 'ou_bot' } }],
+    ...extra,
+  });
+}
+
+test('a mention in a group opens a topic and registers it (default on)', async () => {
+  const { bridge, topics, replies, creates } = topicReplyFixture();
   await bridge.accept(groupHelpEvent('om-help-root'));
   await bridge.waitForIdle();
 
@@ -7907,8 +8281,19 @@ test('groupTopicReply auto-opens a topic for an addressed main-feed question and
   assert.deepEqual(topics.get('omt-auto-1'), { rootMessageId: 'om-help-root', chatId: 'oc_group' });
 });
 
-test('groupTopicReply keeps replies inside a pre-existing Feishu topic without claiming it', async () => {
-  const { bridge, topics, replies } = topicReplyFixture({ groupTopicReply: true });
+test('a mention in a direct chat opens a topic and threads the answer (default on)', async () => {
+  const { bridge, topics, replies, creates } = topicReplyFixture();
+  await bridge.accept(directMentionEvent('om-help-p2p-root', '/help'));
+  await bridge.waitForIdle();
+
+  assert.equal(creates.length, 0, 'the answer must be a reply, not a plain direct message');
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].data.reply_in_thread, true);
+  assert.deepEqual(topics.get('omt-auto-1'), { rootMessageId: 'om-help-p2p-root', chatId: 'oc_chat' });
+});
+
+test('mentionTopicReply keeps replies inside a pre-existing Feishu topic without claiming it', async () => {
+  const { bridge, topics, replies } = topicReplyFixture();
   await bridge.accept(groupHelpEvent('om-help-topic', { threadId: 'omt_existing' }));
   await bridge.waitForIdle();
 
@@ -7917,8 +8302,8 @@ test('groupTopicReply keeps replies inside a pre-existing Feishu topic without c
   assert.equal(topics.size, 0, 'a topic the bot did not open must not be registered as managed');
 });
 
-test('groupTopicReply leaves unaddressed all-mode chatter in the flat group session', async () => {
-  const { bridge, topics, replies } = topicReplyFixture({ groupTopicReply: true });
+test('mentionTopicReply leaves unaddressed all-mode chatter in the flat group session', async () => {
+  const { bridge, topics, replies } = topicReplyFixture();
   await bridge.accept(groupHelpEvent('om-help-unaddressed', { mention: false }));
   await bridge.waitForIdle();
 
@@ -7927,8 +8312,8 @@ test('groupTopicReply leaves unaddressed all-mode chatter in the flat group sess
   assert.equal(topics.size, 0);
 });
 
-test('groupTopicReply is inert in private chats', async () => {
-  const { bridge, topics, replies } = topicReplyFixture({ groupTopicReply: true });
+test('a direct-chat message without a mention stays in the shared direct session', async () => {
+  const { bridge, topics, replies } = topicReplyFixture();
   await bridge.accept(event('om-help-p2p', '/help', { senderOpenId: 'ou_user' }));
   await bridge.waitForIdle();
 
@@ -7937,8 +8322,18 @@ test('groupTopicReply is inert in private chats', async () => {
   assert.equal(topics.size, 0);
 });
 
-test('groupTopicReply disabled keeps the pre-feature flat reply behavior', async () => {
-  const { bridge, topics, replies } = topicReplyFixture({ groupTopicReply: false });
+test('a direct-chat mention opens no topic once the switch is off', async () => {
+  const { bridge, topics, replies } = topicReplyFixture({ mentionTopicReply: false });
+  await bridge.accept(directMentionEvent('om-help-p2p-flat', '/help'));
+  await bridge.waitForIdle();
+
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].data.reply_in_thread, undefined);
+  assert.equal(topics.size, 0);
+});
+
+test('mentionTopicReply disabled keeps the pre-feature flat reply behavior', async () => {
+  const { bridge, topics, replies } = topicReplyFixture({ mentionTopicReply: false });
   await bridge.accept(groupHelpEvent('om-help-flat'));
   await bridge.waitForIdle();
 
@@ -7947,7 +8342,7 @@ test('groupTopicReply disabled keeps the pre-feature flat reply behavior', async
   assert.equal(topics.size, 0);
 });
 
-test('groupTopicReply opens no topic for a group question denied by the access policy', async () => {
+test('mentionTopicReply opens no topic for a group question denied by the access policy', async () => {
   const topics = new Map();
   const replies = [];
   const creates = [];
@@ -7988,7 +8383,7 @@ test('groupTopicReply opens no topic for a group question denied by the access p
     accessPolicy: directAccessPolicy({ users: [], privilegedIds: [] }),
     allowedSenderOpenIds: new Set(['ou_user']),
     botOpenId: 'ou_bot',
-    groupTopicReply: true,
+    mentionTopicReply: true,
     logger: { info() {}, warn() {}, error() {} },
   });
 
@@ -8047,7 +8442,7 @@ function topicTurnFixture() {
     status: bridgeStatus(),
     allowedSenderOpenIds: new Set(['ou_user']),
     botOpenId: 'ou_bot',
-    groupTopicReply: true,
+    mentionTopicReply: true,
     logger: { info() {}, warn() {}, error() {} },
   });
   return { bridge, state, topics, sessions, replies, asked };
@@ -8062,6 +8457,52 @@ function groupMentionEvent(messageId, text, extra = {}) {
     ...extra,
   });
 }
+
+/** A direct-chat message that mentions the bot (see directMentionEvent above). */
+function directChatMentionEvent(messageId, text, extra = {}) {
+  return event(messageId, text, {
+    senderOpenId: 'ou_user',
+    mentions: [{ key: '@_bot', id: { open_id: 'ou_bot' } }],
+    ...extra,
+  });
+}
+
+test('a direct-chat mention opens its own session while the main window keeps the shared one', async () => {
+  const { bridge, topics, sessions, replies, asked } = topicTurnFixture();
+
+  // Main window: no mention, so the shared direct-chat session.
+  await bridge.accept(event('om-p2p-plain', '普通提问'));
+  await bridge.waitForIdle();
+  assert.deepEqual([...sessions.keys()], ['p2p:ou_user']);
+  assert.notEqual(replies[0].data.reply_in_thread, true);
+
+  // Mentioned question: a managed topic rooted at that message, and a session
+  // of its own so the topic's context does not mix with the main window's.
+  await bridge.accept(directChatMentionEvent('om-p2p-root', '第一个问题'));
+  await bridge.waitForIdle();
+  assert.equal(sessions.get('p2p:ou_user:managed:om-p2p-root'), 'session-topic');
+  assert.equal(replies[1].data.reply_in_thread, true);
+  assert.deepEqual(topics.get('omt-auto-1'), {
+    rootMessageId: 'om-p2p-root',
+    chatId: 'oc_chat',
+  });
+
+  // The reader keeps typing inside the topic Feishu created: the same managed
+  // key must resolve, so the topic stays one session.
+  await bridge.accept(directChatMentionEvent('om-p2p-follow', '继续说', {
+    thread_id: 'omt-auto-1',
+  }));
+  await bridge.waitForIdle();
+  assert.equal(sessions.size, 2, 'the follow-up must not open a second topic session');
+  assert.equal(asked.at(-1).sessionId, 'session-topic');
+  assert.equal(replies[2].data.reply_in_thread, true);
+
+  // A second mention opens a second topic, still separate from both of those.
+  await bridge.accept(directChatMentionEvent('om-p2p-root-2', '另一个问题'));
+  await bridge.waitForIdle();
+  assert.equal(sessions.get('p2p:ou_user:managed:om-p2p-root-2'), 'session-topic');
+  assert.equal(sessions.size, 3);
+});
 
 test('a follow-up inside the auto-created topic continues the managed dsh session', async () => {
   const { bridge, state, topics, sessions, replies, asked } = topicTurnFixture();
@@ -8088,6 +8529,83 @@ test('a follow-up inside the auto-created topic continues the managed dsh sessio
   assert.equal(asked.length, 2);
   assert.equal(asked[1].sessionId, 'session-topic');
   assert.equal(replies[1].data.reply_in_thread, true);
+});
+
+test('a topic the reply response does not report is read back and registered', async () => {
+  // Feishu opens the topic from the threaded reply but does not always echo its
+  // thread_id back — we have seen a topic come back without one. Without the
+  // read-back the topic would never be recorded and its follow-ups would land
+  // in the chat's own session instead of the topic's.
+  const topics = new Map();
+  const sessions = new Map();
+  const seen = new Set();
+  const replies = [];
+  const lookups = [];
+  const asked = [];
+  const client = {
+    im: { v1: { message: {
+      reply: async (request) => {
+        replies.push(request);
+        return { code: 0, data: { message_id: `om-topic-reply-${replies.length}` } };
+      },
+      create: async () => ({ code: 0, data: { message_id: 'om-create' } }),
+      get: async (request) => {
+        lookups.push(request.path.message_id);
+        return {
+          code: 0,
+          data: { items: [{
+            message_id: request.path.message_id,
+            chat_id: 'oc_chat',
+            thread_id: 'omt-p2p-late',
+          }] },
+        };
+      },
+    } } },
+  };
+  const bridge = new FeishuHarnessBridge({
+    client,
+    channel: {},
+    status: bridgeStatus(),
+    state: {
+      hasSeen: (id) => seen.has(id),
+      markSeen: async (id) => seen.add(id),
+      sessionFor: (key) => sessions.get(key) ?? null,
+      setSession: async (key, sessionId) => sessions.set(key, sessionId),
+      clearSession: async (key) => sessions.delete(key),
+      topicRootFor: (threadId) => topics.get(threadId) ?? null,
+      setTopic: async (threadId, root) => topics.set(threadId, root),
+    },
+    harness: {
+      ensureRunning: async () => true,
+      sessionExists: async () => true,
+      createSession: async () => 'session-p2p-late',
+      ask: async (sessionId, text) => {
+        asked.push({ sessionId, text });
+        return '好的';
+      },
+    },
+    allowedSenderOpenIds: new Set(['ou_user']),
+    botOpenId: 'ou_bot',
+    logger: { info() {}, warn() {}, error() {} },
+  });
+
+  await bridge.accept(directChatMentionEvent('om-p2p-late-root', '第一个问题'));
+  await bridge.waitForIdle();
+
+  assert.deepEqual(replies[0].data.reply_in_thread, true);
+  assert.deepEqual(lookups, ['om-p2p-late-root']);
+  assert.deepEqual(topics.get('omt-p2p-late'), {
+    rootMessageId: 'om-p2p-late-root',
+    chatId: 'oc_chat',
+  });
+
+  // The follow-up Feishu put inside that topic reuses the managed session.
+  await bridge.accept(directChatMentionEvent('om-p2p-late-follow', '继续说', {
+    thread_id: 'omt-p2p-late',
+  }));
+  await bridge.waitForIdle();
+  assert.equal(sessions.size, 1, 'the topic must stay one session');
+  assert.equal(asked.at(-1).sessionId, 'session-p2p-late');
 });
 
 function deferredAwareStateFixture(initialSessions = []) {
@@ -8765,7 +9283,7 @@ test('deferred card delivery keeps managed-topic routing (replyInThread + thread
     state,
     status: bridgeStatus(),
     allowedSenderOpenIds: new Set(['ou_owner']),
-    groupTopicReply: true,
+    mentionTopicReply: true,
   });
   await bridge.waitForIdle();
   await state.putDeferred(deferredEntryFixture({ key: 'group:oc_chat:managed:om_inbound' }));
@@ -8812,7 +9330,7 @@ test('deferred plain-text fallback replies inside the managed topic thread', asy
     state,
     status: bridgeStatus(),
     allowedSenderOpenIds: new Set(['ou_owner']),
-    groupTopicReply: true,
+    mentionTopicReply: true,
   });
   await bridge.waitForIdle();
   await state.putDeferred(deferredEntryFixture({ key: 'group:oc_chat:managed:om_root' }));
@@ -9038,6 +9556,78 @@ test('step push live_cot mode uses Feishu native process and sends the final ans
   ]);
   assert.deepEqual(sent, ['FINAL_MARKER_9f3a 过程候选']);
   assert.ok(!sent.at(-1).includes('PROCESS_MARKER_9f3a'));
+});
+
+test('step push live_cot mode keeps a topic turn inside the topic with the process card', async () => {
+  const fixture = stateFixture();
+  const cotCreates = [];
+  const replies = [];
+  const creates = [];
+  const patches = [];
+  const progressModes = [];
+  const { stepPushClock } = stepPushClockFixture();
+  const channel = {
+    ...stepPushChannel(),
+    createCot: async (chatId, options) => {
+      cotCreates.push({ chatId, options });
+      return { cotId: 'cot-topic', messageId: 'om-cot-topic' };
+    },
+    writeCotEvents: async () => {},
+  };
+  const bridge = new FeishuHarnessBridge({
+    client: { im: { v1: { message: {
+      reply: async (request) => {
+        replies.push({
+          msgType: request.data.msg_type,
+          replyInThread: request.data.reply_in_thread === true,
+          messageId: request.path.message_id,
+        });
+        return { code: 0, data: { message_id: `om_topic_r_${replies.length}` } };
+      },
+      create: async (request) => {
+        creates.push(request.data.msg_type);
+        return { code: 0, data: { message_id: `om_topic_c_${creates.length}` } };
+      },
+      patch: async (request) => {
+        patches.push(JSON.parse(request.data.content));
+        return { code: 0, data: {} };
+      },
+    } } } },
+    channel,
+    harness: stepPushHarness(async (_sessionId, _text, options) => {
+      progressModes.push(options.progressMode);
+      await options.onUpdate({ type: 'tool', name: 'bash', arguments: '{"command":"ls"}' });
+      return '话题内的最终答案';
+    }),
+    state: fixture.state,
+    status: bridgeStatus(),
+    allowedSenderOpenIds: new Set(['ou_user']),
+    mentionTopicReply: true,
+    stepPush: true,
+    stepPushMode: 'live_cot',
+    stepPushClock,
+  });
+
+  await bridge.accept(event('om_live_topic', '处理话题任务', {
+    chat_type: 'group',
+    thread_id: 'omt_topic',
+    mentions: [{ id: { open_id: 'ou_bot' }, key: '@_user_1' }],
+  }));
+  await bridge.waitForIdle();
+
+  assert.deepEqual(cotCreates, [], 'the native process cannot target a topic, so it is not opened');
+  assert.deepEqual(progressModes, ['all']);
+  assert.ok(replies.length >= 1, 'the process card is delivered as a reply');
+  for (const reply of replies) {
+    assert.equal(reply.msgType, 'interactive', 'the topic turn uses the process card');
+    assert.equal(reply.replyInThread, true, 'the process card stays inside the topic');
+    assert.equal(reply.messageId, 'om_live_topic');
+  }
+  assert.deepEqual(creates, [], 'nothing is posted to the main group feed');
+  assert.ok(
+    JSON.stringify(patches.at(-1) ?? {}).includes('话题内的最终答案'),
+    'the final answer is sealed inside the topic card',
+  );
 });
 
 test('step push: tools and assistant notes push as discrete messages, final answer only in card', async () => {
@@ -10209,7 +10799,7 @@ test('step push: in a thread group the step messages stay inside the topic threa
     state: fixture.state,
     status: bridgeStatus(),
     allowedSenderOpenIds: new Set(['ou_user']),
-    groupTopicReply: true,
+    mentionTopicReply: true,
     stepPush: true,
     stepPushClock,
   });
@@ -10449,7 +11039,7 @@ test('step push: post failure degrades to a threaded plain-text reply inside the
     state: fixture.state,
     status: bridgeStatus(),
     allowedSenderOpenIds: new Set(['ou_user']),
-    groupTopicReply: true,
+    mentionTopicReply: true,
     stepPush: true,
     stepPushClock,
   });
@@ -10468,6 +11058,92 @@ test('step push: post failure degrades to a threaded plain-text reply inside the
     assert.equal(reply.messageId, 'om_thread_fb', 'the degraded reply anchors on the inbound message');
   }
   assert.equal(creates.length, 0, 'the main chat must not receive the degraded steps');
+});
+
+test('step push: a direct-chat topic reported without a thread_id is read back before follow-ups', async () => {
+  // 逐步消息（post）以前只认回复响应里的 thread_id，没有走 #registerTopicReply
+  // 的回读兜底。真机上遇到过话题已经建出来、响应却没带 thread_id 的情况：那一步
+  // 不登记，话题内的追问就会从 p2p:<用户>:managed:<根消息> 掉回 p2p:<用户>，
+  // 一次对话被劈成两条会话。
+  const sessions = new Map();
+  const topics = new Map();
+  const seen = new Set();
+  const lookups = [];
+  const asked = [];
+  const replies = [];
+  const { stepPushClock } = stepPushClockFixture();
+  const bridge = new FeishuHarnessBridge({
+    client: { im: { v1: { message: {
+      // 关键：回复响应一律不带 thread_id，只能靠回读根消息取。
+      reply: async (request) => {
+        replies.push({
+          anchor: request.path.message_id,
+          replyInThread: request.data.reply_in_thread === true,
+        });
+        return { code: 0, data: { message_id: `om_r_${request.path.message_id}` } };
+      },
+      create: async () => ({ code: 0, data: { message_id: 'om_c_1' } }),
+      get: async (request) => {
+        lookups.push(request.path.message_id);
+        return {
+          code: 0,
+          data: { items: [{
+            message_id: request.path.message_id,
+            chat_id: 'oc_chat',
+            thread_id: 'omt-step-dm',
+          }] },
+        };
+      },
+    } } } },
+    channel: stepPushChannel(),
+    harness: stepPushHarness(async (sessionId, text, options) => {
+      asked.push({ sessionId, text });
+      await options.onUpdate({ type: 'tool', name: 'bash', arguments: '{"command":"ls"}' });
+      return '答案正文。';
+    }),
+    state: {
+      hasSeen: (id) => seen.has(id),
+      markSeen: async (id) => seen.add(id),
+      sessionFor: (key) => sessions.get(key) ?? null,
+      setSession: async (key, sessionId) => sessions.set(key, sessionId),
+      clearSession: async (key) => sessions.delete(key),
+      topicRootFor: (threadId) => topics.get(threadId) ?? null,
+      setTopic: async (threadId, root) => topics.set(threadId, root),
+    },
+    status: bridgeStatus(),
+    allowedSenderOpenIds: new Set(['ou_user']),
+    botOpenId: 'ou_bot',
+    mentionTopicReply: true,
+    stepPush: true,
+    stepPushClock,
+  });
+
+  // 私聊里 @机器人 提问：飞书开话题，但响应没带 thread_id → 必须回读并登记。
+  await bridge.accept(event('om_step_root', '@_user_1 你好', {
+    mentions: [{ key: '@_user_1', id: { open_id: 'ou_bot' } }],
+  }));
+  await bridge.waitForIdle();
+
+  assert.deepEqual(lookups, ['om_step_root'], '缺少 thread_id 时必须回读根消息');
+  assert.deepEqual(topics.get('omt-step-dm'), { rootMessageId: 'om_step_root', chatId: 'oc_chat' });
+  assert.deepEqual([...sessions.keys()], ['p2p:ou_user:managed:om_step_root']);
+
+  // 用户在话题里继续追问：必须复用同一条会话，而不是掉回私聊主会话。
+  await bridge.accept(event('om_step_follow', '@_user_1 继续', {
+    thread_id: 'omt-step-dm',
+    mentions: [{ key: '@_user_1', id: { open_id: 'ou_bot' } }],
+  }));
+  await bridge.waitForIdle();
+
+  assert.deepEqual([...sessions.keys()], ['p2p:ou_user:managed:om_step_root'],
+    '话题内的追问不得另开一条会话');
+  assert.equal(asked.at(-1).sessionId, 'session-step-push');
+  // 回答也得留在话题里：reply_in_thread 由会话键决定，登记丢了的话回答会漏到
+  // 私聊主窗口（既不是话题内、上下文也换了）。
+  const followUps = replies.filter((entry) => entry.anchor === 'om_step_follow');
+  assert.ok(followUps.length > 0, '追问必须被回答');
+  assert.equal(followUps.every((entry) => entry.replyInThread), true,
+    '话题内追问的回答必须带 reply_in_thread');
 });
 
 test('step push: rate-limit retries read structured codes, not just message text', async () => {
@@ -10670,7 +11346,7 @@ test('step push: manual topics stay threaded even with the group-topic switch of
     state: fixture.state,
     status: bridgeStatus(),
     allowedSenderOpenIds: new Set(['ou_user']),
-    // NOTE: groupTopicReply stays at its default (false) on purpose — a manual
+    // NOTE: mentionTopicReply stays at its default (false) on purpose — a manual
     // topic conversation must still thread its replies.
     stepPush: true,
     stepPushClock,
@@ -11595,6 +12271,10 @@ function topicAnchorFixture({ mode = 'text', ...options } = {}) {
     client, channel, harness, state: fixture.state, status: bridgeStatus(),
     allowedSenderOpenIds: new Set(['ou_user']), botOpenId: 'ou_bot',
     stepPush: mode === 'steps', logger: { info() {}, warn() {}, error() {} },
+    // These tests count the reply-reference reads, so keep conversations flat;
+    // opening a topic reads the root back too, and topic routing has its own
+    // tests above.
+    mentionTopicReply: false,
     ...options,
   });
   let sequence = 0;
@@ -11787,8 +12467,11 @@ test('a p2p message with no body opens the menu instead of a text-only notice', 
   // An "@bot" with nothing after it arrives with an empty body once the mention
   // is stripped. There is no instruction to parse, and the reader is plainly
   // reaching for the panel — answering with "text only" reads as a refusal.
+  // It is a menu request rather than a question, so it must not open a topic
+  // either: every look at the menu would leave another empty session behind.
   const created = [];
   const replied = [];
+  const topics = new Map();
   const seen = new Set();
   const bridge = new FeishuHarnessBridge({
     client: {
@@ -11806,6 +12489,7 @@ test('a p2p message with no body opens the menu instead of a text-only notice', 
           replied.push({
             to: request.path.message_id,
             type: request.data.msg_type,
+            threaded: request.data.reply_in_thread === true,
             text: request.data.msg_type === 'text'
               ? JSON.parse(request.data.content).text
               : null,
@@ -11824,6 +12508,8 @@ test('a p2p message with no body opens the menu instead of a text-only notice', 
       sessionFor: () => null,
       setSession: async () => {},
       clearSession: async () => {},
+      topicRootFor: () => null,
+      setTopic: async (threadId, root) => topics.set(threadId, root),
     },
     status: bridgeStatus(),
     allowedSenderOpenIds: new Set(['ou_user']),
@@ -11844,6 +12530,12 @@ test('a p2p message with no body opens the menu instead of a text-only notice', 
     false,
     'the text-only notice is not sent for a p2p message',
   );
+  assert.equal(
+    replied.some(({ threaded }) => threaded),
+    false,
+    'a menu request must not ask Feishu to open a topic',
+  );
+  assert.equal(topics.size, 0, 'a menu request must not register a managed topic');
 });
 
 test('a bare mention opens the menu only when commands are allowed', async () => {
@@ -12034,6 +12726,8 @@ for (const referenceField of ['parent_id', 'root_id']) {
       accessPolicy: directAccessPolicy({
         users: [{ id: 'ou_user', canExecuteCommands: false }],
       }),
+      // Quoted-mention handling only; topic routing is covered elsewhere.
+      mentionTopicReply: false,
     });
 
     await bridge.accept(event(`om_mention_${referenceField}`, '@_user_1', {

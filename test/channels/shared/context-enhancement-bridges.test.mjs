@@ -166,6 +166,9 @@ function fixture(channel, { contextEnhancement, onAsk } = {}) {
       // text presentation; the default interaction cards are tested in the
       // Feishu bridge tests.
       interactionCards: false,
+      // Likewise pin flat conversations: this suite is about enhancement, and
+      // the group fixture mentions the bot (which would open a topic session).
+      mentionTopicReply: false,
       channel: {}, client: { im: { v1: {
         message: { create: async (request) => {
           calls.push(['createMessage', request]);
@@ -349,6 +352,11 @@ for (const channel of CHANNELS) {
         ...(channel === 'slack' && kind === 'group' ? { threadId: 'thread-existing' } : {}),
         botId: `${channel}_internal`,
       };
+      // The fixture enables every field, so `sentAt` is selected here too, but
+      // this fixture is a channel that never published a moment: the field is
+      // omitted rather than filled with the local clock, which the model could
+      // not tell apart from a real send time. The weixin bridge publishes one
+      // through `withSentAt`, and its own tests assert the rendered value.
       assert.deepEqual(sourceOf(current.prompts[0]), expected);
       assert.ok(textOf(current.prompts[0]).endsWith('\n\nhello'));
       assert.doesNotMatch(textOf(current.prompts[0]), /source_guidance|private-token|private-secret/);

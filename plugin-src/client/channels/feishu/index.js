@@ -608,7 +608,8 @@ export function BotCard({
           accessPolicy: connection.accessPolicy,
           channelSettings: {
             groupResponseMode: connection.groupResponseMode,
-            groupTopicReply: connection.groupTopicReply,
+            mentionTopicReply: connection.mentionTopicReply,
+            slashPanel: connection.slashPanel,
             groupMessagePermissionGranted: connection.groupMessagePermissionGranted,
           },
         }),
