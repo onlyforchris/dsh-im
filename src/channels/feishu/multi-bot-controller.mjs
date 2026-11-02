@@ -1,5 +1,6 @@
+import { ExclusiveInboundConsumers, normalizeExternalText } from './external-consumer.mjs';
 import { atConnectionStage, createConnectionDiagnostics } from '../shared/connection-error.mjs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { connectionTestMessage } from '../shared/connection-test.mjs';
 import { publicMessageFailure } from '../shared/message-failure.mjs';
 import { RegistrationManager } from './registration-manager.mjs';
@@ -20,6 +21,8 @@ import {
   DEFAULT_FEISHU_STEP_PUSH_MODE,
   isFeishuStepPushMode,
   normalizeFeishuStepPushMode,
+  isFeishuStepCardPanels,
+  normalizeFeishuStepCardPanels,
 } from './step-push-mode.mjs';
 import { normalizeFeishuVoiceConfig } from './voice-config.mjs';
 import {
@@ -93,6 +96,7 @@ function secretRefFor(botId) {
 function configuredBotFingerprint(config) {
   return JSON.stringify({
     id: config.id,
+    consumerMode: config.consumerMode ?? 'standalone',
     appId: config.appId,
     secretRef: config.secretRef,
     ownerOpenIds: config.ownerOpenIds,
@@ -104,6 +108,7 @@ function configuredBotFingerprint(config) {
     mentionTopicReply: config.mentionTopicReply !== false,
     stepPush: config.stepPush === true,
     stepPushMode: normalizeFeishuStepPushMode(config.stepPushMode),
+    stepCardPanels: normalizeFeishuStepCardPanels(config.stepCardPanels),
     voice: config.voice,
     slashPanel: normalizeSlashPanelConfig(config.slashPanel),
     groupMessagePermissionGranted: config.groupMessagePermissionGranted === true,
@@ -111,6 +116,14 @@ function configuredBotFingerprint(config) {
     connectedAt: config.connectedAt ?? null,
     createdAt: config.createdAt ?? null,
   });
+}
+
+// Account/ownership fences must not include settings that are hot-updated on
+// the same runtime (step push, voice, slash panel or group presentation).
+function externalAccountOwnership(config) {
+  return JSON.stringify({ id: config.id, consumerMode: config.consumerMode ?? 'standalone',
+    appId: config.appId, secretRef: config.secretRef, ownerOpenIds: config.ownerOpenIds,
+    domain: config.domain, botOpenId: config.botOpenId, deletionPending: config.deletionPending === true });
 }
 
 function optionalNonEmptyString(value) {
@@ -133,6 +146,7 @@ export class MultiBotDshFeishuController {
   #createBotId;
   #createRegistrationId;
   #runtimes = new Map();
+  #inboundConsumers = new ExclusiveInboundConsumers();
   #botErrors = new Map();
   #registrations = new Map();
   #activeAppUpdates = new Map();
@@ -325,7 +339,7 @@ export class MultiBotDshFeishuController {
     return this.registrationStatus(id);
   }
 
-  startGroupMessagePermission(botId) {
+  startGroupMessagePermission(botId, { preserveResponseMode = false } = {}) {
     this.#assertOpen();
     const target = this.#requireBot(botId);
     if (target.deletionPending) {
@@ -338,6 +352,7 @@ export class MultiBotDshFeishuController {
       if (active.operation !== GROUP_MESSAGE_PERMISSION_OPERATION) {
         throw new Error('Another Feishu app update is already active for this bot');
       }
+      if (Boolean(active.preserveResponseMode) !== preserveResponseMode) throw new Error('A different group permission update is already active');
       return this.registrationStatus(active.id);
     }
     this.#activeAppUpdates.delete(botId);
@@ -349,6 +364,7 @@ export class MultiBotDshFeishuController {
     const record = {
       id,
       operation: GROUP_MESSAGE_PERMISSION_OPERATION,
+      preserveResponseMode,
       manager: null,
       botId,
       createdNew: false,
@@ -563,10 +579,135 @@ export class MultiBotDshFeishuController {
     });
   }
 
-  async sendProactiveText(botId, target, text, options = {}) {
+  async #deliveryAccount(config) {
+    let verified;
+    try {
+      const resolved = await this.#credentials.resolve(config.secretRef);
+      if (!resolved?.value) throw new Error('Account credentials unavailable');
+      verified = await this.#verifyApp({ appId: config.appId, appSecret: resolved.value, domain: config.domain });
+    } catch (cause) {
+      const error = new Error('Account credentials could not be verified', { cause });
+      error.code = 'account-unverified';
+      throw error;
+    }
+    if (!verified?.openId || verified.openId !== config.botOpenId) {
+      const error = new Error('Authenticated account identity changed');
+      error.code = 'account-changed';
+      throw error;
+    }
+    const fingerprint = createHash('sha256').update(JSON.stringify({
+      provider: 'feishu', domain: config.domain, appId: config.appId, botOpenId: verified.openId,
+    })).digest('hex');
+    return { fingerprint, ...(verified.name ? { name: verified.name } : {}) };
+  }
+
+  async describeDeliveryAccount(botId) {
+    this.#assertOpen('capability-unavailable');
+    return this.#withBotTransition(botId, async () => {
+      this.#assertOpen('capability-unavailable');
+      const config = this.#requireBot(botId);
+      const account = await this.#deliveryAccount(config);
+      this.#assertOpen('capability-unavailable');
+      return { version: 1, botId, channel: 'feishu', account,
+        connected: isConnected(connectionStatus(this.#runtimes.get(botId))),
+        capabilities: ['proactive-text-checked', 'proactive-receipt-checked', 'exclusive-text-consumer', 'reply-text-checked', 'history-text-checked', 'thread-history-text-checked'] };
+    });
+  }
+
+  async consumeInbound(botId, { expectedFingerprint, onEvent, signal } = {}) {
+    this.#assertOpen();
+    return this.#serializeConfig(() => this.#withBotTransition(botId, async () => {
+      this.#assertOpen();
+      signal?.throwIfAborted();
+      const config = this.#requireBot(botId);
+      const account = await this.#deliveryAccount(config);
+      this.#assertOpen('capability-unavailable');
+      signal?.throwIfAborted();
+      if (account.fingerprint !== expectedFingerprint)
+        throw Object.assign(new Error('account-changed'), { code: 'account-changed' });
+      const dispose = this.#inboundConsumers.register(botId, { fingerprint: expectedFingerprint, onEvent, signal });
+      try {
+        const saved = await this.#configStore.saveBot({ ...config, consumerMode: 'external-consumer' });
+        this.#assertOpen('capability-unavailable');
+        signal?.throwIfAborted();
+        const resolved = await this.#credentials.resolve(saved.secretRef);
+        this.#assertOpen('capability-unavailable');
+        signal?.throwIfAborted();
+        if (!resolved?.value) throw Object.assign(new Error('account-unverified'), { code: 'account-unverified' });
+        await this.#startRuntime(saved, resolved.value);
+        signal?.throwIfAborted();
+        this.#touch();
+        return dispose;
+      } catch (error) {
+        dispose();
+        throw error;
+      }
+    }));
+  }
+
+  async historyChecked(botId, route, query, { expectedFingerprint, signal } = {}) {
+    this.#assertOpen('capability-unavailable');
+    return this.#withBotTransition(botId, async () => {
+      this.#assertOpen('capability-unavailable');
+      signal?.throwIfAborted();
+      const config = this.#requireBot(botId);
+      const account = await this.#deliveryAccount(config);
+      this.#assertOpen('capability-unavailable');
+      signal?.throwIfAborted();
+      if (account.fingerprint !== expectedFingerprint)
+        throw Object.assign(new Error('account-changed'), { code: 'account-changed' });
+      const runtime = this.#runtimes.get(botId);
+      if (config.consumerMode !== 'external-consumer' || !isConnected(connectionStatus(runtime))
+        || typeof runtime.historyChecked !== 'function')
+        throw Object.assign(new Error('capability-unavailable'), { code: 'capability-unavailable' });
+      const leaseSignal = this.#inboundConsumers.signalFor(botId, expectedFingerprint);
+      const readSignal = signal ? AbortSignal.any([signal, leaseSignal]) : leaseSignal;
+      const result = await runtime.historyChecked({ botId, appId: config.appId,
+        botOpenId: config.botOpenId, fingerprint: account.fingerprint }, route, query, { signal: readSignal });
+      this.#assertOpen('capability-unavailable');
+      readSignal.throwIfAborted();
+      return result;
+    });
+  }
+
+  async replyChecked(botId, route, text, { expectedFingerprint, signal } = {}) {
     this.#assertOpen();
     return this.#withBotTransition(botId, async () => {
-      this.#requireBot(botId);
+      this.#assertOpen();
+      const config = this.#requireBot(botId);
+      const account = await this.#deliveryAccount(config);
+      this.#assertOpen('capability-unavailable');
+      signal?.throwIfAborted();
+      if (account.fingerprint !== expectedFingerprint)
+        throw Object.assign(new Error('account-changed'), { code: 'account-changed' });
+      signal?.throwIfAborted();
+      const runtime = this.#runtimes.get(botId);
+      if (config.consumerMode !== 'external-consumer' || !isConnected(connectionStatus(runtime))
+        || typeof runtime.replyChecked !== 'function')
+        throw Object.assign(new Error('capability-unavailable'), { code: 'capability-unavailable' });
+      return runtime.replyChecked(route, text, { signal });
+    });
+  }
+
+  async sendProactiveText(botId, target, text, options = {}) {
+    const checked = options.expectedFingerprint !== undefined;
+    this.#assertOpen(checked ? 'capability-unavailable' : undefined);
+    return this.#withBotTransition(botId, async () => {
+      this.#assertOpen(checked ? 'capability-unavailable' : undefined);
+      const config = this.#requireBot(botId);
+      if (checked) {
+        const account = await this.#deliveryAccount(config);
+        if (account.fingerprint !== options.expectedFingerprint) {
+          const error = new Error('Authenticated account identity changed');
+          error.code = 'account-changed';
+          throw error;
+        }
+        // Account verification yields; a Registration can be replaced or disposed
+        // before the SDK request starts. Recheck its owner at the effect boundary.
+        options.beforeSend?.();
+        this.#assertOpen('capability-unavailable');
+        options.signal?.throwIfAborted();
+      }
       const runtime = this.#runtimes.get(botId);
       if (!isConnected(connectionStatus(runtime))
         || typeof runtime.sendProactiveText !== 'function') {
@@ -575,6 +716,30 @@ export class MultiBotDshFeishuController {
         throw error;
       }
       return runtime.sendProactiveText(target, text, options);
+    });
+  }
+
+  async presentSessionSyncApproval(botId, target, interaction, options = {}) {
+    this.#assertOpen();
+    return this.#withBotTransition(botId, async () => {
+      this.#assertOpen();
+      this.#requireBot(botId);
+      const runtime = this.#runtimes.get(botId);
+      if (!isConnected(connectionStatus(runtime))
+        || typeof runtime.presentSessionSyncApproval !== 'function') return false;
+      return runtime.presentSessionSyncApproval(target, interaction, options);
+    });
+  }
+
+  async presentSessionSyncQuestion(botId, target, interaction, options = {}) {
+    this.#assertOpen();
+    return this.#withBotTransition(botId, async () => {
+      this.#assertOpen();
+      this.#requireBot(botId);
+      const runtime = this.#runtimes.get(botId);
+      if (!isConnected(connectionStatus(runtime))
+        || typeof runtime.presentSessionSyncQuestion !== 'function') return false;
+      return runtime.presentSessionSyncQuestion(target, interaction, options);
     });
   }
 
@@ -668,6 +833,20 @@ export class MultiBotDshFeishuController {
     }));
   }
 
+  async updateStepCardPanels(botId, stepCardPanels) {
+    this.#assertOpen();
+    if (!isFeishuStepCardPanels(stepCardPanels)) {
+      throw new TypeError('Invalid Feishu step card panels');
+    }
+    return this.#serializeConfig(() => this.#withBotTransition(botId, async () => {
+      const config = this.#requireBot(botId);
+      const saved = await this.#configStore.saveBot({ ...config, stepCardPanels });
+      this.#runtimes.get(botId)?.setStepCardPanels?.(saved.stepCardPanels);
+      this.#touch();
+      return this.status(botId);
+    }));
+  }
+
   async updateVoice(botId, voice) {
     this.#assertOpen();
     if (voice !== null && (typeof voice !== 'object' || Array.isArray(voice))) {
@@ -711,6 +890,7 @@ export class MultiBotDshFeishuController {
   async close() {
     if (this.#closed) return;
     this.#closed = true;
+    this.#inboundConsumers.close();
     const appUpdateProcessing = [];
     for (const record of this.#registrations.values()) {
       const state = record.manager.status().state;
@@ -752,6 +932,7 @@ export class MultiBotDshFeishuController {
         mentionTopicReply: config.mentionTopicReply !== false,
         stepPush: config.stepPush === true,
         stepPushMode: normalizeFeishuStepPushMode(config.stepPushMode),
+        stepCardPanels: normalizeFeishuStepCardPanels(config.stepCardPanels),
         voice: normalizeFeishuVoiceConfig(config.voice),
         slashPanel: normalizeSlashPanelConfig(config.slashPanel),
         groupMessagePermissionGranted: config.groupMessagePermissionGranted === true,
@@ -925,7 +1106,7 @@ export class MultiBotDshFeishuController {
         saved = await this.#configStore.saveBot({
           ...current,
           groupMessagePermissionGranted: true,
-          groupResponseMode: 'all',
+          groupResponseMode: record.preserveResponseMode ? current.groupResponseMode : 'all',
         });
       } catch (error) {
         throw this.#callbackRepairError(
@@ -1069,6 +1250,17 @@ export class MultiBotDshFeishuController {
           }
         }
 
+        // The SDK update includes group-message access. Persist that fact
+        // without changing the bot's response mode.
+        record.stage = 'persisting_permissions';
+        let saved;
+        try {
+          saved = await this.#configStore.saveBot({ ...current, groupMessagePermissionGranted: true });
+        } catch (error) {
+          throw this.#callbackRepairError(record, 'repair_permissions_save_failed',
+            'The permissions were accepted, but their local state could not be saved.', error);
+        }
+
         let currentRuntime;
         // Callback subscriptions are delivered over the long connection.
         // Always replace it after the platform-side callback update commits,
@@ -1076,7 +1268,7 @@ export class MultiBotDshFeishuController {
         // still reports healthy, so the probe never runs on stale metadata.
         record.stage = 'restarting';
         try {
-          await this.#startRuntime(current, appSecret);
+          await this.#startRuntime(saved, appSecret);
           currentRuntime = this.#runtimes.get(record.botId);
         } catch (error) {
           // The returned credential was already verified and persisted. Do
@@ -1192,6 +1384,7 @@ export class MultiBotDshFeishuController {
         // their stored values, undefined falls through to the defaults here).
         stepPush: existing?.stepPush ?? true,
         stepPushMode: existing?.stepPushMode ?? DEFAULT_FEISHU_STEP_PUSH_MODE,
+        groupMessagePermissionGranted: true,
         deletionPending: false,
         connectedAt: new Date().toISOString(),
         createdAt: existing?.createdAt ?? new Date().toISOString(),
@@ -1302,11 +1495,39 @@ export class MultiBotDshFeishuController {
 
   async #startRuntime(config, appSecret) {
     await this.#stopRuntime(config.id);
-    const runtime = await atConnectionStage('runtime.prepare', () => this.#createRuntime({
+    let runtime;
+    runtime = await atConnectionStage('runtime.prepare', () => this.#createRuntime({
       botId: config.id,
       config,
       appSecret,
       repair: this.#runtimeRepairCapability(config.id),
+      acceptExternal: async (event, { signal } = {}) => {
+        const assertCurrent = () => {
+          this.#assertOpen('capability-unavailable');
+          signal?.throwIfAborted();
+          if (this.#runtimes.get(config.id) !== runtime)
+            throw Object.assign(new Error('consumer-unavailable'), { code: 'consumer-unavailable' });
+          const current = this.#requireBot(config.id);
+          if (current.consumerMode !== 'external-consumer'
+            || externalAccountOwnership(current) !== externalAccountOwnership(config))
+            throw Object.assign(new Error('account-changed'), { code: 'account-changed' });
+          return current;
+        };
+        const evidence = await this.#withBotTransition(config.id, async () => {
+          const current = assertCurrent();
+          const account = await this.#deliveryAccount(current);
+          assertCurrent();
+          return normalizeExternalText(event, { botId: current.id, appId: current.appId,
+            botOpenId: current.botOpenId, fingerprint: account.fingerprint });
+        });
+        // Never hold the account queue across application work: onEvent may
+        // await a checked read/reply, and stop must be able to abort its signal.
+        assertCurrent();
+        if (evidence === null) return { accepted: true, ignored: true };
+        const result = await this.#inboundConsumers.accept(config.id, evidence, signal);
+        assertCurrent();
+        return result;
+      },
     }));
     this.#runtimes.set(config.id, runtime);
     try {
@@ -1348,6 +1569,7 @@ export class MultiBotDshFeishuController {
   async #deleteBot(botId) {
     let config = this.#configStore.getBot(botId);
     if (!config) return;
+    this.#inboundConsumers.remove(botId);
     if (!config.deletionPending) {
       config = await this.#configStore.saveBot({ ...config, deletionPending: true });
     }
@@ -1386,8 +1608,12 @@ export class MultiBotDshFeishuController {
     return config;
   }
 
-  #assertOpen() {
-    if (this.#closed) throw new Error('The Feishu controller is closed');
+  #assertOpen(code) {
+    if (this.#closed) {
+      const error = new Error('The Feishu controller is closed');
+      if (code) error.code = code;
+      throw error;
+    }
   }
 
   #serializeConfig(operation) {

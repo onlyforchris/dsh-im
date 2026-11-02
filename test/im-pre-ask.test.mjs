@@ -30,3 +30,35 @@ test('pre-ask replies bypass Harness and continuing preserves upstream guidance'
     assert.equal(calls[0].options.sourceGuidance, 'guidance');
   } finally { dispose(); }
 });
+
+for (const resolveWorkspace of [true, false]) {
+  test(`pre-ask uses the committed conversation workspace (resolver=${resolveWorkspace})`, async () => {
+    let workspace = '/old';
+    let finishSwitch;
+    const pending = new Promise(resolve => { finishSwitch = resolve; });
+    const signal = new AbortController().signal;
+    const harness = {
+      workspace: '/bot-default',
+      pendingConversationWorkspaceSwitch: key => { assert.equal(key, 'chat'); return pending; },
+      currentWorkspace: () => '/bot-default',
+      currentConversationWorkspace: key => { assert.equal(key, 'chat'); return workspace; },
+      ...(resolveWorkspace ? { resolveConversationWorkspace(key, options) {
+        assert.equal(key, 'chat');
+        assert.equal(options.signal, signal);
+        return Promise.resolve(workspace);
+      } } : {}),
+      ask: () => assert.fail('a fixed reply must bypass the model'),
+    };
+    const dispose = installImPreAsk(payload => {
+      assert.equal(payload.workspace, '/conversation');
+      return { kind: 'reply', text: 'handled' };
+    });
+    try {
+      const result = askInWorkspaceSession({ harness, state: { sessionFor: () => '' },
+        key: 'chat', text: 'hello', existsOptions: { signal } });
+      workspace = '/conversation';
+      finishSwitch();
+      assert.equal((await result).answer, 'handled');
+    } finally { dispose(); }
+  });
+}

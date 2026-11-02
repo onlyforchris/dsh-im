@@ -1,6 +1,9 @@
+import { randomUUID } from 'node:crypto';
 import { withSessionBindingLock } from './session-binding-lock.mjs';
 import { runImPreAsk } from './im-pre-ask.mjs';
 import { initialSessionTitle } from './session-title.mjs';
+import { extractConnectionEvidence, messageDiagnosticError } from './connection-error.mjs';
+import { t } from './i18n.mjs';
 
 export const WORKSPACE_SESSION_STALE = 'workspace-session-stale';
 
@@ -163,12 +166,18 @@ export async function askInWorkspaceSession({
   existsOptions,
   askOptions,
   deferredDelivery,
+  onNotice,
   logger,
   workspace,
 }) {
   const plainText = extractPlainText(text, content);
+  await awaitPendingConversationSwitch(harness, key);
+  const conversationWorkspace = workspace
+    || await harness.resolveConversationWorkspace?.(key, existsOptions)
+    || harness.currentConversationWorkspace?.(key)
+    || harness.currentWorkspace?.();
   const resolvedWorkspace =
-    workspace
+    conversationWorkspace
     || (typeof harness?.workspace === 'string' ? harness.workspace : '')
     || (typeof harness?.workspace === 'function' ? harness.workspace() : '')
     || '';
@@ -207,18 +216,53 @@ export async function askInWorkspaceSession({
   const renameSignal = createOptions?.signal
     ?? (typeof askOptions === 'object' ? askOptions?.signal : undefined);
   const renameOptions = renameSignal ? { signal: renameSignal } : undefined;
+  let unreadableSessionId;
   while (true) {
+    const diagnostic = { stage: 'session.prepare', submissionState: 'not-submitted' };
+    let dsBotSession = false;
     try {
       const binding = await withSessionBindingLock(state, key, async () => {
         await awaitPendingConversationSwitch(harness, key);
-        let sessionId = state.sessionFor(key);
+        const dsBotSessionId = await harness.resolveDsBotSession?.(key);
+        dsBotSession = Boolean(dsBotSessionId);
+        let sessionId = dsBotSessionId || state.sessionFor(key);
+        diagnostic.sessionId = sessionId;
         let session = sessionId ? workspaceSession(harness, sessionId, key) : null;
-        if (!session || !(await sessionExists(session, existsOptions))) {
-          sessionId = await createSession(harness, {
-            conversationKey: key,
-            ...(createOptions ?? {}),
-          });
-          if (await state.setSession(key, sessionId) === false) return null;
+        const replacingUnreadable = sessionId && sessionId === unreadableSessionId;
+        if (!session || replacingUnreadable || !(await sessionExists(session, existsOptions))) {
+          if (dsBotSessionId) {
+            throw Object.assign(new Error('DS Bot 的当前会话不可用。'), { code: 'ds-bot-unavailable' });
+          }
+          // Name the Session here and bind it *before* creating it. Prompt
+          // assembly runs inside creation, and a subscriber that resolves the
+          // conversation by session id can only answer if the conversation owns
+          // the id by then.
+          // A Harness that accepts a caller-chosen id lets the binding exist
+          // before the Session does; anything else keeps the old order.
+          const plannedSessionId = harness?.canChooseSessionId === true ? `session-${randomUUID()}` : null;
+          const previousSessionId = plannedSessionId === null ? null : state.sessionFor(key) ?? null;
+          if (plannedSessionId !== null && await state.setSession(key, plannedSessionId) === false) return null;
+          try {
+            sessionId = await createSession(harness, {
+              conversationKey: key,
+              ...(plannedSessionId === null ? {} : { sessionId: plannedSessionId }),
+              ...(createOptions ?? {}),
+            });
+          } catch (error) {
+            // The binding must not outlive a Session that was never created, and a
+            // failed replacement must leave the previous binding in place.
+            if (plannedSessionId !== null) {
+              if (previousSessionId === null) await state.clearSession?.(key);
+              else await state.setSession(key, previousSessionId);
+            }
+            throw error;
+          }
+          diagnostic.sessionId = sessionId;
+          if (plannedSessionId === null) {
+            if (await state.setSession(key, sessionId) === false) return null;
+          } else if (sessionId !== plannedSessionId && await state.setSession(key, sessionId) === false) {
+            return null;
+          }
           // Binding committed: capture the conversation's effective-workspace
           // generation together with the session, so the prompt below is fenced
           // against a conversation switch that only commits after the bind.
@@ -239,11 +283,16 @@ export async function askInWorkspaceSession({
           if (conversationGenerationMoved(harness, key, conversationGeneration)) {
             throw workspaceSessionStaleError();
           }
-          return { sessionId, session };
+          return { sessionId, session, recovered: replacingUnreadable };
         }
         return { sessionId, session };
       });
       if (!binding) continue;
+      diagnostic.sessionId = binding.sessionId;
+      if (binding.recovered) {
+        await onNotice?.(t('绑定会话的日志已损坏，已切换到新会话并继续处理本条消息。原会话记录已保留，历史上下文不会自动带入。'));
+      }
+      diagnostic.stage = 'prompt.prepare';
       const artifacts = [];
       const originalOnArtifact = typeof askOptions === 'object'
         && typeof askOptions?.onArtifact === 'function'
@@ -266,6 +315,9 @@ export async function askInWorkspaceSession({
         ? await prepareContent({ sessionId: binding.sessionId, content: tagged.content, text: tagged.text })
         : tagged.content ?? tagged.text;
       try {
+        // An alternate Harness adapter may not supply finer ask() diagnostics.
+        diagnostic.stage = 'operation';
+        diagnostic.submissionState = 'unknown';
         answer = await binding.session.ask(prompt, artifactOptions);
       } catch (error) {
         if (error?.code === 'harness-reply-timeout' && deferredDelivery) {
@@ -284,7 +336,18 @@ export async function askInWorkspaceSession({
         ...(artifacts.length > 0 ? { artifacts } : {}),
       };
     } catch (error) {
-      if (error?.code !== WORKSPACE_SESSION_STALE) throw error;
+      const failure = messageDiagnosticError(error, diagnostic);
+      // Retry once, only with positive evidence that no prompt was submitted.
+      // The binding lock rechecks identity so a concurrent /new or workspace
+      // switch cannot be overwritten by recovery of the previous Session.
+      if (!unreadableSessionId && !dsBotSession && diagnostic.sessionId
+        && error?.code === 'session-unreadable'
+        && !renameSignal?.aborted && !existsOptions?.signal?.aborted
+        && extractConnectionEvidence(failure).details.submissionState === 'not-submitted') {
+        unreadableSessionId = diagnostic.sessionId;
+        continue;
+      }
+      if (error?.code !== WORKSPACE_SESSION_STALE) throw failure;
     }
   }
 }

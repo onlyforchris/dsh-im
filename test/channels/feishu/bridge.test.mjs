@@ -19,6 +19,7 @@ import {
 import {
   COMMAND_PERMISSION_DENIED_MESSAGE,
   directAccessPolicy,
+  configuredAccessPolicy,
 } from '../access-policy-fixture.mjs';
 
 const PNG_1X1 = Buffer.from(
@@ -220,6 +221,10 @@ async function committedArtifact(t, fileName, content, suffix = '') {
       ],
     },
   };
+  t.after(registry.openConsumer(agent.session.header.id, `rpc-${suffix || 'file'}`));
+  for (const event of agent.session.events) {
+    registry.observeSessionEvent(agent.session, event);
+  }
   const tool = createOutboundArtifactTool({ registry });
   const exec = {
     name: OUTBOUND_ARTIFACT_TOOL,
@@ -307,6 +312,44 @@ test('Feishu executes /compact for the bound Session without prompting the model
 
   assert.deepEqual(executed, [{ sessionId: 'session-compact', line: '/compact' }]);
   assert.deepEqual(sent, ['暂无可压缩的历史记录。']);
+});
+
+test('Feishu rejects /clear with an embedded image before Harness execution', async () => {
+  const fixture = stateFixture([['p2p:ou_user', 'session-clear-image']]);
+  const sent = [];
+  let executed = 0;
+  let asked = 0;
+  const bridge = new FeishuHarnessBridge({
+    client: textClient(async ({ text }) => sent.push(text)),
+    channel: {},
+    harness: {
+      executeCommand: async () => {
+        executed += 1;
+        return { result: { kind: 'success' } };
+      },
+      ask: async () => {
+        asked += 1;
+        return '不应调用';
+      },
+    },
+    state: fixture.state,
+    status: bridgeStatus(),
+    allowedSenderOpenIds: new Set(['ou_user']),
+  });
+
+  await bridge.accept(event('clear-feishu-image', '', {
+    message_type: 'post',
+    content: JSON.stringify({ content: [
+      [{ tag: 'text', text: '/clear' }],
+      [{ tag: 'img', image_key: 'clear-image' }],
+    ] }),
+  }));
+  await bridge.waitForIdle();
+
+  assert.equal(executed, 0);
+  assert.equal(asked, 0);
+  assert.match(sent.at(-1), /用法.*不可附带/);
+  assert.equal(fixture.state.sessionFor('p2p:ou_user'), 'session-clear-image');
 });
 
 test('Feishu lists models and presets without prompting and advertises fast commands', async () => {
@@ -1193,9 +1236,10 @@ test('Feishu applies the unified access policy before attachments or Harness wor
   let downloads = 0;
   const harnessCalls = [];
   const sent = [];
-  const accessPolicy = directAccessPolicy({
+  const accessLogs = [];
+  const accessPolicy = configuredAccessPolicy({
+    channel: 'feishu', config: { ownerOpenIds: ['*', 'ou_owner'] },
     users: [{ id: 'ou_member', canExecuteCommands: false }],
-    privilegedIds: ['ou_owner'],
   });
   const client = {
     im: { v1: {
@@ -1225,6 +1269,7 @@ test('Feishu applies the unified access policy before attachments or Harness wor
     },
     state: fixture.state,
     status: bridgeStatus(),
+    logger: { info: (...args) => accessLogs.push(args), warn() {}, error() {} },
   });
 
   await bridge.accept(event('policy-blocked-image', '', {
@@ -1236,6 +1281,12 @@ test('Feishu applies the unified access policy before attachments or Harness wor
   assert.equal(downloads, 0);
   assert.deepEqual(harnessCalls, []);
   assert.deepEqual(sent, []);
+
+  await bridge.accept(event('policy-blocked-image', 'private message replay', { senderOpenId: 'ou_blocked' }));
+  await bridge.waitForIdle();
+  assert.deepEqual(accessLogs, [['[dsh-feishu] inbound access denied', {
+    botId: 'configured_bot', conversationType: 'direct', reason: 'sender-not-allowed',
+  }]], 'replays do not repeat logs, and logs contain neither user identity nor message content');
 
   await bridge.accept(event('policy-member-text', '普通消息', {
     senderOpenId: 'ou_member',
@@ -1259,6 +1310,21 @@ test('Feishu applies the unified access policy before attachments or Harness wor
   }));
   await bridge.waitForIdle();
   assert.match(sent.at(-1), /\/status/);
+
+  await bridge.accept(event('policy-owner-group-command', '/help', {
+    senderOpenId: 'ou_owner', chat_type: 'group', chat_id: 'oc_owner_group',
+  }));
+  await bridge.waitForIdle();
+  assert.match(sent.at(-1), /\/status/);
+  const repliesBeforeBlockedGroup = sent.length;
+  await bridge.accept(event('policy-blocked-group', 'private group content', {
+    senderOpenId: 'ou_blocked', chat_type: 'group', chat_id: 'oc_owner_group',
+  }));
+  await bridge.waitForIdle();
+  assert.equal(sent.length, repliesBeforeBlockedGroup);
+  assert.deepEqual(accessLogs.at(-1)[1], {
+    botId: 'configured_bot', conversationType: 'group', reason: 'sender-not-allowed',
+  });
 });
 
 test('bridge hands a native Feishu file source to the current Harness turn', async () => {
@@ -1285,11 +1351,14 @@ test('bridge hands a native Feishu file source to the current Harness turn', asy
     harness: {
       sessionExists: async () => true,
       ask: async (sessionId, prompt, options) => {
+        const { stream } = await options.files[0].load({ signal: options.signal });
+        const chunks = [];
+        for await (const chunk of stream) chunks.push(chunk);
         asked.push({
           sessionId,
           prompt,
           name: options.files[0].name,
-          bytes: await options.files[0].load({ signal: options.signal }),
+          bytes: Buffer.concat(chunks),
         });
         return '文件已收到';
       },
@@ -5382,9 +5451,11 @@ test('a stream finalization failure falls back to text without repeating the pro
 
 test('bridge does not expose internal error details in a Feishu failure reply', async () => {
   const sent = [];
+  const logs = [];
   const seen = new Set();
   const status = { messagesReceived: 0, messagesReplied: 0, messagesRejected: 0 };
   const bridge = new FeishuHarnessBridge({
+    logger: { error: (...args) => logs.push(args) },
     client: {
       im: { v1: { message: { create: async (request) => {
         sent.push(JSON.parse(request.data.content).text);
@@ -5414,11 +5485,18 @@ test('bridge does not expose internal error details in a Feishu failure reply', 
   await bridge.waitForIdle();
 
   assert.equal(sent.length, 1);
-  assert.match(sent[0], /任务未完成，暂时无法确定原因/);
+  assert.match(sent[0], /任务结果尚未确认.*不要立即重复提交/);
   assert.match(sent[0], /错误码：INTERNAL_UNKNOWN；参考号：MF-[A-F0-9]{8}$/);
   assert.doesNotMatch(sent[0], /secret-shaped-internal-detail|private\/path/);
   assert.equal(status.lastError, status.lastMessageError.message);
   assert.doesNotMatch(JSON.stringify(status), /secret-shaped-internal-detail|private\/path/);
+  const diagnostic = logs.find(([label]) => label.includes(status.lastMessageError.referenceId))?.[1];
+  assert.equal(diagnostic?.code, 'INTERNAL_UNKNOWN');
+  assert.equal(diagnostic?.referenceId, status.lastMessageError.referenceId);
+  assert.equal(diagnostic?.details.submissionState, 'unknown');
+  assert.equal(diagnostic?.sessionId, 'session-existing');
+  assert.ok(Array.isArray(diagnostic?.errors));
+  assert.doesNotMatch(JSON.stringify(logs), /secret-shaped-internal-detail|private\/path/);
 });
 
 test('Feishu exposes a structured model rate limit without changing connection state', async () => {
@@ -5489,10 +5567,12 @@ function cardClient(onSend, onPatch = null) {
   return client;
 }
 
-function cardActionEvent(messageId, action, operatorOpenId) {
+function cardActionEvent(messageId, action, operatorOpenId, card = null) {
   return {
     operator: { open_id: operatorOpenId },
-    action: { value: { action } },
+    action: { value: card
+      ? buttonsFromCard(card).find((button) => callbackAction(button) === action).behaviors[0].value
+      : { action } },
     context: { open_message_id: messageId },
   };
 }
@@ -5616,10 +5696,11 @@ test('a card callback without a trusted route stays silent before access evaluat
 test('card buttons from an allowed sender work', async () => {
   const fixture = stateFixture();
   const sent = [];
+  const patches = [];
   const bridge = new FeishuHarnessBridge({
     client: cardClient(async ({ chatId, msgType, content }) => {
       sent.push({ chatId, msgType, content });
-    }),
+    }, async (request) => patches.push(request)),
     channel: {},
     harness: sessionsHarness(3),
     state: fixture.state,
@@ -5631,9 +5712,442 @@ test('card buttons from an allowed sender work', async () => {
   await bridge.waitForIdle();
   assert.equal(sent.length, 1);
 
-  await bridge.onCardAction(cardActionEvent('om_card_1', 'new', 'ou_owner'));
+  await bridge.onCardAction(cardActionEvent('om_card_1', 'new', 'ou_owner', cards(sent)[0].content));
   await bridge.waitForIdle();
-  assert.equal(sent.length, 3, 'allowed operator click should send a reply + menu card update');
+  assert.equal(sent.length, 2, 'allowed operator click should send a receipt');
+  assert.equal(patches.length, 2, 'the original card shows processing and success');
+  assert.ok(patches.every((request) => request.path.message_id === 'om_card_1'));
+  assert.match(patches.at(-1).data.content, /已执行：新会话/);
+});
+
+test('numeric new-session clears an idle binding without starting a turn', async () => {
+  const fixture = stateFixture([['p2p:ou_user', 'session-existing']]);
+  const sent = [];
+  let clearCalls = 0;
+  let askCalls = 0;
+  const clearSession = fixture.state.clearSession;
+  fixture.state.clearSession = async (key) => {
+    clearCalls += 1;
+    return clearSession(key);
+  };
+  const bridge = new FeishuHarnessBridge({
+    client: cardClient(async (outgoing) => sent.push(outgoing)),
+    harness: {
+      sessionExists: async () => true,
+      ask: async () => { askCalls += 1; return 'unexpected task'; },
+    },
+    state: fixture.state,
+    status: bridgeStatus(),
+    allowedSenderOpenIds: new Set(['ou_user']),
+  });
+
+  await bridge.accept(event('numeric-new-menu', '/m'));
+  await bridge.accept(event('numeric-new-pick', '2'));
+  await bridge.waitForIdle();
+
+  assert.equal(clearCalls, 1);
+  assert.equal(fixture.state.sessionFor('p2p:ou_user'), null);
+  assert.equal(askCalls, 0);
+  const replies = sent.filter(({ msgType }) => msgType === 'text').map(({ content }) => JSON.parse(content).text);
+  assert.ok(replies.includes('已开启全新 Harness 会话。'));
+  assert.equal(replies.some((text) => text.includes('当前任务仍在运行')), false);
+});
+
+for (const withFollowingMessage of [false, true]) {
+  test(`numeric new-session waits for the active turn${withFollowingMessage ? ' and rebinds the following message' : ''}`, async () => {
+    const fixture = stateFixture([['p2p:ou_user', 'session-existing']]);
+    const sent = [];
+    const order = [];
+    const started = deferred();
+    const release = deferred();
+    const clearSession = fixture.state.clearSession;
+    fixture.state.clearSession = async (key) => {
+      order.push('clear');
+      return clearSession(key);
+    };
+    const bridge = new FeishuHarnessBridge({
+      client: cardClient(async (outgoing) => sent.push(outgoing)),
+      harness: {
+        sessionExists: async () => true,
+        createSession: async () => { order.push('create'); return 'session-new'; },
+        ask: async (sessionId) => {
+          order.push(`ask:${sessionId}`);
+          if (order.length === 1) {
+            started.resolve();
+            await release.promise;
+            order.push('finished');
+          }
+          return 'task finished';
+        },
+      },
+      state: fixture.state,
+      status: bridgeStatus(),
+      allowedSenderOpenIds: new Set(['ou_user']),
+    });
+
+    await bridge.accept(event('numeric-busy-menu', '/m'));
+    const turn = bridge.accept(event('numeric-busy-task', 'run a task'));
+    await started.promise;
+    const pick = bridge.accept(event('numeric-busy-pick', '2'));
+    const following = withFollowingMessage
+      ? bridge.accept(event('numeric-following', 'start the next task'))
+      : Promise.resolve();
+    try {
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepEqual(order, ['ask:session-existing']);
+      assert.equal(fixture.state.sessionFor('p2p:ou_user'), 'session-existing');
+    } finally {
+      release.resolve();
+      await Promise.all([turn, pick, following]);
+    }
+    await bridge.waitForIdle();
+
+    assert.deepEqual(order, withFollowingMessage
+      ? ['ask:session-existing', 'finished', 'clear', 'create', 'ask:session-new']
+      : ['ask:session-existing', 'finished', 'clear']);
+    assert.equal(fixture.state.sessionFor('p2p:ou_user'), withFollowingMessage ? 'session-new' : null);
+    const replies = sent.filter(({ msgType }) => msgType === 'text').map(({ content }) => JSON.parse(content).text);
+    assert.ok(replies.includes('已开启全新 Harness 会话。'));
+    assert.equal(replies.some((text) => text.includes('当前任务仍在运行')), false);
+  });
+}
+
+test('numeric question reply takes precedence over the new-session menu choice', async () => {
+  const fixture = stateFixture([['p2p:ou_user', 'session-question']]);
+  const ready = deferred();
+  const answered = deferred();
+  const sent = [];
+  const bridge = new FeishuHarnessBridge({
+    client: cardClient(async (outgoing) => sent.push(outgoing)),
+    harness: {
+      sessionExists: async () => true,
+      ask: async (sessionId, _text, options) => {
+        await options.onInteraction({
+          kind: 'question',
+          interactionId: 'numeric-menu-question',
+          rpcId: 'numeric-menu-question',
+          sessionId,
+          payload: {
+            type: 'question/requested', sessionId,
+            questions: [{
+              id: 'language', question: '请选择语言',
+              options: [{ label: '中文' }, { label: 'English' }],
+            }],
+          },
+          respond: async (result) => {
+            answered.resolve(result);
+            return { accepted: true };
+          },
+        });
+        ready.resolve();
+        await answered.promise;
+        return 'question finished';
+      },
+    },
+    state: fixture.state,
+    status: bridgeStatus(),
+    allowedSenderOpenIds: new Set(['ou_user']),
+  });
+
+  await bridge.accept(event('numeric-question-menu', '/m'));
+  const turn = bridge.accept(event('numeric-question-start', 'ask a question'));
+  await ready.promise;
+  await bridge.accept(event('numeric-question-answer', '2'));
+  await turn;
+  assert.deepEqual(await answered.promise, {
+    ok: true,
+    value: { sessionId: 'session-question', answer: { answers: [{ id: 'language', selected: ['English'] }] } },
+  });
+  assert.equal(fixture.state.sessionFor('p2p:ou_user'), 'session-question');
+  assert.equal(sent.some(({ content }) => JSON.stringify(content).includes('已开启全新 Harness 会话')), false);
+});
+
+test('/new menu shows processing and success on the original card and consumes duplicate clicks', async () => {
+  const fixture = stateFixture();
+  const sent = [];
+  const patches = [];
+  const cleared = deferred();
+  let clearCalls = 0;
+  const clearSession = fixture.state.clearSession;
+  fixture.state.clearSession = async (key) => {
+    clearCalls += 1;
+    if (clearCalls > 1) await cleared.promise;
+    return clearSession(key);
+  };
+  const bridge = new FeishuHarnessBridge({
+    client: cardClient(async (outgoing) => sent.push(outgoing), async (request) => patches.push(request)),
+    channel: {},
+    harness: sessionsHarness(3),
+    state: fixture.state,
+    status: bridgeStatus(),
+    allowedSenderOpenIds: new Set(['ou_owner']),
+  });
+
+  await bridge.accept(event('new-menu-feedback', '/new', { senderOpenId: 'ou_owner' }));
+  await bridge.waitForIdle();
+  assert.equal(clearCalls, 1);
+  assert.equal(fixture.state.sessionFor('p2p:ou_owner'), null, 'the reported flow starts unbound');
+  const original = cards(sent)[0].content;
+  const newButton = buttonsFromCard(original).find((button) => callbackAction(button) === 'new');
+  const callback = {
+    ...cardActionEvent('om_card_2', 'new', 'ou_owner'),
+    action: { value: newButton.behaviors[0].value },
+  };
+  const first = bridge.onCardAction(callback);
+  try {
+    await eventually(() => clearCalls === 2);
+    assert.equal(patches.length, 1, 'processing feedback must precede the side effect settling');
+    assert.equal(patches[0].path.message_id, 'om_card_2');
+    const processing = JSON.parse(patches[0].data.content);
+    assert.match(JSON.stringify(processing), /正在开启新会话/);
+    assert.equal(buttonsFromCard(processing).find((button) => callbackAction(button) === 'new').disabled, true);
+  } finally {
+    cleared.resolve();
+    await first;
+  }
+  const result = JSON.parse(patches.at(-1).data.content);
+  assert.match(JSON.stringify(result), /已执行：新会话/);
+  assert.notDeepEqual(result, original, 'an unbound menu must visibly change after execution');
+  assert.equal(buttonsFromCard(result).find((button) => callbackAction(button) === 'new').disabled, true);
+  for (const action of ['sessions', 'status', 'help', 'stop']) {
+    assert.notEqual(buttonsFromCard(result).find((button) => callbackAction(button) === action).disabled, true);
+  }
+  // A delayed callback must not clear a session created after the first click.
+  await fixture.state.setSession('p2p:ou_owner', 'later-session');
+  await bridge.onCardAction(structuredClone(callback));
+  await bridge.onCardAction({ ...callback, event_id: 'distinct-repeated-click' });
+  assert.equal(clearCalls, 2);
+  assert.equal(fixture.state.sessionFor('p2p:ou_owner'), 'later-session');
+  assert.equal(cards(sent).length, 1, 'feedback must only patch the original card');
+  assert.ok(patches.every((request) => request.path.message_id === 'om_card_2'));
+
+  await bridge.onCardAction(cardActionEvent('om_card_2', 'help', 'ou_owner'));
+  assert.match(patches.at(-1).data.content, /帮助/);
+  await bridge.onCardAction(cardActionEvent('om_card_2', 'back_to_menu', 'ou_owner'));
+  const reopened = JSON.parse(patches.at(-1).data.content);
+  const reopenedNew = buttonsFromCard(reopened).find((button) => callbackAction(button) === 'new');
+  assert.notEqual(reopenedNew.disabled, true);
+  await bridge.onCardAction(callback);
+  await bridge.onCardAction(cardActionEvent('om_card_2', 'new', 'ou_owner'));
+  assert.equal(clearCalls, 2, 'old or malformed callbacks stay stale after returning to the menu');
+  await bridge.onCardAction({ ...callback, action: { value: reopenedNew.behaviors[0].value } });
+  assert.equal(clearCalls, 3, 'the persistent menu can start a new operation after navigation');
+});
+
+test('new menu action serializes distinct click events and allows retry only from the failed card', async () => {
+  const fixture = stateFixture([['p2p:ou_owner', 'original-session']]);
+  const sent = [];
+  const patches = [];
+  const reset = deferred();
+  let clearCalls = 0;
+  fixture.state.clearSession = async (key) => {
+    clearCalls += 1;
+    if (clearCalls === 1) await reset.promise;
+    fixture.sessions.delete(key);
+  };
+  const bridge = new FeishuHarnessBridge({
+    client: cardClient(async (outgoing) => sent.push(outgoing), async (request) => patches.push(request)),
+    channel: {},
+    harness: sessionsHarness(1),
+    state: fixture.state,
+    status: bridgeStatus(),
+    allowedSenderOpenIds: new Set(['ou_owner']),
+    logger: { warn() {}, error() {} },
+  });
+  await bridge.accept(event('failed-menu-open', '/m', { senderOpenId: 'ou_owner' }));
+  await bridge.waitForIdle();
+  const original = buttonsFromCard(cards(sent)[0].content).find((button) => callbackAction(button) === 'new');
+  const callback = {
+    ...cardActionEvent('om_card_1', 'new', 'ou_owner', cards(sent)[0].content),
+    action: { value: original.behaviors[0].value },
+  };
+  const first = bridge.onCardAction({ ...callback, event_id: 'new-first-click' });
+  const second = bridge.onCardAction({ ...callback, event_id: 'new-second-click' });
+  await eventually(() => clearCalls === 1);
+  reset.reject(new Error('private-state-path-secret'));
+  await Promise.all([first, second]);
+  assert.equal(clearCalls, 1, 'a second click queued before failure must not become a retry');
+  assert.equal(fixture.state.sessionFor('p2p:ou_owner'), 'original-session');
+  const failed = JSON.parse(patches.at(-1).data.content);
+  assert.match(JSON.stringify(failed), /新会话操作失败/);
+  assert.doesNotMatch(JSON.stringify(failed), /private-state-path-secret/);
+  const retry = buttonsFromCard(failed).find((button) => callbackAction(button) === 'new');
+  assert.notEqual(retry.disabled, true);
+  assert.notEqual(retry.behaviors[0].value.newSessionActionId, original.behaviors[0].value.newSessionActionId);
+  await bridge.onCardAction(callback);
+  assert.equal(clearCalls, 1, 'replayed failed clicks cannot silently retry a mutation');
+  await bridge.onCardAction({ ...callback, action: { value: retry.behaviors[0].value } });
+  assert.equal(clearCalls, 2);
+  assert.equal(fixture.state.sessionFor('p2p:ou_owner'), null);
+  assert.match(patches.at(-1).data.content, /已执行：新会话/);
+});
+
+test('new menu feedback reflects an unbound session after a persistence failure', async () => {
+  const fixture = stateFixture([['p2p:ou_owner', 'session-01']]);
+  const sent = [];
+  const patches = [];
+  fixture.state.clearSession = async (key) => {
+    fixture.sessions.delete(key);
+    throw new Error('private-persistence-detail');
+  };
+  const bridge = new FeishuHarnessBridge({
+    client: cardClient(async (outgoing) => sent.push(outgoing), async (request) => patches.push(request)),
+    channel: {},
+    harness: {
+      ...sessionsHarness(1),
+      listModels: async () => ({
+        groups: [{ id: 'provider', name: 'Provider', models: [{ id: 'default', name: 'Default' }, { id: 'override', name: 'Override' }] }],
+        current: { provider: 'provider', model: 'default' },
+      }),
+      workspaceSession: () => ({ models: async () => ({
+        groups: [{ id: 'provider', name: 'Provider', models: [{ id: 'default', name: 'Default' }, { id: 'override', name: 'Override' }] }],
+        current: { provider: 'provider', model: 'override' },
+      }) }),
+    },
+    state: fixture.state,
+    status: bridgeStatus(), allowedSenderOpenIds: new Set(['ou_owner']),
+    logger: { warn() {}, error() {} },
+  });
+  await bridge.accept(event('persistence-failed-menu', '/m', { senderOpenId: 'ou_owner' }));
+  await bridge.waitForIdle();
+  const original = cards(sent)[0].content;
+  const selectedIndex = (card) => selectsFromCard(card).find((select) => select.name === 'session_pick').initial_index;
+  assert.equal(selectedIndex(original), 1);
+  const selectedModelIndex = (card) => selectsFromCard(card).find((select) => select.name === 'model_pick').initial_index;
+  assert.equal(selectedModelIndex(original), 2);
+  await bridge.onCardAction(cardActionEvent('om_card_1', 'new', 'ou_owner', original));
+  const failed = JSON.parse(patches.at(-1).data.content);
+  assert.equal(selectedIndex(failed), 0, 'the card must show the actual remaining binding');
+  assert.equal(selectedModelIndex(failed), 1, 'an unbound menu must show the bot default model');
+  assert.match(JSON.stringify(failed), /新会话操作失败/);
+  assert.doesNotMatch(JSON.stringify(failed), /private-persistence-detail|已执行：新会话|新会话未开启/);
+});
+
+test('new menu action does not reset a task that starts while processing feedback is delayed', async () => {
+  const fixture = stateFixture([['p2p:ou_owner', 'session-active']]);
+  const sent = [];
+  const patches = [];
+  const patchReady = deferred();
+  const releasePatch = deferred();
+  const taskReady = deferred();
+  const releaseTask = deferred();
+  let clearCalls = 0;
+  fixture.state.clearSession = async () => { clearCalls += 1; };
+  const bridge = new FeishuHarnessBridge({
+    client: cardClient(async (outgoing) => sent.push(outgoing), async (request) => {
+      patches.push(request);
+      if (patches.length === 1) {
+        patchReady.resolve();
+        await releasePatch.promise;
+      }
+    }),
+    channel: {},
+    harness: {
+      ...sessionsHarness(1),
+      sessionExists: async () => true,
+      ask: async () => { taskReady.resolve(); await releaseTask.promise; return 'done'; },
+    },
+    state: fixture.state, status: bridgeStatus(), allowedSenderOpenIds: new Set(['ou_owner']),
+    logger: { warn() {}, error() {} },
+  });
+  await bridge.accept(event('delayed-patch-menu', '/m', { senderOpenId: 'ou_owner' }));
+  await bridge.waitForIdle();
+  const click = bridge.onCardAction(cardActionEvent('om_card_1', 'new', 'ou_owner', cards(sent)[0].content));
+  await patchReady.promise;
+  const task = bridge.accept(event('task-during-menu-patch', 'start work', { senderOpenId: 'ou_owner' }));
+  try {
+    await taskReady.promise;
+    releasePatch.resolve();
+    await click;
+    assert.equal(clearCalls, 0);
+    assert.equal(fixture.state.sessionFor('p2p:ou_owner'), 'session-active');
+    assert.match(patches.at(-1).data.content, /当前任务仍在运行/);
+  } finally {
+    releasePatch.resolve();
+    releaseTask.resolve();
+    await Promise.all([click, task]);
+    await bridge.waitForIdle();
+  }
+});
+
+test('new menu feedback PATCH failures do not create extra cards or repeat the reset', async (t) => {
+  for (const failure of ['business', 'transport']) {
+    await t.test(failure, async () => {
+      const fixture = stateFixture();
+      const sent = [];
+      let clearCalls = 0;
+      fixture.state.clearSession = async () => { clearCalls += 1; };
+      const patches = [];
+      const bridge = new FeishuHarnessBridge({
+        client: cardClient(async (outgoing) => sent.push(outgoing), async (request) => {
+          patches.push(request);
+          if (failure === 'transport') throw new Error('network error');
+          return { code: 230099, msg: 'update rejected' };
+        }),
+        channel: {}, harness: sessionsHarness(1), state: fixture.state,
+        status: bridgeStatus(), allowedSenderOpenIds: new Set(['ou_owner']),
+        logger: { warn() {}, error() {} },
+      });
+      await bridge.accept(event(`patch-failed-${failure}`, '/m', { senderOpenId: 'ou_owner' }));
+      await bridge.waitForIdle();
+      const callback = cardActionEvent('om_card_1', 'new', 'ou_owner', cards(sent)[0].content);
+      await bridge.onCardAction(callback);
+      await bridge.onCardAction(callback);
+      assert.equal(clearCalls, 1);
+      assert.equal(patches.length, 2);
+      assert.equal(cards(sent).length, 1);
+      assert.match(sent.filter((entry) => entry.msgType === 'text').map((entry) => entry.content).join('\n'), /卡片状态未能更新/);
+    });
+  }
+});
+
+test('a new menu receipt delivery error keeps the action completed', async () => {
+  const fixture = stateFixture();
+  let clearCalls = 0;
+  fixture.state.clearSession = async () => { clearCalls += 1; };
+  const patches = [];
+  const sent = [];
+  const bridge = new FeishuHarnessBridge({
+    client: cardClient(async (outgoing) => {
+      sent.push(outgoing);
+      if (outgoing.msgType === 'text') throw new Error('receipt transport failure');
+    }, async (request) => patches.push(request)),
+    channel: {}, harness: sessionsHarness(1), state: fixture.state,
+    status: bridgeStatus(), allowedSenderOpenIds: new Set(['ou_owner']),
+    logger: { warn() {}, error() {} },
+  });
+  await bridge.accept(event('receipt-failed-menu', '/m', { senderOpenId: 'ou_owner' }));
+  await bridge.waitForIdle();
+  const callback = cardActionEvent('om_card_1', 'new', 'ou_owner', cards(sent)[0].content);
+  await bridge.onCardAction(callback);
+  await bridge.onCardAction(callback);
+  assert.equal(clearCalls, 1);
+  assert.equal(patches.length, 2);
+  assert.match(patches.at(-1).data.content, /已执行：新会话/);
+});
+
+test('confirmed Feishu owner can use menu cards with an empty allowlist while other actors stay blocked', async () => {
+  const fixture = stateFixture();
+  const sent = [];
+  const logs = [];
+  const bridge = new FeishuHarnessBridge({
+    client: cardClient(async (outgoing) => sent.push(outgoing)),
+    channel: {}, harness: sessionsHarness(3), state: fixture.state, status: bridgeStatus(),
+    accessPolicy: configuredAccessPolicy({ channel: 'feishu', config: { ownerOpenIds: ['ou_owner'] } }),
+    logger: { info: (...args) => logs.push(args), warn() {}, error() {} },
+  });
+  await bridge.accept(event('owner-menu', '/m', { senderOpenId: 'ou_owner' }));
+  await bridge.waitForIdle();
+  assert.equal(sent.length, 1);
+  await bridge.onCardAction(cardActionEvent('om_card_1', 'status', 'ou_blocked'));
+  await bridge.waitForIdle();
+  assert.equal(sent.length, 1);
+  assert.deepEqual(logs.at(-1), ['[dsh-feishu] inbound access denied', {
+    botId: 'configured_bot', conversationType: 'direct', reason: 'sender-not-allowed',
+  }]);
+  await bridge.onCardAction(cardActionEvent('om_card_1', 'status', 'ou_owner'));
+  await bridge.waitForIdle();
+  assert.equal(sent.length, 2, 'a confirmed owner can execute the card command');
 });
 
 test('card buttons honor the wildcard sender allowlist', async () => {
@@ -5890,6 +6404,133 @@ test('single-select workspace ids preserve commas', async () => {
   await bridge.waitForIdle();
 
   assert.deepEqual(selected, [workspace]);
+});
+
+test('workspace titles flow through both cards, refreshes, and path-based dropdown/button/number picks', async (t) => {
+  const root = realpathSync(await mkdtemp(join(tmpdir(), 'dsh-workspace-titles-')));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const paths = [join(root, 'a'), join(root, 'b')];
+  paths.forEach((path) => mkdirSync(path));
+  let current = paths[0];
+  let title = '策略研究';
+  let calls = 0;
+  const selected = [];
+  const sent = [];
+  const patches = [];
+  const harness = {
+    ...sessionsHarness(0),
+    currentWorkspace: () => current,
+    listWorkspaces() { assert.fail('metadata request must not also request paths'); },
+    async listWorkspaceEntries({ signal, ...rest }) {
+      assert.ok(signal instanceof AbortSignal);
+      assert.deepEqual(rest, {});
+      calls += 1;
+      return [{ path: paths[1], title: '交流区' }, { path: paths[0], title }];
+    },
+    switchWorkspace: async (path) => { selected.push(path); current = path; return path; },
+  };
+  const bridge = new FeishuHarnessBridge({
+    client: cardClient(async (message) => sent.push(message), async (request) => patches.push(request)),
+    channel: {}, harness, state: stateFixture().state, status: bridgeStatus(),
+    allowedSenderOpenIds: new Set(['ou_owner']),
+  });
+  let input = 0;
+  const send = async (text) => {
+    await bridge.accept(event(`workspace-title-${++input}`, text, { senderOpenId: 'ou_owner' }));
+    await bridge.waitForIdle();
+  };
+  const picker = (card) => selectsFromCard(card).find((item) => item.name === 'workspace_pick');
+  await send('/m');
+  assert.equal(calls, 1);
+  assert.deepEqual(picker(sent.at(-1).content).options, [
+    { text: { tag: 'plain_text', content: '✓ 策略研究' }, value: paths[0] },
+    { text: { tag: 'plain_text', content: '交流区' }, value: paths[1] },
+  ]);
+  await bridge.onCardAction({
+    ...cardActionEvent('om_card_1', 'workspace_pick', 'ou_owner'),
+    action: { value: { action: 'workspace_pick' }, option: paths[1] },
+  });
+  await bridge.waitForIdle();
+  assert.deepEqual(selected, [paths[1]]);
+  assert.equal(picker(JSON.parse(patches.at(-1).data.content)).options[0].text.content, '✓ 交流区');
+  assert.ok(sent.some((item) => item.msgType === 'text'
+    && JSON.parse(item.content).text === `工作区已切换为：${paths[1]}`));
+
+  await send('/workspacelist');
+  const list = buttonsFromCard(sent.at(-1).content).filter((button) => callbackAction(button).startsWith('workspace:'));
+  assert.deepEqual(list.map((button) => button.text.content), ['1. 交流区（当前）', '2. 策略研究']);
+  // Merged command: the bare /workspace and /ws open the same picker card.
+  for (const alias of ['/ws', '/workspace']) {
+    await send(alias);
+    const aliased = buttonsFromCard(sent.at(-1).content)
+      .filter((button) => callbackAction(button).startsWith('workspace:'));
+    assert.deepEqual(
+      aliased.map((button) => button.text.content),
+      ['1. 交流区（当前）', '2. 策略研究'],
+      alias,
+    );
+  }
+  await send('2');
+  assert.deepEqual(selected, [paths[1], paths[0]]);
+
+  await send('/workspacelist');
+  await bridge.onCardAction(cardActionEvent(`om_card_${sent.length}`, `workspace:${paths[1]}`, 'ou_owner'));
+  await bridge.waitForIdle();
+  assert.deepEqual(selected, [paths[1], paths[0], paths[1]]);
+  title = '策略研究新版';
+  await send('/m');
+  assert.equal(picker(sent.at(-1).content).options[1].text.content, title);
+
+  harness.listWorkspaceEntries = async () => { throw new Error('unavailable'); };
+  await send('/m');
+  assert.deepEqual(picker(sent.at(-1).content).options, [
+    { text: { tag: 'plain_text', content: '✓ b' }, value: paths[1] },
+  ]);
+});
+
+test('isolated Feishu workspace listings retain all while bare workspace commands stay disabled', async (t) => {
+  const root = realpathSync(await mkdtemp(join(tmpdir(), 'dsh-isolated-workspace-list-')));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const isolated = join(root, 'conv-generated');
+  mkdirSync(isolated);
+  let enabled = true;
+  const sent = [];
+  const bridge = new FeishuHarnessBridge({
+    client: cardClient(async (message) => sent.push(message)),
+    channel: {},
+    harness: {
+      ...sessionsHarness(0),
+      currentWorkspace: () => root,
+      conversationDirectoryConfig: () => ({ enabled }),
+      conversationDirectoryPaths: () => [isolated],
+      listWorkspaces: async () => [root, isolated],
+    },
+    state: stateFixture().state,
+    status: bridgeStatus(),
+    allowedSenderOpenIds: new Set(['ou_owner']),
+  });
+  let input = 0;
+  const send = async (text) => {
+    await bridge.accept(event(`isolation-list-${++input}`, text, { senderOpenId: 'ou_owner' }));
+    await bridge.waitForIdle();
+  };
+  const listed = () => buttonsFromCard(sent.at(-1).content)
+    .map(callbackAction).filter((action) => action.startsWith('workspace:'));
+
+  await send('/ws');
+  await send('/workspace');
+  assert.equal(sent.length, 0);
+  await send('/workspacelist');
+  assert.deepEqual(listed(), [`workspace:${root}`]);
+  await send('/workspacelist all');
+  assert.deepEqual(listed(), [`workspace:${root}`, `workspace:${isolated}`]);
+  enabled = false;
+  for (const command of ['/ws', '/workspace']) {
+    const before = sent.length;
+    await send(command);
+    assert.equal(sent.length, before + 1);
+    assert.deepEqual(listed(), [`workspace:${root}`]);
+  }
 });
 
 test('menu optional Host data is bounded by the card data timeout', async () => {
@@ -6161,6 +6802,58 @@ function collectVisibleCardText(card) {
   visit(card);
   return fragments.join('\n');
 }
+
+test('model card pagination preserves its page across model selection and refreshes the same card', async () => {
+  const fixture = stateFixture();
+  const sent = [];
+  let selected = { provider: 'provider', model: 'model-00' };
+  const models = Array.from({ length: 45 }, (_, index) => ({ id: `model-${String(index).padStart(2, '0')}`, name: `Model ${index}` }));
+  const catalog = () => ({ groups: [{ id: 'provider', name: 'Provider', models }], current: selected });
+  const bridge = new FeishuHarnessBridge({
+    client: cardClient(async (outgoing) => sent.push(outgoing), async (request) => {
+      const card = JSON.parse(request.data.content);
+      sent.push({ msgType: 'interactive', content: card, patched: request.path.message_id });
+      return { code: 0 };
+    }),
+    channel: {},
+    harness: {
+      ...sessionsHarness(1),
+      listModels: async () => ({ ...catalog(), failures: [] }),
+      workspaceSession: () => ({
+        models: async () => ({ ...catalog(), failures: [] }),
+        sessionExists: async () => true,
+        isRunning: async () => false,
+        hasActiveTurn: async () => false,
+        selectModel: async (selection) => { selected = selection; return { selected }; },
+      }),
+      selectSessionModel: async (_key, value) => { selected = value; return { selected }; },
+    },
+    state: fixture.state,
+    status: bridgeStatus(),
+    allowedSenderOpenIds: new Set(['ou_owner']),
+  });
+  await fixture.state.setSession('p2p:ou_owner', 'session-01');
+  await bridge.accept(event('model-card-open', '/m', { senderOpenId: 'ou_owner' }));
+  await bridge.waitForIdle();
+  const first = sent.at(-1).content;
+  await bridge.onCardAction(cardActionEvent('om_card_1', 'models:2', 'ou_owner'));
+  await bridge.waitForIdle();
+  const third = sent.at(-1).content;
+  assert.match(JSON.stringify(third), /model-40/);
+  assert.equal(selectsFromCard(third).find((select) => select.name === 'model_pick')?.options.length, 5);
+  const modelPick = selectsFromCard(third).find((select) => select.name === 'model_pick');
+  await bridge.onCardAction({
+    operator: { open_id: 'ou_owner' },
+    action: { value: { action: 'model_pick' }, option: modelPick.options[0].value },
+    context: { open_message_id: 'om_card_1' },
+  });
+  await bridge.waitForIdle();
+  assert.equal(selected.model, 'model-40');
+  const refreshed = sent.filter((item) => item.msgType === 'interactive').at(-1);
+  assert.equal(refreshed.patched, 'om_card_1');
+  assert.match(JSON.stringify(refreshed.content), /model-40/);
+  assert.ok(first);
+});
 
 test('/sessions alias uses the interactive session list and paginates across 25 sessions', async () => {
   const fixture = stateFixture();
@@ -7911,7 +8604,7 @@ test('pending question blocks card steer and card stop cancels the question', as
   await questionReady.promise;
 
   await bridge.accept(event('question-new-blocked', '/new', { senderOpenId: 'ou_owner' }));
-  await bridge.onCardAction(cardActionEvent('om_card_1', 'new', 'ou_owner'));
+  await bridge.onCardAction(cardActionEvent('om_card_1', 'new', 'ou_owner', cards(sent)[0].content));
   assert.equal(
     fixture.sessions.get('p2p:ou_owner'),
     'session-active',
@@ -9741,6 +10434,49 @@ function stepCardClient() {
     ids,
   };
 }
+
+test('step card panel settings apply on the next live update and the finished card still collapses', async (t) => {
+  const fixture = stateFixture();
+  const { client, interactiveCreates, patches, text } = stepCardClient();
+  const ready = deferred();
+  const finish = deferred();
+  let update;
+  const bridge = new FeishuHarnessBridge({
+    client, channel: stepPushChannel(), state: fixture.state, status: bridgeStatus(),
+    allowedSenderOpenIds: new Set(['ou_user']), stepPush: true, stepPushMode: 'streaming_card',
+    stepPushClock: stepPushClockFixture().stepPushClock,
+    stepCardPanels: { thinkingExpanded: true, toolsExpanded: false },
+    harness: stepPushHarness(async (_sessionId, _text, options) => {
+      update = options.onUpdate;
+      await update({ type: 'assistant-message', step: 0, text: '正在检查' });
+      await update({ type: 'tool', name: 'bash', arguments: '{"command":"echo first"}' });
+      ready.resolve();
+      await finish.promise;
+      return '最终结果';
+    }),
+  });
+  t.after(() => finish.resolve());
+  const latest = () => patches.at(-1)?.content ?? interactiveCreates.at(-1);
+  const panels = () => latest()?.body.elements.filter((element) => element.tag === 'collapsible_panel') ?? [];
+  const accepted = bridge.accept(event('om_panels_live', '验证面板'));
+  await ready.promise;
+  await eventually(() => panels().length === 2);
+  assert.deepEqual(panels().map((panel) => panel.expanded), [true, false]);
+  const count = interactiveCreates.length + patches.length;
+  bridge.setStepCardPanels({ thinkingExpanded: false, toolsExpanded: true });
+  assert.equal(interactiveCreates.length + patches.length, count, 'changing preferences sends no extra message');
+  await update({ type: 'tool', name: 'bash', arguments: '{"command":"echo second"}' });
+  await eventually(() => patches.length + interactiveCreates.length > count);
+  assert.deepEqual(panels().map((panel) => panel.expanded), [false, true]);
+  finish.resolve();
+  await accepted;
+  await bridge.waitForIdle();
+  assert.equal(interactiveCreates.length, 1);
+  assert.equal(panels()[0].expanded, false);
+  assert.deepEqual(panels()[0].elements.map((panel) => panel.expanded), [false, false]);
+  assert.match(JSON.stringify(latest()), /最终结果/);
+  assert.deepEqual(text, []);
+});
 
 test('step push streaming_card mode: one process card patched in place, answer sealed inside', async () => {
   const fixture = stateFixture();
@@ -12236,7 +12972,7 @@ test('plain IM replies (stepPush off) register the in-flight turn and never open
 });
 
 // Topic deduplication must follow the real Harness session, not message parsing.
-function topicAnchorFixture({ mode = 'text', ...options } = {}) {
+function topicAnchorFixture({ mode = 'text', quotedFile = false, ...options } = {}) {
   const fixture = stateFixture();
   const asked = [];
   const reads = [];
@@ -12250,8 +12986,11 @@ function topicAnchorFixture({ mode = 'text', ...options } = {}) {
   client.im.v1.message.get = async (request) => {
     reads.push(request.path.message_id);
     return { code: 0, data: { items: [{
-      message_id: request.path.message_id, chat_id: 'oc_group', msg_type: 'text',
-      body: { content: JSON.stringify({ text: `REPORT:${request.path.message_id}` }) },
+      message_id: request.path.message_id, chat_id: 'oc_group',
+      msg_type: quotedFile ? 'file' : 'text',
+      body: { content: JSON.stringify(quotedFile
+        ? { file_key: 'quoted-file-key', file_name: 'quoted.txt' }
+        : { text: `REPORT:${request.path.message_id}` }) },
     }] } };
   };
   const harness = {
@@ -12420,6 +13159,27 @@ test('missing AI sessions and stale-workspace retries receive the topic anchor a
   };
   await f.send();
   assert.ok(hasAnchor(f.asked[2].text), 'replacement session must rebuild content with its anchor');
+});
+
+test('stale-workspace retries do not duplicate quoted files or current files', async () => {
+  const f = topicAnchorFixture({ quotedFile: true });
+  let stale = true;
+  const attemptFileCounts = [];
+  const ask = f.harness.ask;
+  f.harness.ask = async (...args) => {
+    attemptFileCounts.push(args[2]?.files?.length ?? 0);
+    assert.equal(attemptFileCounts.at(-1), 1, 'each attempt receives one quoted file');
+    if (stale) {
+      stale = false;
+      await f.state.clearSession('group:oc_group:thread:omt_anchor');
+      throw Object.assign(new Error('workspace moved'), { code: 'workspace-session-stale' });
+    }
+    return ask(...args);
+  };
+  await f.send();
+  assert.deepEqual(attemptFileCounts, [1, 1]);
+  assert.equal(f.asked.length, 1);
+  assert.equal(f.asked[0].options.files.length, 1);
 });
 
 test('topic anchors are isolated between bots and between topics', async () => {
@@ -12884,5 +13644,48 @@ for (const scenario of ['final rewrite', 'shrink and regrow', 'unchanged draft']
     for (let n = 0; n < 6; n++) assert.equal(delivered.join('\n').split(`### FINAL_T${n}`).length - 1, 1);
     assert.match(delivered.at(-1), /_已完成_/);
     assert.deepEqual(fx.text, []);
+  });
+}
+
+for (const mode of ['text', 'stream', 'fallback']) {
+  test(`corrupt Session recovery sends a Feishu notice before the answer (${mode})`, async () => {
+    const fixture = stateFixture([['p2p:ou_user', 'corrupt-session']]);
+    const sent = [];
+    let created = 0;
+    const status = bridgeStatus();
+    const bridge = new FeishuHarnessBridge({
+      client: textClient(message => sent.push(message.text)),
+      ...(mode === 'text' ? {} : { channel: { stream: async (_chatId, input) => {
+        if (mode === 'fallback') throw new Error('stream unavailable');
+        await input.markdown({ setContent: async text => sent.push(text) });
+        return { messageId: 'om_stream' };
+      } } }),
+      state: fixture.state, status,
+      allowedSenderOpenIds: new Set(['ou_user']),
+      harness: {
+        ensureRunning: async () => {},
+        sessionExists: async id => {
+          if (id === 'corrupt-session') throw Object.assign(new Error('unreadable'), { code: 'session-unreadable' });
+          return true;
+        },
+        createSession: async () => { created++; return 'replacement-session'; },
+        ask: async (id, text) => {
+          assert.equal(id, 'replacement-session');
+          assert.equal(text, 'recovery test');
+          assert.equal(sent.length, 1);
+          assert.match(sent[0], /日志已损坏.*新会话/u);
+          return 'RECOVERY_OK';
+        },
+      },
+      logger: { warn() {} },
+    });
+    bridge.accept(event(`om_corrupt_${mode}`, 'recovery test'));
+    await bridge.waitForIdle();
+    assert.equal(created, 1);
+    assert.equal(fixture.sessions.get('p2p:ou_user'), 'replacement-session');
+    assert.equal(sent.length, 2);
+    assert.equal(sent[1], 'RECOVERY_OK');
+    assert.equal(status.messagesReplied, 1);
+    assert.equal(status.lastError, null);
   });
 }

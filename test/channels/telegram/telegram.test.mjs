@@ -33,6 +33,7 @@ import {
   TELEGRAM_COMMAND_MENU,
   normalizeTelegramUpdate,
   telegramCommandMenu,
+  telegramCommandMenuScopes,
   telegramInboundAllowed,
 } from '../../../src/channels/telegram/telegram-runtime.mjs';
 import { TelegramStateStore } from '../../../src/channels/telegram/state-store.mjs';
@@ -120,6 +121,10 @@ async function committedTelegramArtifact(t, {
       ],
     },
   };
+  t.after(registry.openConsumer(sessionId, `rpc-${suffix}`));
+  for (const event of agent.session.events) {
+    registry.observeSessionEvent(agent.session, event);
+  }
   await writeFile(join(workspace, fileName), content);
   const tool = createOutboundArtifactTool({ registry });
   const execution = {
@@ -224,10 +229,14 @@ test('Telegram API registers the command menu and commands-type menu button', as
     TELEGRAM_COMMAND_MENU.filter(({ command }) => ['presetlist', 'presets', 'preset'].includes(command)),
     [
       { command: 'presetlist', description: '列出可用 Agent Preset' },
-      { command: 'presets', description: '列出可用 Agent Preset' },
       { command: 'preset', description: '查看或设置新会话 Agent Preset' },
     ],
   );
+  // Aliases stay typeable but leave the native menu (batch 0).
+  for (const alias of ['ws', 'conversation', 'thread', 'workspaces', 'wsl',
+    'sessions', 'reasonings', 'presets']) {
+    assert.equal(TELEGRAM_COMMAND_MENU.some(({ command }) => command === alias), false, alias);
+  }
   assert.match(calls[0].url.pathname, /setMyCommands$/);
   assert.deepEqual(calls[0].body, { commands: TELEGRAM_COMMAND_MENU });
   assert.match(calls[1].url.pathname, /setChatMenuButton$/);
@@ -542,16 +551,6 @@ test('Telegram document errors retain provider details and use stable artifact r
     status: 400,
     code: 'artifact-too-large',
   }, {
-    body: {
-      ok: false,
-      error_code: 429,
-      description: 'Too Many Requests',
-      parameters: { retry_after: 7 },
-    },
-    status: 429,
-    code: 'artifact-rate-limited',
-    retryAfter: 7,
-  }, {
     body: { ok: false, error_code: 400, description: 'Bad Request: unsupported document' },
     status: 400,
     code: 'artifact-provider-rejected',
@@ -578,6 +577,39 @@ test('Telegram document errors retain provider details and use stable artifact r
       return true;
     });
   }
+});
+
+test('a rate-limited document send is retried and then reported as channel-rate-limit', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  let attempts = 0;
+  const api = new TelegramApi({
+    token: TOKEN,
+    fetchImpl: async () => {
+      attempts += 1;
+      return jsonResponse({
+        ok: false,
+        error_code: 429,
+        description: 'Too Many Requests',
+        parameters: { retry_after: 7 },
+      }, 429);
+    },
+  });
+  const delivery = api.sendDocument({
+    chatId: 123,
+    file: { fileName: 'result.bin', bytes: Buffer.from('result') },
+  }).then(() => null, (error) => error);
+  for (let waited = 0; waited < 3; waited += 1) {
+    await new Promise((resolve) => { setImmediate(resolve); });
+    t.mock.timers.tick(7_000);
+    await new Promise((resolve) => { setImmediate(resolve); });
+  }
+  const error = await delivery;
+  assert.equal(attempts, 4, 'one original call and three retries');
+  assert.equal(error.code, 'channel-rate-limit');
+  assert.equal(error.providerCode, 429);
+  assert.equal(error.status, 429);
+  assert.equal(error.retry_after, 7);
+  assert.equal(error.retryAfter, 7);
 });
 
 test('Telegram document delivery marks post-dispatch failures uncertain but preserves caller aborts', async () => {
@@ -1503,8 +1535,12 @@ test('Telegram runtime validates webhook state and starts a cancellable long pol
   const fakeApi = {
     getMe: async () => ({ id: 123456789, is_bot: true }),
     getWebhookInfo: async () => ({ url: '' }),
-    setMyCommands: async ({ commands }) => {
-      calls.push({ method: 'setMyCommands', commands });
+    deleteMyCommands: async ({ scope } = {}) => {
+      calls.push(scope ? { method: 'deleteMyCommands', scope } : { method: 'deleteMyCommands' });
+      return true;
+    },
+    setMyCommands: async ({ commands, scope }) => {
+      calls.push({ method: 'setMyCommands', commands, scope });
       return true;
     },
     setChatMenuButton: async ({ menuButton }) => {
@@ -1548,9 +1584,18 @@ test('Telegram runtime validates webhook state and starts a cancellable long pol
   assert.equal(proactiveCall.text, 'proactive-test');
   await runtime.stop();
   assert.equal(runtime.status.ready, false);
-  assert.deepEqual(calls[0], { method: 'setMyCommands', commands: TELEGRAM_COMMAND_MENU });
-  assert.deepEqual(calls[1], { method: 'setChatMenuButton', menuButton: COMMANDS_MENU_BUTTON });
-  assert.deepEqual(calls[2], { method: 'getUpdates', offset: -1, timeout: 0 });
+  const [privateMenu, groupMenu] = telegramCommandMenuScopes();
+  // Scoped lists first, legacy default-scope cleanup last (a failed scoped
+  // write must leave the previous menu in place).
+  assert.deepEqual(calls[0], {
+    method: 'setMyCommands', commands: privateMenu.commands, scope: { type: 'all_private_chats' },
+  });
+  assert.deepEqual(calls[1], {
+    method: 'setMyCommands', commands: groupMenu.commands, scope: { type: 'all_group_chats' },
+  });
+  assert.deepEqual(calls[2], { method: 'deleteMyCommands' });
+  assert.deepEqual(calls[3], { method: 'setChatMenuButton', menuButton: COMMANDS_MENU_BUTTON });
+  assert.deepEqual(calls[4], { method: 'getUpdates', offset: -1, timeout: 0 });
   await rm(directory, { recursive: true, force: true });
 });
 
@@ -2111,7 +2156,11 @@ test('Telegram runtime answers a question from an inline-keyboard press', async 
   const questionSent = deferred();
   const answerSubmitted = deferred();
   const releaseTurn = deferred();
+  const finalReplySent = deferred();
+  const drafts = [];
+  const edits = [];
   const sent = [];
+  const deleted = [];
   const acknowledgements = [];
   const keyboardEdits = [];
   let answerUpdateDelivered = false;
@@ -2159,6 +2208,19 @@ test('Telegram runtime answers a question from an inline-keyboard press', async 
       });
     },
     sendChatAction: async () => true,
+    sendRichMessageDraft: async (payload) => { drafts.push(payload); return true; },
+    editMessageText: async (payload) => {
+      edits.push(payload);
+      return true;
+    },
+    sendRichMessage: async ({ richMessage }) => {
+      const messageId = nextOutboundMessageId;
+      nextOutboundMessageId += 1;
+      sent.push({ text: richMessage.markdown });
+      if (richMessage.markdown === '已选择生产环境') finalReplySent.resolve();
+      return { message_id: messageId };
+    },
+    deleteMessage: async ({ messageId }) => { deleted.push(messageId); return true; },
     sendMessage: async ({ text, replyMarkup }) => {
       const messageId = nextOutboundMessageId;
       nextOutboundMessageId += 1;
@@ -2208,6 +2270,7 @@ test('Telegram runtime answers a question from an inline-keyboard press', async 
   const runtime = new TelegramRuntime({
     config: {
       botId: 'telegram_card',
+      thinkingTraces: false,
       platformId: '123456789',
       username: 'HarnessBot',
     },
@@ -2267,9 +2330,162 @@ test('Telegram runtime answers a question from an inline-keyboard press', async 
       }
     })(), 'the cursor did not advance past the press update');
     assert.equal(state.hasSeen('11'), true);
+    assert.equal(sent[0].text, '正在处理…');
+    releaseTurn.resolve();
+    await bounded(finalReplySent.promise, 'the answer was not sent as a new message');
+    assert.equal(drafts.length, 0);
+    assert.equal(edits.length, 0, 'the answer never rewrites the placeholder');
+    assert.deepEqual(deleted, [900], 'the finished turn drops its placeholder');
   } finally {
     releaseTurn.resolve();
     await runtime.stop();
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test('Telegram private placeholder streams keep controls responsive and ordinary follow-ups queued', async (t) => {
+  for (const action of ['stop', 'steer', 'follow-up']) {
+    await t.test(action, async () => {
+      const state = memoryState();
+      await state.setSession('direct:42:66', 'session-private-controls');
+      const started = deferred();
+      const release = deferred();
+      const asked = [];
+      const controls = [];
+      const sent = [];
+      const edits = [];
+      const deleted = [];
+      const drafts = [];
+      let promptControl;
+      let running = false;
+      const session = {
+        sessionExists: async () => true,
+        ask: async (text, options) => {
+          asked.push(text);
+          if (asked.length > 1) return 'follow-up answer';
+          promptControl = options.control;
+          running = true;
+          await options.onUpdate({ type: 'tool', name: 'bash' });
+          started.resolve();
+          try {
+            await release.promise;
+            return 'final answer';
+          } finally {
+            running = false;
+          }
+        },
+        stopActiveTurn: async (control) => {
+          controls.push({ control });
+          assert.equal(running, true);
+          const error = new Error('stopped');
+          error.code = 'turn-stopped';
+          release.reject(error);
+          return true;
+        },
+        steerActiveTurn: async (text, control) => {
+          controls.push({ text, control });
+          assert.equal(running, true);
+          return true;
+        },
+      };
+      const client = new TelegramBotClient({
+        api: {
+          sendChatAction: async () => true,
+          setMessageReaction: async () => true,
+          sendMessage: async (payload) => { sent.push(payload); return { message_id: 900 + sent.length }; },
+          sendRichMessage: async (payload) => {
+            sent.push({ ...payload, text: payload.richMessage?.markdown });
+            return { message_id: 900 + sent.length };
+          },
+          editMessageText: async (payload) => { edits.push(payload); return true; },
+          deleteMessage: async (payload) => { deleted.push(payload.messageId); return true; },
+          sendRichMessageDraft: async (payload) => { drafts.push(payload); return true; },
+        },
+        logger: { warn() {} },
+      });
+      const bridge = new TelegramHarnessBridge({
+        bot: client, state, thinkingTraces: false,
+        harness: { workspaceSession: () => session },
+        logger: { warn() {}, error() {} },
+      });
+      const incoming = (id, text) => normalizeTelegramUpdate({
+        update_id: id,
+        message: { message_id: id, message_thread_id: 66,
+          chat: { id: 42, type: 'private' }, from: { id: 42 }, text },
+      }, { botId: '123456789' });
+      const prompt = bridge.accept(incoming(100, 'long task'));
+      let followUp;
+      try {
+        await bounded(started.promise, 'the original prompt did not start');
+        assert.equal(drafts.length, 0, 'the running turn must never block the composer with a Draft');
+        assert.equal(sent.length, 1);
+        assert.equal(sent[0].messageThreadId, 66);
+        assert.equal(edits[0].messageId, 901);
+        if (action === 'follow-up') {
+          followUp = bridge.accept(incoming(101, 'ordinary follow-up'));
+          await new Promise((resolve) => setImmediate(resolve));
+          assert.deepEqual(asked, ['long task']);
+          assert.equal(running, true);
+          release.resolve();
+          await bounded(Promise.all([prompt, followUp]), 'queued follow-up did not complete');
+          assert.deepEqual(asked, ['long task', 'ordinary follow-up']);
+          assert.equal(controls.length, 0);
+          assert.equal(sent.length, 5, 'one placeholder and one answer per prompt, plus the queue receipt');
+          assert.match(sent[1].text, /已排队/);
+          assert.deepEqual(sent.map((entry) => entry.text).filter((text) => !/已排队/.test(text)),
+            ['正在处理…', 'final answer', '正在处理…', 'follow-up answer'],
+            'every turn answers in its own message');
+          assert.deepEqual(edits.map((entry) => entry.messageId), [901],
+            'progress stays on the placeholder');
+          assert.deepEqual(deleted, [901, 904], 'every finished turn drops its placeholder');
+        } else {
+          await bounded(bridge.accept(incoming(101, action === 'stop' ? '/stop' : '/steer add ANDROID_OK')),
+            'control command waited for the ordinary prompt queue');
+          assert.deepEqual(controls[0].control, promptControl);
+          assert.deepEqual(asked, ['long task']);
+          if (action === 'steer') {
+            assert.equal(controls[0].text, 'add ANDROID_OK');
+            assert.equal(running, true);
+            release.resolve();
+          }
+          await bounded(prompt, 'the original prompt did not settle');
+          assert.ok(sent.some(({ text }) => text.includes(action === 'stop' ? '已请求停止当前任务' : '已提交补充指令')));
+          assert.equal(sent.at(-1).text, action === 'stop' ? '已停止。' : 'final answer',
+            'the terminal message is a new message, not a placeholder edit');
+          assert.deepEqual(edits.map((entry) => entry.messageId), [901],
+            'progress stays on the placeholder');
+          assert.deepEqual(deleted, [901], 'the finished turn drops its placeholder');
+        }
+        assert.equal(drafts.length, 0);
+      } finally {
+        release.resolve();
+        await Promise.allSettled([prompt, followUp]);
+      }
+    });
+  }
+});
+
+test('Telegram private placeholder creation failure still delivers the final answer once', async () => {
+  const calls = [];
+  let asks = 0;
+  const client = new TelegramBotClient({
+    api: {
+      sendChatAction: async () => true,
+      sendMessage: async () => { calls.push('placeholder'); throw new Error('placeholder unavailable'); },
+      sendRichMessage: async () => { calls.push('final'); return { message_id: 901 }; },
+      sendRichMessageDraft: async () => { calls.push('draft'); return true; },
+    },
+  });
+  const bridge = new TelegramHarnessBridge({
+    bot: client, state: memoryState(), thinkingTraces: false,
+    harness: { createSession: async () => 'session-fallback', ask: async () => { asks += 1; return 'final'; } },
+    logger: { warn() {}, error() {} },
+  });
+  const receipt = await bridge.accept(normalizeTelegramUpdate({
+    update_id: 100,
+    message: { message_id: 100, chat: { id: 42, type: 'private' }, from: { id: 42 }, text: 'hello' },
+  }, { botId: '123456789' }));
+  assert.equal(asks, 1);
+  assert.deepEqual(calls, ['placeholder', 'final']);
+  assert.equal(receipt.deliveryOutcome, 'sent');
 });

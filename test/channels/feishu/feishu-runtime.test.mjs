@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { FeishuRuntime } from '../../../src/channels/feishu/feishu-runtime.mjs';
+import { FeishuHarnessBridge } from '../../../src/channels/feishu/bridge.mjs';
 import { rememberConnectionTestTarget } from '../../../src/channels/shared/connection-test.mjs';
+import { createSessionSyncCoordinator } from '../../../plugin-src/host/session-sync-coordinator.mjs';
 
 class FakeClient {
   static instances = [];
@@ -463,6 +465,64 @@ test('FeishuRuntime stop waits for a pending Harness check and prevents startup 
   assert.deepEqual(runtime.status, stopped);
 });
 
+test('FeishuRuntime bounds the bridge idle wait during stop', async t => {
+  const warnings = [];
+  const runtime = await startRuntimeForProbe({
+    slashCommands: false,
+    logger: { warn: (message) => warnings.push(message) },
+  });
+  const idle = deferred();
+  t.after(() => idle.resolve());
+  t.mock.method(FeishuHarnessBridge.prototype, 'waitForIdle', () => idle.promise);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+
+  let stopped;
+  const stopping = runtime.stop().then((status) => { stopped = status; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(runtime.status.ready, false);
+  assert.equal(FakeWSClient.instances[0].state, 'closed');
+  assert.equal(stopped, undefined);
+
+  t.mock.timers.tick(1_999);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stopped, undefined);
+  assert.deepEqual(warnings, []);
+
+  t.mock.timers.tick(1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.notEqual(stopped, undefined, 'stop must finish after the 2000ms bridge idle deadline');
+  await stopping;
+  assert.equal(stopped.ready, false);
+  assert.equal(stopped.feishuLongConnectionState, 'idle');
+  assert.equal(stopped.slashCommandRegistration, 'idle');
+  assert.equal(stopped.error, null);
+  assert.equal(stopped.lastError, null);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /bridge idle wait timed out after 2000ms/);
+});
+
+test('FeishuRuntime unreferences and clears the idle deadline when the bridge is already idle', async t => {
+  const runtime = await startRuntimeForProbe({ slashCommands: false });
+  t.mock.method(FeishuHarnessBridge.prototype, 'waitForIdle', async () => {});
+  const setTimer = globalThis.setTimeout;
+  const clearTimer = globalThis.clearTimeout;
+  let timer;
+  t.after(() => clearTimer(timer));
+  const setTimeoutMock = t.mock.method(globalThis, 'setTimeout', (...args) => {
+    timer = setTimer(...args);
+    t.mock.method(timer, 'unref');
+    return timer;
+  });
+  const clearTimeoutMock = t.mock.method(globalThis, 'clearTimeout');
+
+  const stopped = await runtime.stop();
+  assert.equal(stopped.feishuLongConnectionState, 'idle');
+  assert.equal(setTimeoutMock.mock.callCount(), 1);
+  assert.equal(setTimeoutMock.mock.calls[0].arguments[1], 2_000);
+  assert.equal(timer.unref.mock.callCount(), 1);
+  assert.ok(clearTimeoutMock.mock.calls.some((call) => call.arguments[0] === timer));
+});
+
 test('FeishuRuntime fails closed when the initial WebSocket handshake times out', async () => {
   const runtime = new FeishuRuntime({
     lark: fakeLark(),
@@ -527,6 +587,85 @@ async function startRuntimeForProbe(options = {}) {
   FakeWSClient.instances[0].becomeReady();
   await starting;
   return runtime;
+}
+
+for (const phase of ['user echo', 'final fallback']) {
+  test(`a hanging proactive ${phase} times out so other targets and the next turn continue`, { timeout: 5_000 }, async t => {
+    const runtime = await startRuntimeForProbe({ requestTimeoutMs: 15_000 });
+    t.after(() => runtime.stop());
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const pending = deferred();
+    t.after(() => pending.resolve({ code: 0 }));
+    const delivered = [];
+    let held = false;
+    const client = FakeClient.instances[0];
+    const create = client.im.v1.message.create;
+    client.im.v1.message.create = async request => {
+      const text = JSON.parse(request.data.content).text;
+      if (!held && text.startsWith(phase === 'user echo' ? '[来自 DSH]' : '[DSH 助手]')) {
+        held = true;
+        return pending.promise;
+      }
+      return create(request);
+    };
+    const coordinator = createSessionSyncCoordinator({
+      deliveryService: {
+        listSessionSyncTargets: async () => [
+          { channel: 'feishu', botId: 'bot_probe', targetId: 'owner' },
+          { channel: 'telegram', botId: 'other', targetId: 'owner' },
+        ],
+        sendSessionSyncText: async (botId, targetId, sessionId, text) => {
+          if (botId === 'other') { delivered.push(text); return; }
+          return runtime.sendProactiveText({ kind: 'user', route: { openId: 'ou_owner' } }, text);
+        },
+      },
+      logger: { warn() {} },
+    });
+    t.after(() => coordinator.close());
+    const emitTurn = turn => {
+      for (const event of [
+        { type: 'turn/start', data: { turn } },
+        { type: 'user/message', surfaceOp: 'append', data: { content: [{ type: 'text', text: `question ${turn}` }] } },
+        { type: 'assistant/message', surfaceOp: 'append', data: { turn, step: 1, message: { content: [{ type: 'text', text: `answer ${turn}` }] } } },
+        { type: 'turn/end', data: { turn, reason: { kind: 'completed' } } },
+      ]) void coordinator.enqueue('session', event, 'dsh');
+    };
+    emitTurn(1);
+    await waitFor(() => held);
+    emitTurn(2);
+    t.mock.timers.tick(15_000);
+    await coordinator.whenIdle();
+    assert.ok(delivered.includes('[DSH 助手]\n\nanswer 1'));
+    assert.ok(delivered.includes('[DSH 助手]\n\nanswer 2'));
+    assert.ok(FakeClient.sent.some(request => JSON.parse(request.data.content).text === '[DSH 助手]\n\nanswer 2'));
+    const sent = FakeClient.sent.length;
+    pending.resolve({ code: 0 });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(FakeClient.sent.length, sent, 'late acceptance must not retry or resume the old turn');
+  });
+}
+
+for (const cause of ['caller', 'runtime']) {
+  test(`a hanging proactive delivery releases on ${cause} cancellation`, { timeout: 5_000 }, async t => {
+    const runtime = await startRuntimeForProbe();
+    t.after(() => runtime.stop());
+    const pending = deferred();
+    t.after(() => pending.resolve({ code: 0 }));
+    const entered = deferred();
+    FakeClient.instances[0].im.v1.message.create = async () => {
+      entered.resolve();
+      return pending.promise;
+    };
+    const controller = new AbortController();
+    const sending = runtime.sendProactiveText({ kind: 'user', route: { openId: 'ou_owner' } }, 'cancel me', {
+      signal: controller.signal,
+    });
+    const rejected = assert.rejects(sending, { name: 'AbortError' });
+    await entered.promise;
+    if (cause === 'caller') controller.abort();
+    else await runtime.stop();
+    await rejected;
+  });
 }
 
 test('FeishuRuntime drains failed and idle WS resources before creating a replacement', async () => {
@@ -639,7 +778,7 @@ test('FeishuRuntime dispatcher ACKs immediately while card work is still pending
   await runtime.stop();
 });
 
-test('FeishuRuntime start waits for an idle-draining stop and preserves the new resources', async () => {
+test('FeishuRuntime cancels a hanging card before restarting and ignores its late result', async t => {
   const seen = new Set();
   const runtime = await startRuntimeForProbe({
     logger: { info() {}, warn() {}, error() {} },
@@ -677,6 +816,7 @@ test('FeishuRuntime start waits for an idle-draining stop and preserves the new 
 
   const patchEntered = deferred();
   const patchReleased = deferred();
+  t.after(() => patchReleased.resolve({ code: 0 }));
   FakeClient.instances[0].im.v1.message.patch = async () => {
     patchEntered.resolve();
     return patchReleased.promise;
@@ -702,13 +842,10 @@ test('FeishuRuntime start waits for an idle-draining stop and preserves the new 
     return status;
   });
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(stopSettled, false);
+  assert.equal(stopSettled, true);
   assert.equal(restartSettled, false);
-  assert.equal(FakeWSClient.instances.length, 1);
-  assert.equal(FakeClient.instances.length, 1);
   assert.equal(firstWsClient.state, 'closed');
 
-  patchReleased.resolve({ code: 0, data: { message_id: 'message-1' } });
   const stopped = await stopping;
   assert.equal(stopped.ready, false);
   assert.equal(stopped.feishuLongConnectionState, 'idle');
@@ -723,6 +860,10 @@ test('FeishuRuntime start waits for an idle-draining stop and preserves the new 
   const restarted = await restarting;
   assert.equal(restarted.ready, true);
   assert.equal(restarted.feishuLongConnectionState, 'connected');
+  assert.equal(secondWsClient.state, 'connected');
+  patchReleased.resolve({ code: 0, data: { message_id: 'message-1' } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(runtime.status.ready, true);
   assert.equal(secondWsClient.state, 'connected');
 
   const sentBeforeLateDispatch = FakeClient.sent.length;
@@ -881,4 +1022,78 @@ test('FeishuRuntime rejects imprecise probe operators and probes before connecti
     /precise Feishu operator/,
   );
   await runtime.stop();
+});
+
+
+test('external group handler awaits durable acceptance and cannot start the native bridge or card actions', async () => {
+  let calls = 0;
+  const committed = deferred();
+  const runtime = new FeishuRuntime({
+    lark: fakeLark(), appId: 'app', appSecret: 'secret', ownerOpenIds: ['*'],
+    consumerMode: 'external-consumer',
+    acceptExternal: async () => { calls++; await committed.promise; return { accepted: true }; },
+    harness: { async ensureRunning() {}, ask() { throw new Error('native bridge must not execute'); } },
+    state: { hasSeen() { throw new Error('standalone state must not be consulted'); } },
+  });
+  const starting = runtime.start();
+  await waitFor(() => FakeWSClient.instances.length === 1);
+  const socket = FakeWSClient.instances[0];
+  socket.becomeReady(); await starting;
+  let acknowledged = false;
+  const pending = socket.dispatcher.handlers['im.message.receive_v1']({ message: { chat_type: 'group', thread_id: 'thread' } }).then(() => { acknowledged = true; });
+  await Promise.resolve();
+  assert.equal(calls, 1); assert.equal(acknowledged, false);
+  socket.dispatcher.handlers['card.action.trigger']({});
+  assert.equal(runtime.status.cardActionsReceived, 0);
+  committed.resolve(); await pending;
+  assert.equal(acknowledged, true);
+  await runtime.stop();
+});
+
+test('checked replies validate the original source before sending and retain unknown SDK outcomes', async () => {
+  const runtime = new FeishuRuntime({ lark: fakeLark(), appId: 'app', appSecret: 'secret', ownerOpenIds: ['*'],
+    consumerMode: 'external-consumer', harness: { async ensureRunning() {} }, state: {} });
+  const starting = runtime.start();
+  await waitFor(() => FakeWSClient.instances.length === 1);
+  FakeWSClient.instances[0].becomeReady(); await starting;
+  const source = { message_id: 'message', chat_id: 'chat', thread_id: 'thread', root_id: 'root', parent_id: 'parent', sender: { sender_type: 'user', id_type: 'open_id', id: 'human' } };
+  const client = FakeClient.instances[0];
+  client.im.v1.message.get = async () => ({ code: 0, data: { items: [source] } });
+  let sends = 0;
+  client.im.v1.message.reply = async request => {
+    sends++;
+    assert.equal(request.path.message_id, 'message');
+    assert.equal(request.data.reply_in_thread, true);
+    return { code: 0, data: { message_id: 'reply' } };
+  };
+  const route = { messageId: 'message', conversationId: 'chat', actorId: 'human', threadId: 'thread', rootId: 'root', parentId: 'parent' };
+  assert.deepEqual(await runtime.replyChecked(route, 'hello'), { sent: true, messageId: 'reply' });
+  source.thread_id = 'other-topic';
+  await assert.rejects(runtime.replyChecked(route, 'hello'), { code: 'stale-route' });
+  assert.equal(sends, 1);
+  source.thread_id = 'thread';
+  source.chat_id = 'other';
+  await assert.rejects(runtime.replyChecked(route, 'hello'), { code: 'stale-route' });
+  assert.equal(sends, 1);
+  source.chat_id = 'chat';
+  client.im.v1.message.reply = async () => { sends++; throw new Error('ambiguous timeout'); };
+  await assert.rejects(runtime.replyChecked(route, 'hello'), { code: 'reply-result-unknown' });
+  assert.equal(sends, 2);
+  await runtime.stop();
+});
+
+test('checked history refuses a result after the runtime stops during SDK listing', async () => {
+ const runtime=new FeishuRuntime({lark:fakeLark(),appId:'app',appSecret:'secret',ownerOpenIds:['*'],
+ consumerMode:'external-consumer',harness:{async ensureRunning(){}},state:{}});
+ const starting=runtime.start();await waitFor(()=>FakeWSClient.instances.length===1);
+ FakeWSClient.instances[0].becomeReady();await starting;
+ const client=FakeClient.instances[0];
+ const source={message_id:'anchor',chat_id:'chat',create_time:'1790830000000',
+ sender:{sender_type:'user',id_type:'open_id',id:'human'}};
+ client.im.v1.message.get=async()=>({code:0,data:{items:[source]}});
+ let entered,release;const started=new Promise(resolve=>{entered=resolve;});const gate=new Promise(resolve=>{release=resolve;});
+ client.im.v1.message.list=async()=>{entered();await gate;return {code:0,data:{items:[],has_more:false}};};
+ const pending=runtime.historyChecked({botId:'bot',appId:'app',botOpenId:'bot',fingerprint:'a'.repeat(64)},
+ {messageId:'anchor',conversationId:'chat',actorId:'human'},{scope:'group',limit:1});
+ await started;await runtime.stop();release();await assert.rejects(pending,{code:'bot-not-connected'});
 });

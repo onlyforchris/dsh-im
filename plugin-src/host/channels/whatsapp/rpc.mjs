@@ -1,7 +1,9 @@
+import { SET_MESSAGE_MODE_ENDPOINT, validMessageModePayload } from '../../../../src/channels/shared/message-mode.mjs';
 import { createConnectionDiagnostics, diagnosticRpcResult } from '../../../../src/channels/shared/connection-error.mjs';
 import { SET_ALIAS_ENDPOINT, validAliasPayload } from '../shared/bot-alias-rpc.mjs';
 import { registerManagementRpc } from '../../../management-rpc.mjs';
 import QRCode from 'qrcode';
+import { qrEncodingError } from '../../../../src/channels/shared/qr-encoding-error.mjs';
 
 import { publicConnectionTestResult } from '../../../../src/channels/shared/connection-test.mjs';
 import { SET_ACCESS_POLICY_ENDPOINT, validAccessPolicyPayload } from '../shared/access-policy-rpc.mjs';
@@ -25,6 +27,7 @@ export const WHATSAPP_ENDPOINTS = Object.freeze({
   setModel: SET_MODEL_ENDPOINT,
   setAgentPreset: SET_AGENT_PRESET_ENDPOINT,
   setContextEnhancement: SET_CONTEXT_ENHANCEMENT_ENDPOINT,
+  setBusyMessageMode: SET_MESSAGE_MODE_ENDPOINT,
 });
 export const WHATSAPP_RPC_ENDPOINTS = Object.freeze(Object.values(WHATSAPP_ENDPOINTS));
 
@@ -79,6 +82,10 @@ function payloadFailure(endpoint, payload) {
     return validAgentPresetPayload(payload)
       ? null : '请选择 Agent Preset。';
   }
+  if (endpoint === WHATSAPP_ENDPOINTS.setBusyMessageMode) {
+    return validMessageModePayload(payload)
+      ? null : '请提交有效的消息处理方式。';
+  }
   if (endpoint === WHATSAPP_ENDPOINTS.setContextEnhancement) {
     return validContextEnhancementPayload(payload)
       ? null : '请提交有效的上下文增强设置。';
@@ -128,7 +135,10 @@ export function createWhatsappRpcHandler(controller, { encodeQr = qrDataUrl } = 
     let encoded = qrCache.get(value);
     if (!encoded) {
       if (qrCache.size >= 16) qrCache.delete(qrCache.keys().next().value);
-      encoded = Promise.resolve().then(() => encodeQr(value));
+      encoded = Promise.resolve().then(() => encodeQr(value)).catch(error => {
+        if (qrCache.get(value) === encoded) qrCache.delete(value);
+        throw qrEncodingError(error);
+      });
       qrCache.set(value, encoded);
     }
     return encoded;
@@ -191,6 +201,11 @@ export function createWhatsappRpcHandler(controller, { encodeQr = qrDataUrl } = 
         value = await publicStatus(
           await controller.updateModel(payload.botId, payload.model),
           cachedEncode,
+        );
+      } else if (endpoint === WHATSAPP_ENDPOINTS.setBusyMessageMode) {
+        if (typeof controller.updateBusyMessageMode !== 'function') throw new Error('Message mode update is unavailable');
+        value = await controller.updateBusyMessageMode(
+          payload.botId, payload.busyMessageMode, (status) => publicStatus(status, cachedEncode),
         );
       } else if (endpoint === WHATSAPP_ENDPOINTS.setContextEnhancement) {
         if (typeof controller.updateContextEnhancement !== 'function') throw new Error('Context enhancement update is unavailable');

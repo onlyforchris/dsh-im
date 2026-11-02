@@ -1,8 +1,13 @@
+import { createHash } from 'node:crypto';
 import {
   deliverySuggestionsFromSessions,
   privateConversationKeyMatchesTarget,
+  privateDeliverySuggestionFromConversationKey,
   resolvePrivateConversationKey,
 } from './delivery-suggestions.mjs';
+import { parseConversationKey } from '../../src/channels/shared/conversation/describe.mjs';
+import { withSessionBindingLock } from '../../src/channels/shared/session-binding-lock.mjs';
+import { dsBotError } from './ds-bot-client.mjs';
 
 const CHANNELS = new Set([
   'weixin',
@@ -191,6 +196,107 @@ function sessionSyncConfigs(workspaces, botId) {
   return botId === undefined ? targets : targets.filter((target) => target.botId === botId);
 }
 
+/** Bindings own their private-chat sync while active. Ordinary delivery
+ * settings remain saved and resume after unbinding, without duplicate mirrors. */
+export function configuredSessionSyncTargets(workspaces, botId) {
+  const bindings = (workspaces.listDsBotBindings?.(botId) ?? []).map((binding) => ({
+    ...binding,
+    targetId: `__dsbot_${createHash('sha256').update(binding.conversationKey).digest('hex').slice(0, 32)}`,
+  }));
+  return [
+    ...bindings,
+    ...sessionSyncConfigs(workspaces, botId).filter((target) => !bindings.some((binding) => (
+      binding.botId === target.botId && binding.conversationKey === target.conversationKey
+    ))),
+  ];
+}
+
+export function sessionSyncTarget(channel, workspaces, configured) {
+  if (!configured) return null;
+  if (!configured.dsBotId) return workspaces.deliveryTargetFor(configured.botId, configured.targetId);
+  const target = privateDeliverySuggestionFromConversationKey(channel, configured.conversationKey);
+  return target ? { ...target, targetId: configured.targetId } : null;
+}
+
+/** Describe the conversation of one channel's state that owns `sessionId`. */
+function describeFromState(state, sessionId, channel) {
+  const sessions = stateSessions(state);
+  if (!sessions) return null;
+  const conversationKey = Object.keys(sessions).find((key) => sessions[key] === sessionId);
+  if (!conversationKey) return null;
+  const snapshot = typeof state.snapshot === 'function' ? state.snapshot() : null;
+  const authors = snapshot?.authors && typeof snapshot.authors === 'object'
+    && !Array.isArray(snapshot.authors) ? snapshot.authors : null;
+  const parsed = parseConversationKey(conversationKey, { channel });
+  const author = authors?.[conversationKey] ?? null;
+  return {
+    conversationKey,
+    chatType: parsed?.chatType ?? null,
+    chatId: parsed?.chatId ?? null,
+    threadId: parsed?.threadId ?? null,
+    chatTitle: null,
+    senderId: author?.senderId ?? parsed?.senderId ?? null,
+    senderName: author?.senderName ?? null,
+    senderUsername: author?.senderUsername ?? null,
+    senderIsBot: author ? author.isBot === true : null,
+  };
+}
+
+function botIdsOfChannel(workspaces) {
+  try {
+    return workspaces.listBotIds();
+  } catch {
+    return [];
+  }
+}
+
+/** The bot and the conversation binding that own `sessionId`, awaiting each state. */
+async function findBySession(workspaces, stateOf, sessionId, channel) {
+  if (typeof sessionId !== 'string' || sessionId === '') return null;
+  for (const botId of botIdsOfChannel(workspaces)) {
+    let state;
+    try {
+      state = await stateOf(botId);
+    } catch {
+      continue;
+    }
+    let binding = null;
+    try {
+      binding = describeFromState(state, sessionId, channel);
+    } catch {
+      continue;
+    }
+    if (binding !== null) return { botId, binding };
+  }
+  return null;
+}
+
+/**
+ * The same lookup over states that are already in memory. Never awaits: prompt
+ * assembly is synchronous, and a lookup that cannot answer right now has to say
+ * `null` instead of starting work the caller will never see.
+ */
+function findBySessionSync(workspaces, stateOf, sessionId, channel) {
+  if (typeof sessionId !== 'string' || sessionId === '') return null;
+  for (const botId of botIdsOfChannel(workspaces)) {
+    let state;
+    try {
+      state = stateOf(botId);
+    } catch {
+      continue;
+    }
+    if (!state) continue;
+    let binding = null;
+    try {
+      binding = describeFromState(state, sessionId, channel);
+    } catch {
+      continue;
+    }
+    if (binding !== null) return { botId, binding };
+  }
+  return null;
+}
+
 function stateSessions(state) {
   if (!state || typeof state.snapshot !== 'function') return null;
   const sessions = state.snapshot()?.sessions;
@@ -220,7 +326,14 @@ function sessionSyncView(channel, target, sessions, configured) {
 }
 
 /** Bind one channel's existing workspace store and unwrapped controller to DeliveryService. */
-export function createDeliveryAdapter({ channel, workspaces, coreController, stateFor }) {
+export function createDeliveryAdapter({
+  channel,
+  workspaces,
+  coreController,
+  stateFor,
+  stateForSync = null,
+  dsBot,
+}) {
   if (!supportsDeliveryChannel(channel)) throw new TypeError(`Unsupported delivery channel: ${channel}`);
   if (!workspaces || typeof workspaces !== 'object') {
     throw new TypeError('delivery adapter requires a workspace store');
@@ -231,10 +344,118 @@ export function createDeliveryAdapter({ channel, workspaces, coreController, sta
   if (typeof stateFor !== 'function') {
     throw new TypeError('delivery adapter requires a bot state getter');
   }
+  const syncTarget = async (botId, targetId, sessionId, { allowParts = true } = {}) => {
+    const configured = configuredSessionSyncTargets(workspaces, botId).find((entry) => entry.targetId === targetId);
+    const target = sessionSyncTarget(channel, workspaces, configured);
+    if (!configured || !target || !privateConversationKeyMatchesTarget(channel, configured.conversationKey, target)) {
+      throw sessionSyncUnavailable('Session sync target is no longer enabled');
+    }
+    const sessions = stateSessions(await stateFor(botId));
+    const bot = configured.dsBotId ? await dsBot?.resolve(configured.dsBotId) : null;
+    const matches = configured.dsBotId
+      ? bot && (bot.sessionId === sessionId || (allowParts && bot.parts?.includes(sessionId)))
+      : sessions?.[configured.conversationKey] === sessionId;
+    if (!matches) {
+      throw sessionSyncUnavailable('Session sync target is no longer bound to this Session');
+    }
+    return { target, conversationKey: configured.conversationKey, dsBotId: configured.dsBotId };
+  };
+  const describeSyncTarget = async (botId, targetId, sessionId) => {
+    const { conversationKey } = await syncTarget(botId, targetId, sessionId);
+    return { conversationKey };
+  };
+  const presentSyncInteraction = async (method, botId, targetId, sessionId, interaction, options = {}) => {
+    // Text from an old part may finish delivery, but a new question answer must
+    // still belong to the Bot's current session.
+    const routeOptions = { allowParts: method !== 'presentSessionSyncQuestion' };
+    const original = await syncTarget(botId, targetId, sessionId, routeOptions);
+    if (typeof coreController[method] !== 'function') return false;
+    const validate = async () => {
+      const current = await syncTarget(botId, targetId, sessionId, routeOptions);
+      if (current.conversationKey !== original.conversationKey || current.dsBotId !== original.dsBotId
+        || options.signal?.aborted) throw sessionSyncUnavailable('The interaction route changed or ended');
+    };
+    const guarded = {
+      ...interaction,
+      respond: async (result, responseOptions) => {
+        try { await validate(); }
+        catch (error) {
+          await interaction.withdraw?.();
+          throw Object.assign(new Error('Interaction route is no longer available', { cause: error }), {
+            code: 'interaction-not-pending',
+          });
+        }
+        return interaction.respond(result, responseOptions);
+      },
+    };
+    return coreController[method](botId, original.target, guarded, {
+      ...options, key: original.conversationKey, validate,
+    });
+  };
   return Object.freeze({
     channel,
+    consumeInbound: (botId, options) => {
+      if (typeof coreController.consumeInbound !== 'function')
+        throw Object.assign(new Error('capability-unavailable'), { code: 'capability-unavailable' });
+      return coreController.consumeInbound(botId, options);
+    },
+    historyChecked: (botId, route, query, options) => {
+      if (typeof coreController.historyChecked !== 'function')
+        throw Object.assign(new Error('capability-unavailable'), { code: 'capability-unavailable' });
+      return coreController.historyChecked(botId, route, query, options);
+    },
+    replyChecked: (botId, route, text, options) => {
+      if (typeof coreController.replyChecked !== 'function')
+        throw Object.assign(new Error('capability-unavailable'), { code: 'capability-unavailable' });
+      return coreController.replyChecked(botId, route, text, options);
+    },
+    describeAccount: (botId) => {
+      if (typeof coreController.describeDeliveryAccount !== 'function') {
+        const error = new Error('Verified account capability unavailable');
+        error.code = 'capability-unavailable';
+        throw error;
+      }
+      return coreController.describeDeliveryAccount(botId);
+    },
     ownsBot: (botId) => workspaces.has(botId),
     listBots: () => workspaces.listBotIds(),
+    listDsBotBindings: () => workspaces.listDsBotBindings().filter(({ conversationKey }) => (
+      privateDeliverySuggestionFromConversationKey(channel, conversationKey)
+    )),
+    /**
+     * Reverse lookup for a session: which conversation of this channel owns it.
+     * Reads only what the channel already keeps (its state file), never the
+     * network, and never throws — an unknown session is simply `null`.
+     */
+    async describeConversationBySession(sessionId) {
+      const found = await findBySession(workspaces, stateFor, sessionId, channel);
+      if (found === null) return null;
+      const { botId, binding } = found;
+      let botName = null;
+      try {
+        if (typeof coreController.describeDeliveryAccount === 'function') {
+          botName = (await coreController.describeDeliveryAccount(botId))?.name ?? null;
+        }
+      } catch {
+        botName = null;
+      }
+      return { channel, botId, botName, ...binding };
+    },
+
+    /**
+     * The same lookup without a single `await`: prompt assembly is synchronous and
+     * cannot wait for a promise. Reads only state that is already loaded in this
+     * process, so a session of a bot that was never touched answers `null` — the
+     * caller decides what an unknown session means. `botName` is left out on
+     * purpose: naming a bot needs the network, and a never-awaited lookup must not
+     * start one.
+     */
+    describeConversationBySessionSync(sessionId) {
+      if (typeof stateForSync !== 'function') return null;
+      const found = findBySessionSync(workspaces, stateForSync, sessionId, channel);
+      if (found === null) return null;
+      return { channel, botId: found.botId, botName: null, ...found.binding };
+    },
     async listTargets(botId) {
       const targets = workspaces.listDeliveryTargets(botId);
       const configured = new Map(
@@ -250,6 +471,51 @@ export function createDeliveryAdapter({ channel, workspaces, coreController, sta
         ...target,
         sessionSync: sessionSyncView(channel, target, sessions, configured.get(target.targetId)),
       }));
+    },
+    async listDsBotConversations(botId) {
+      const sessions = stateSessions(await stateFor(botId)) ?? {};
+      const keys = new Set([...Object.keys(sessions), ...workspaces.dsBotConversationKeys(botId)]);
+      return [...keys].flatMap((conversationKey) => {
+        const route = privateDeliverySuggestionFromConversationKey(channel, conversationKey);
+        if (!route) return [];
+        const binding = workspaces.dsBotBindingFor(botId, conversationKey);
+        const address = String(Object.values(route.route)[0]);
+        return [{ conversationKey, address, ...(binding ? { dsBotId: binding.dsBotId } : {}) }];
+      });
+    },
+    async bindDsBot(botId, conversationKey, dsBotId) {
+      if (!dsBot) throw dsBotError();
+      if (!privateDeliverySuggestionFromConversationKey(channel, conversationKey)) {
+        throw dsBotError('ds-bot-private-required');
+      }
+      const state = await stateFor(botId);
+      return withSessionBindingLock(state, conversationKey, async () => {
+        if (workspaces.listDsBotBindings(botId).some((binding) => (
+          binding.conversationKey === conversationKey || binding.dsBotId === dsBotId
+        ))) throw dsBotError('ds-bot-binding-conflict');
+        if (!state.sessionFor(conversationKey) && !workspaces.dsBotConversationKeys(botId).includes(conversationKey)) {
+          throw dsBotError('ds-bot-private-required');
+        }
+        const bot = await dsBot.resolve(dsBotId);
+        const previousSession = state.sessionFor(conversationKey);
+        await state.setSession(conversationKey, bot.sessionId);
+        try {
+          return await workspaces.setDsBotBinding(botId, conversationKey, dsBotId);
+        } catch (error) {
+          if (previousSession) await state.setSession(conversationKey, previousSession);
+          else await state.clearSession(conversationKey);
+          throw error;
+        }
+      });
+    },
+    async unbindDsBot(botId, conversationKey) {
+      const state = await stateFor(botId);
+      return withSessionBindingLock(state, conversationKey, async () => {
+        if (!workspaces.dsBotBindingFor(botId, conversationKey)) return false;
+        await state.clearSession(conversationKey);
+        await workspaces.setDsBotBinding(botId, conversationKey, null);
+        return true;
+      });
     },
     async listSuggestions(botId) {
       const state = await stateFor(botId);
@@ -278,8 +544,8 @@ export function createDeliveryAdapter({ channel, workspaces, coreController, sta
       if (typeof coreController.sendProactiveText !== 'function') {
         throw new TypeError('delivery controller cannot send proactive text');
       }
-      await coreController.sendProactiveText(botId, normalized, text, options);
-      return { sent: true };
+      const result = await coreController.sendProactiveText(botId, normalized, text, options);
+      return options.receipt === true ? result : { sent: true };
     },
     async setSessionSync(botId, targetId, enabled) {
       if (typeof workspaces.setDeliveryTargetSessionSync !== 'function') {
@@ -312,43 +578,50 @@ export function createDeliveryAdapter({ channel, workspaces, coreController, sta
         throw new TypeError('sessionId is required');
       }
       const matches = [];
-      for (const configured of sessionSyncConfigs(workspaces)) {
-        const target = workspaces.deliveryTargetFor(configured.botId, configured.targetId);
+      for (const configured of configuredSessionSyncTargets(workspaces)) {
+        const target = sessionSyncTarget(channel, workspaces, configured);
         if (!target || !privateConversationKeyMatchesTarget(
           channel,
           configured.conversationKey,
           target,
         )) continue;
-        let sessions;
+        let currentId;
         try {
-          sessions = stateSessions(await stateFor(configured.botId));
+          currentId = configured.dsBotId
+            ? (await dsBot?.resolve(configured.dsBotId))?.sessionId
+            : stateSessions(await stateFor(configured.botId))?.[configured.conversationKey];
         } catch {
           continue;
         }
-        if (sessions?.[configured.conversationKey] === sessionId) {
+        if (currentId === sessionId) {
           matches.push({ botId: configured.botId, targetId: configured.targetId });
         }
       }
       return matches;
     },
+    describeSessionSyncApprovalTarget: describeSyncTarget,
+    describeSessionSyncQuestionTarget: describeSyncTarget,
+    async presentSessionSyncApproval(botId, targetId, sessionId, interaction, options = {}) {
+      return presentSyncInteraction('presentSessionSyncApproval', botId, targetId, sessionId, interaction, options);
+    },
+    async presentSessionSyncQuestion(botId, targetId, sessionId, interaction, options = {}) {
+      return presentSyncInteraction('presentSessionSyncQuestion', botId, targetId, sessionId, interaction, options);
+    },
     async sendSessionSyncText(botId, targetId, sessionId, text, options = {}) {
       if (typeof text !== 'string' || !text.trim()) throw new TypeError('text is required');
-      const configured = sessionSyncConfigs(workspaces, botId)
-        .find((target) => target.targetId === targetId);
-      const target = workspaces.deliveryTargetFor(botId, targetId);
-      if (!configured || !target || !privateConversationKeyMatchesTarget(
-        channel,
-        configured.conversationKey,
-        target,
-      )) throw sessionSyncUnavailable('Session sync target is no longer enabled');
-      const sessions = stateSessions(await stateFor(botId));
-      if (sessions?.[configured.conversationKey] !== sessionId) {
-        throw sessionSyncUnavailable('Session sync target is no longer bound to this Session');
-      }
+      const { target } = await syncTarget(botId, targetId, sessionId);
       if (typeof coreController.sendProactiveText !== 'function') {
         throw new TypeError('delivery controller cannot send proactive text');
       }
-      await coreController.sendProactiveText(botId, target, text, options);
+      const result = await coreController.sendProactiveText(botId, target, text, options);
+      // Rich senders may report failure without throwing. Never report these
+      // as success, or retry an uncertain send that may already be visible.
+      if (result === false || result?.sent === false
+        || result?.deliveryOutcome === 'failed' || result?.deliveryOutcome === 'unknown') {
+        const error = new Error('Session sync delivery was not confirmed');
+        error.code = result?.deliveryOutcome === 'unknown' ? 'send-result-unknown' : 'delivery-failed';
+        throw error;
+      }
       return { sent: true };
     },
   });

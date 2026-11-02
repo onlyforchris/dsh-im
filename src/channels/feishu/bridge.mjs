@@ -1,4 +1,11 @@
+import { captureGroupHistory } from '../shared/group-history.mjs';
+import { BusyMessageDispatcher, canAutomaticallySteer } from '../shared/busy-message-dispatcher.mjs';
+import { isPermissionCommand, runPermissionCommand } from '../shared/permission-command.mjs';
+import { randomUUID } from 'node:crypto';
+import { chunkMarkdownText } from '../shared/markdown-chunks.mjs';
 import QRCode from 'qrcode';
+import { waitForFeishuOperation } from './feishu-channel.mjs';
+import { startNewConversation } from '../shared/new-command.mjs';
 import {
   conversationKey,
   conversationScope,
@@ -40,6 +47,7 @@ import {
   isBatchInputCommand,
 } from '../shared/batch-input.mjs';
 import { runCompactCommand } from '../shared/compact-command.mjs';
+import { isClearCommand, runClearCommand } from '../shared/clear-command.mjs';
 import { isHistoryCommand, runHistoryCommand } from '../shared/history-command.mjs';
 import {
   isControlCommand,
@@ -75,6 +83,7 @@ import {
 import {
   channelDeliveryFailure,
   clearLastMessageFailure,
+  messageFailureDiagnostic,
   messageFailureText,
   setLastMessageFailure,
 } from '../shared/message-failure.mjs';
@@ -87,6 +96,7 @@ import { isSharedLocalCommand } from '../shared/command-permission.mjs';
 import {
   MENU_PAGE_SIZE,
   PRESET_FOLLOW_DEFAULT_SENTINEL,
+  REASONING_DEFAULT_SENTINEL,
   STEER_CUSTOM_SENTINEL,
   approvalCard,
   completionCard,
@@ -116,6 +126,7 @@ import {
 import {
   FEISHU_STEP_PUSH_MODES,
   normalizeFeishuStepPushMode,
+  normalizeFeishuStepCardPanels,
 } from './step-push-mode.mjs';
 import { FeishuLiveCot } from './live-cot.mjs';
 
@@ -127,6 +138,8 @@ const ROOT_CANDIDATE_TTL_MS = 30 * 60_000;
 /** Bound main-feed roots awaiting a topic so silent drops cannot grow them. */
 const MAX_ROOT_CANDIDATES = 512;
 const MAX_TOPIC_ANCHORS = 4_000;
+/** Conversations remembered as auto-continued-round delivery targets (LRU). */
+const MAX_CONVERSATION_ROUTES = 512;
 
 const MENU_COMMAND = /^\/m(?:enu)?$/i;
 const REPAIR_COMMAND_PREFIX = /^\/repair(?:\s|$)/i;
@@ -135,7 +148,9 @@ const WATCH_COMMAND = /^\/watch(?:\s+([^\s]+))?$/i;
 const UNWATCH_COMMAND = /^\/unwatch(?:\s+([^\s]+))?$/i;
 const WATCHLIST_COMMAND = /^\/watchlist$/i;
 const SESSION_LIST_PREFIX = /^\/(?:sessionlist|sessions)(?:\s|$)/i;
-const WORKSPACE_LIST_COMMAND = /^\/(?:workspacelist|workspaces|wsl)$/i;
+const WORKSPACE_LIST_COMMAND = /^\/(?:workspacelist|workspaces|wsl)(?:\s+all)?$/i;
+// After the merge a bare /workspace or /ws opens the same picker card.
+const BARE_WORKSPACE_COMMAND = /^\/(?:workspace|ws)$/i;
 const NUMBER_REPLY = /^\d{1,2}$/;
 /** A displayed menu stays number-tappable for this long. */
 const MENU_TTL_MS = 10 * 60_000;
@@ -174,7 +189,7 @@ const REPAIR_URL_HOSTS = new Set([
 
 const ARCHIVED_COMMAND = /^\/archived(?:\s+(on|off))?$/i;
 /** Matches fast card commands that should not be queued behind a running task. */
-const CARD_COMMAND = /^\/(?:m(?:enu)?|new|help|status|compact|(?:sessionlist|sessions)(?:\s|$)|workspacelist|workspaces|wsl|watchlist|archived(?:\s+(on|off))?)$/i;
+const CARD_COMMAND = /^\/(?:m(?:enu)?|new|help|status|compact|clear|(?:sessionlist|sessions)(?:\s|$)|workspacelist|workspaces|wsl|watchlist|archived(?:\s+(on|off))?)$/i;
 
 // ── Step push (分步直推) limits ──────────────────────────────────────────────
 /** Feishu allows 5 msg/s per chat; step push stays well below that. */
@@ -202,6 +217,31 @@ const STEP_PUSH_POST_CHUNK_MAX_BYTES = 24_000;
 const STEP_STREAM_PATCH_MIN_INTERVAL_MS = 1_000;
 /** Confirm missed boundaries from history; elapsed time is never completion. */
 const MIRROR_CHECK_MS = 30_000;
+/** Retire orphan snapshots outside Feishu's message update window. */
+const MIRROR_STALE_MS = 14 * 24 * 60 * 60_000;
+const MIRROR_RECOVERY_MAX_FAILURES = 20;
+
+/**
+ * The one-line label an auto-continued round shows in the conversation. The
+ * Harness goal driver feeds the round a `<goal_round>` prompt that must never
+ * reach the chat, so both the goal-round card and the session-sync mirror
+ * announce the round by number instead of echoing that text.
+ */
+function goalRoundLabel(round) {
+  return Number.isSafeInteger(round) && round > 0
+    ? t('🔄 目标自动续跑（第 {round} 轮）', { round })
+    : t('🔄 目标自动续跑');
+}
+
+function mirrorErrorText(error) {
+  return [error?.response?.data?.msg, error?.msg, error?.message]
+    .filter((value) => typeof value === 'string' && value.trim()).join('; ') || String(error);
+}
+
+function isExpiredMirrorError(error) {
+  return /Message has expired when updating message|Message can only be updated within fourteen days/i
+    .test(mirrorErrorText(error));
+}
 /** One answer chunk inside the streaming card: small enough that the block
  *  splitter can always distribute blocks across sealed/live cards. */
 const STEP_STREAM_ANSWER_CHUNK_MAX_BYTES = 18_000;
@@ -297,6 +337,7 @@ function printableText(value) {
 }
 
 function isFeishuLocalCommand(text, { hasImages = false, hasFiles = false } = {}) {
+  if (isPermissionCommand(text)) return true;
   if (hasImages || hasFiles || typeof text !== 'string') return false;
   const command = text.trim();
   return MENU_COMMAND.test(command)
@@ -610,8 +651,11 @@ export class FeishuHarnessBridge {
   #harness;
   #state;
   #contextEnhancement;
+  #groupHistory;
+  #groupHistoryScope;
   #accessPolicy;
   #queues = new Map();
+  #busyMessages = new BusyMessageDispatcher();
   #batchInputs = new BatchInputManager();
   #pendingInteractions = new Map();
   #interactionKeys = new Map();
@@ -672,6 +716,7 @@ export class FeishuHarnessBridge {
   #stepPush = false;
   /** Step push presentation: discrete posts, a CardKit card, or native live CoT. */
   #stepPushMode = FEISHU_STEP_PUSH_MODES.POST;
+  #stepCardPanels;
   /** Per-conversation step push state: key → { lastSentAt, count, breakerLogged }. */
   #stepPushSendState = new Map();
   /** Live streaming step cards: key → per-turn card state (streaming_card mode). */
@@ -716,7 +761,16 @@ export class FeishuHarnessBridge {
   #sessionSyncIdleTimers = new Map();
   /** Conversation keys with an IM ask in flight (set BEFORE the turn starts). */
   #imTurnKeys = new Set();
+  /** Where each conversation posts: { chatId, replyToMessageId } (last inbound). */
+  #conversationRoutes = new Map();
+  /** Goal rounds currently rendering into a bound conversation, by key. */
+  #goalRounds = new Map();
+  // A goal round's user/message carries `source.kind === 'goal'` but no
+  // `data.turn`; the turn/start right before it does. Keep the latest start
+  // so the round can still be identified without inventing a turn.
+  #goalTurnStarts = new Map();
   #cardDataTimeoutMs;
+  #requestTimeoutMs;
   /** When true, approval/question interactions render as Feishu cards (buttons). */
   #interactionCards = true;
 
@@ -726,6 +780,8 @@ export class FeishuHarnessBridge {
     harness,
     state,
     contextEnhancement,
+    groupHistory,
+    groupHistoryScope = 'feishu',
     accessPolicy,
     status,
     allowedSenderOpenIds = new Set(),
@@ -736,11 +792,13 @@ export class FeishuHarnessBridge {
     mentionTopicReply = true,
     stepPush = false,
     stepPushMode = FEISHU_STEP_PUSH_MODES.POST,
+    stepCardPanels,
     stepPushClock = null,
     repair,
     repairPollIntervalMs = REPAIR_POLL_INTERVAL_MS,
     repairLinkWaitMs = REPAIR_LINK_WAIT_MS,
     cardDataTimeoutMs = CARD_DATA_TIMEOUT_MS,
+    requestTimeoutMs = 15_000,
     replyTimeoutMs = 600_000,
     interactionCards = true,
     sessionSyncTargetsFor = null,
@@ -763,7 +821,8 @@ export class FeishuHarnessBridge {
     }
     if (!Number.isFinite(repairPollIntervalMs) || repairPollIntervalMs <= 0
       || !Number.isFinite(repairLinkWaitMs) || repairLinkWaitMs <= 0
-      || !Number.isFinite(cardDataTimeoutMs) || cardDataTimeoutMs <= 0) {
+      || !Number.isFinite(cardDataTimeoutMs) || cardDataTimeoutMs <= 0
+      || !Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) {
       throw new TypeError('Feishu timing values must be positive numbers');
     }
     if (stepPushClock !== null
@@ -784,6 +843,8 @@ export class FeishuHarnessBridge {
     this.#harness = harness;
     this.#state = state;
     this.#contextEnhancement = contextEnhancement;
+    this.#groupHistory = groupHistory;
+    this.#groupHistoryScope = groupHistoryScope;
     this.#accessPolicy = accessPolicy;
     this.#status = status;
     this.#allowedSenderOpenIds = allowedSenderOpenIds;
@@ -794,12 +855,14 @@ export class FeishuHarnessBridge {
     this.#mentionTopicReply = mentionTopicReply !== false;
     this.#stepPush = stepPush === true;
     this.#stepPushMode = normalizeFeishuStepPushMode(stepPushMode);
+    this.#stepCardPanels = normalizeFeishuStepCardPanels(stepCardPanels);
     this.#stepPushClock = stepPushClock ?? DEFAULT_STEP_PUSH_CLOCK;
     this.#voice = voice ?? null;
     this.#repair = repair ?? null;
     this.#repairPollIntervalMs = repairPollIntervalMs;
     this.#repairLinkWaitMs = repairLinkWaitMs;
     this.#cardDataTimeoutMs = cardDataTimeoutMs;
+    this.#requestTimeoutMs = requestTimeoutMs;
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#interactionCards = interactionCards === true;
     this.#sessionSyncTargetsFor = typeof sessionSyncTargetsFor === 'function'
@@ -832,27 +895,48 @@ export class FeishuHarnessBridge {
   }
 
   /** Recover only a known finished turn, using its last successful card JSON. */
-  async #sealOrphanMirrors() {
-    for (const [key, entry] of this.#state.mirrorEntries?.() ?? []) {
-      if (!entry?.chatId || !entry.sessionId || !Number.isSafeInteger(entry.turn)
-        || !Array.isArray(entry.cardIds) || !entry.cardIds.length) continue;
-      await this.#queueEventTask(entry.sessionId, async () => {
+  async #sealOrphanMirrors(onlyKey = null) {
+    for (const [key, queuedEntry] of this.#state.mirrorEntries?.() ?? []) {
+      if (onlyKey !== null && key !== onlyKey) continue;
+      if (!queuedEntry?.sessionId) continue;
+      await this.#queueEventTask(queuedEntry.sessionId, async () => {
         if (this.#signal?.aborted) return;
         // An adopted turn now owns this record and will finish through its queue.
         if (this.#sessionSyncTurns.has(key)) return;
+        // A queued timer must not resurrect a deleted record or overwrite a
+        // newer snapshot/failure count with the entry captured before queuing.
+        let entry = this.#state.mirrorEntries?.().find(([entryKey]) => entryKey === key)?.[1];
+        if (!entry?.chatId || !entry.sessionId || !Number.isSafeInteger(entry.turn)
+          || !Array.isArray(entry.cardIds) || !entry.cardIds.length) return;
+        const now = Date.now();
+        if (!Number.isFinite(entry.claimedAt) || entry.claimedAt <= 0 || entry.claimedAt > now) {
+          entry = { ...entry, claimedAt: now };
+          await this.#state.setMirror?.(key, entry);
+        }
+        if (now - entry.claimedAt >= MIRROR_STALE_MS) {
+          await this.#clearMirrorRecovery(key, 'snapshot expired');
+          return;
+        }
+        const failures = Number.isSafeInteger(entry.recoveryFailures) && entry.recoveryFailures > 0
+          ? entry.recoveryFailures : 0;
+        if (failures >= MIRROR_RECOVERY_MAX_FAILURES) {
+          await this.#clearMirrorRecovery(key, 'recovery failure limit reached');
+          return;
+        }
         try {
           const events = await this.#mirrorHistory(entry.sessionId, entry.turn);
+          if (this.#signal?.aborted) return;
           const outcome = extractCompletedTurnAnswer(events, { turn: entry.turn });
           if (outcome.endSeq < 0) {
-            this.#scheduleMirrorCheck(`recovery\0${key}`, () => this.#sealOrphanMirrors());
+            this.#scheduleMirrorCheck(`recovery\0${key}`, () => this.#sealOrphanMirrors(key));
             return;
           }
           if (this.#restoreMirrorCard(key, entry)) {
             const result = await this.#finishStepCard(key, {
               answerText: outcome.text, stopped: outcome.reason !== 'completed',
             });
-            if (!result?.ok) throw new Error('Recovered mirror could not deliver its final answer');
-            await this.#state.clearMirror?.(key);
+            if (!result?.ok) throw result?.error ?? new Error('Recovered mirror could not deliver its final answer');
+            await this.#clearMirrorRecovery(key);
             return;
           }
           const content = JSON.parse(entry.lastContent);
@@ -864,12 +948,37 @@ export class FeishuHarnessBridge {
           else elements.push({ tag: 'markdown', content: status });
           // Earlier chunks are sealed history; update only the live card.
           await this.#patchStepCard(entry.cardIds.at(-1), JSON.stringify(content));
-          await this.#state.clearMirror?.(key);
+          await this.#clearMirrorRecovery(key);
         } catch (error) {
-          this.#logger.warn?.('[dsh-feishu] mirror recovery failed:', error?.message ?? error);
-          this.#scheduleMirrorCheck(`recovery\0${key}`, () => this.#sealOrphanMirrors());
+          if (this.#signal?.aborted) return;
+          const current = this.#state.mirrorEntries?.().find(([entryKey]) => entryKey === key)?.[1];
+          if (!current) return;
+          if (isExpiredMirrorError(error)) {
+            await this.#clearMirrorRecovery(key, 'message expired');
+            return;
+          }
+          await this.#state.setMirror?.(key, { ...current, recoveryFailures: failures + 1 });
+          if (failures + 1 >= MIRROR_RECOVERY_MAX_FAILURES) {
+            await this.#clearMirrorRecovery(key, 'recovery failure limit reached');
+            return;
+          }
+          this.#logger.warn?.('[dsh-feishu] mirror recovery failed:', mirrorErrorText(error),
+            { sessionId: entry.sessionId, turn: entry.turn, recoveryFailures: failures + 1 });
+          this.#scheduleMirrorCheck(`recovery\0${key}`, () => this.#sealOrphanMirrors(key));
         }
       });
+    }
+  }
+
+  async #clearMirrorRecovery(key, reason = null) {
+    const timerKey = `recovery\0${key}`;
+    clearTimeout(this.#sessionSyncIdleTimers.get(timerKey));
+    this.#sessionSyncIdleTimers.delete(timerKey);
+    const entry = this.#state.mirrorEntries?.().find(([entryKey]) => entryKey === key)?.[1];
+    await this.#state.clearMirror?.(key);
+    if (reason && entry) {
+      this.#logger.warn?.('[dsh-feishu] mirror recovery stopped:', reason,
+        { sessionId: entry.sessionId, turn: entry.turn, recoveryFailures: entry.recoveryFailures ?? 0 });
     }
   }
 
@@ -887,6 +996,10 @@ export class FeishuHarnessBridge {
 
   setStepPushMode(value) {
     this.#stepPushMode = normalizeFeishuStepPushMode(value);
+  }
+
+  setStepCardPanels(value) {
+    this.#stepCardPanels = normalizeFeishuStepCardPanels(value);
   }
 
   setVoice(voice) {
@@ -1073,7 +1186,39 @@ export class FeishuHarnessBridge {
     }
   }
 
+  /**
+   * Remember where a conversation posts, so a turn opened outside the IM can
+   * render into it later. Called for every accepted inbound message; a host
+   * that already knows a binding can register it the same way.
+   */
+  rememberConversationRoute(key, { chatId, replyToMessageId = null } = {}) {
+    const conversation = nonEmptyString(chatId);
+    if (!nonEmptyString(key) || !conversation) return;
+    this.#conversationRoutes.delete(key);
+    this.#conversationRoutes.set(key, {
+      chatId: conversation,
+      replyToMessageId: nonEmptyString(replyToMessageId),
+    });
+    while (this.#conversationRoutes.size > MAX_CONVERSATION_ROUTES) {
+      this.#conversationRoutes.delete(this.#conversationRoutes.keys().next().value);
+    }
+  }
+
   accept(event) {
+    if (!this.#groupHistory || event?.message?.chat_type !== 'group') return this.#accept(event);
+    const content = extractInboundMessage({ ...event, message: { ...event.message, mentions: [] } }, this.#client);
+    const message = { ...content, kind: 'group', senderId: senderOpenId(event),
+      senderIsBot: isBotSender(event) };
+    return captureGroupHistory(this.#groupHistory, message, {
+      channel: 'feishu', scope: this.#groupHistoryScope, groupId: event.message.chat_id,
+      messageId: event.message.message_id, sentAt: Number(event.message.create_time),
+      type: event.message.message_type, text: content.content,
+      threadId: event.message.thread_id, replyToMessageId: event.message.parent_id,
+      capability: '需授权 im:message.group_msg；授权采集不改变群回复模式。',
+    }, { logger: this.#logger }).then(() => { event.groupHistory = message.groupHistory; return this.#accept(event); });
+  }
+
+  #accept(event) {
     if (this.#signal?.aborted) return Promise.resolve();
     const messageId = nonEmptyString(event?.message?.message_id);
     if (!messageId) return Promise.resolve();
@@ -1109,6 +1254,10 @@ export class FeishuHarnessBridge {
       return Promise.resolve();
     }
     this.#rememberTopicReply(messageId, key);
+    this.rememberConversationRoute(key, {
+      chatId: event.message.chat_id,
+      replyToMessageId: messageId,
+    });
 
     const commandMessage = extractInboundMessage(event, this.#client);
     const commandText = nonEmptyString(commandMessage.content) ?? '';
@@ -1233,6 +1382,7 @@ export class FeishuHarnessBridge {
       return processing;
     }
     const commandRunner = isHistoryCommand(commandText) ? runHistoryCommand
+      : isPermissionCommand(commandText) ? runPermissionCommand
       : hasInboundFiles(commandMessage) ? null : isControlCommand(commandText)
       ? runControlCommand
       : (isModelCommand(commandText)
@@ -1378,7 +1528,27 @@ export class FeishuHarnessBridge {
       this.#interactionTasks.add(current);
       return current;
     }
-    return this.#enqueueMessage(event, messageId, key, processingReaction);
+    return this.#busyMessages.dispatch({
+      key, messageId, text: commandText,
+      eligible: () => event.message.message_type === 'text' && !hasImages && !hasFiles
+        && !hasReplyReference(commandMessage) && !isFeishuLocalCommand(commandText)
+        && !(NUMBER_REPLY.test(commandText) && this.#menus.has(key))
+        && canAutomaticallySteer(this.#accessPolicy, conversationType, senderOpenId(event)),
+      harness: this.#harness, state: this.#state, status: this.#status,
+      signal: this.#signal, control: { owner: this, key }, logger: this.#logger,
+      acceptedMessageIds: this.#acceptedMessageIds,
+      pendingInteraction: () => this.#pendingInteractions.has(key) || this.#approvals.hasPending(key),
+      enhancement: {
+        snapshot: this.#acceptedMessageIds.get(messageId),
+        source: () => ({ channel: 'feishu', senderId: senderOpenId(event),
+          chatId: event.message.chat_id, threadId: event.message.thread_id }),
+      },
+      isQueued: () => this.#queues.has(key),
+      enqueue: (options) => this.#enqueueMessage(event, messageId, key, processingReaction, options),
+      send: (reply) => this.#send(event.message.chat_id, reply, { replyTo: messageId }),
+      onSteered: () => this.#finishReaction(messageId, processingReaction, 'DONE'),
+      onError: (error) => this.#handleMessageFailure(event, messageId, processingReaction, error),
+    });
   }
 
   #finishBatchResult(event, messageId, processingReaction, result) {
@@ -1407,11 +1577,20 @@ export class FeishuHarnessBridge {
     return current;
   }
 
+  #logAccessDenied(conversationType, reason) {
+    this.#logger.info?.('[dsh-feishu] inbound access denied', {
+      botId: this.#accessPolicy?.botId,
+      conversationType,
+      reason,
+    });
+  }
+
   #finishAccessDecision(event, messageId, access) {
     let current;
     current = Promise.resolve().then(async () => {
       if (this.#state.hasSeen(messageId)) return;
       await this.#state.markSeen(messageId);
+      this.#logAccessDenied(event.message.chat_type === 'p2p' ? 'direct' : 'group', access.reason);
       if (access.reason === 'command-not-allowed') {
         this.#status.lastMessageAt = new Date().toISOString();
         this.#status.messagesReceived += 1;
@@ -1480,7 +1659,7 @@ export class FeishuHarnessBridge {
     const failure = setLastMessageFailure(this.#status, error, { userMessage, reason });
     this.#logger?.[logLevel]?.(
       `[dsh-feishu] ${logLabel} failed [${failure.referenceId}]:`,
-      error?.message ?? String(error),
+      messageFailureDiagnostic(error, failure),
     );
     return failure;
   }
@@ -1526,6 +1705,7 @@ export class FeishuHarnessBridge {
   }
 
   async waitForIdle() {
+    await this.#busyMessages.whenIdle();
     // Drain to a fixed point: awaited work can register compensation or
     // another serialized tail before it settles.
     for (;;) {
@@ -1581,6 +1761,7 @@ export class FeishuHarnessBridge {
         deferredDelivery: this.#deferred,
         hasFiles: hasInboundFiles(message),
         pendingInteraction: this.#hasPendingInteraction(key),
+        busy: this.#queues.has(key),
         control: { owner: this, key },
         enhancement: captureContextEnhancementSource(
           this.#contextEnhancement,
@@ -1655,6 +1836,7 @@ export class FeishuHarnessBridge {
           || (!hasImages && !hasFiles && NUMBER_REPLY.test(text) && this.#menus.has(key)),
       });
       if (!transcribedAccess.allowed) {
+        this.#logAccessDenied(event.message.chat_type === 'p2p' ? 'direct' : 'group', transcribedAccess.reason);
         if (transcribedAccess.reason === 'command-not-allowed') {
           await this.#send(
             event.message.chat_id,
@@ -1671,7 +1853,8 @@ export class FeishuHarnessBridge {
     // 命令识别对 text 与纯文本 post 一视同仁：post 富文本若仅含单个
     // 文本段落（如复制粘贴的 /new），同样按命令处理；带图片/文件不认。
     // accept() 侧已用 nonEmptyString(content) 判定，两侧保持一致。
-    const commandText = !hasImages && !hasFiles && text ? text.trim() : null;
+    const rawCommandText = text ? text.trim() : '';
+    const commandText = !hasImages && !hasFiles && text ? rawCommandText : null;
     if (!text && !hasImages && !hasFiles && !hasReply) {
       // An "@bot" with nothing else carries no instruction to parse, and the
       // menu card is what the reader is reaching for — answer it the way `/m`
@@ -1687,6 +1870,15 @@ export class FeishuHarnessBridge {
 
     if (commandText !== null && REPAIR_COMMAND_PREFIX.test(commandText)) {
       await this.#handleRepairCommand(event, commandText);
+      return;
+    }
+    if (isPermissionCommand(text)) {
+      const result = await runPermissionCommand(text, this.#harness, this.#state, key, {
+        signal: this.#signal, hasImages, hasFiles,
+      });
+      for (const reply of result.messages) {
+        await this.#send(event.message.chat_id, reply, { replyTo: event.message.message_id });
+      }
       return;
     }
     if (commandText === '/help') {
@@ -1706,8 +1898,9 @@ export class FeishuHarnessBridge {
         );
         return;
       }
-      await this.#state.clearSession(key);
-      await this.#send(event.message.chat_id, t('已开启全新 Harness 会话。'), { replyTo: event.message.message_id });
+      await this.#send(event.message.chat_id, await startNewConversation({
+        state: this.#state, harness: this.#harness, key,
+      }), { replyTo: event.message.message_id });
       await this.#sendMenuCard(key, event.message.chat_id, { replyTo: event.message.message_id });
       return;
     }
@@ -1719,6 +1912,19 @@ export class FeishuHarnessBridge {
       const compactCommand = await runCompactCommand(commandText, this.#harness, this.#state, key, { signal: this.#signal });
       if (compactCommand) {
         await this.#send(event.message.chat_id, compactCommand.message, { replyTo: event.message.message_id });
+      }
+      return;
+    }
+    if (isClearCommand(rawCommandText)) {
+      const clearCommand = await runClearCommand(rawCommandText, this.#harness, this.#state, key, {
+        signal: this.#signal,
+        hasImages,
+        hasFiles,
+        pendingInteraction: this.#hasPendingInteraction(key),
+        busy: this.#queues.has(key),
+      });
+      if (clearCommand) {
+        await this.#send(event.message.chat_id, clearCommand.message, { replyTo: event.message.message_id });
       }
       return;
     }
@@ -1737,8 +1943,12 @@ export class FeishuHarnessBridge {
       );
       return;
     }
-    if (WORKSPACE_LIST_COMMAND.test(commandText)) {
-      await this.#showWorkspaces({ chatId: event.message.chat_id, key, replyTo: event.message.message_id });
+    if (BARE_WORKSPACE_COMMAND.test(commandText)
+      && this.#harness.conversationDirectoryConfig?.()?.enabled === true) return;
+    if (BARE_WORKSPACE_COMMAND.test(commandText) || WORKSPACE_LIST_COMMAND.test(commandText)) {
+      await this.#showWorkspaces({ chatId: event.message.chat_id, key, replyTo: event.message.message_id }, {
+        includeConversationDirectories: /\s+all$/iu.test(commandText),
+      });
       return;
     }
     if (WATCH_COMMAND.test(commandText)) {
@@ -1859,7 +2069,12 @@ export class FeishuHarnessBridge {
       }
       throw error;
     } finally {
-      await this.#cancelPendingInteraction(key);
+      // Synced questions (including DS Bot's ask_user) outlive the turn that
+      // presented them. Only turn-owned questions belong to this cleanup;
+      // their failed-delivery/error paths must still resolve by cancellation.
+      if (this.#pendingInteractions.get(key)?.lifecycle !== 'session-sync') {
+        await this.#cancelPendingInteraction(key);
+      }
       await this.#approvals.closeRoute(key);
       this.#voiceTurns.delete(key);
     }
@@ -2138,7 +2353,7 @@ export class FeishuHarnessBridge {
       : t('链接约 {minutes} 分钟后过期', { minutes: Math.max(1, Math.ceil(remaining / 60)) });
     await this.#send(chatId, [
       restarted ? t('旧授权链接已作废，已生成新的修复链接。') : t('🔧 准备补全权限与回调。'),
-      t('本次会增量添加当前缺少项：卡片回调 card.action.trigger；飞书显示为“获取单聊、群组消息”的租户权限 im:message:readonly（用于读取用户消息中的图片或文件）；im:resource（用于上传机器人发送的图片或文件）；im:message.group_at_msg.include_bot:readonly（用于接收群内其他机器人 @ 当前机器人的消息）；以及原生命令面板所需的 application:app_slash_command:read / write。确认页只会显示当前缺少的项；若出现上述范围之外的配置，请取消。'),
+      t('本次会增量添加当前缺少项：卡片回调 card.action.trigger；im:message.group_msg（用于接收未 @ 的群消息）；飞书显示为“获取单聊、群组消息”的租户权限 im:message:readonly（用于读取用户消息中的图片或文件）；im:resource（用于上传机器人发送的图片或文件）；im:message.group_at_msg.include_bot:readonly（用于接收群内其他机器人 @ 当前机器人的消息）；以及原生命令面板所需的 application:app_slash_command:read / write。群回复方式保持不变，实际收到的群消息和文件会自动保存。确认页只会显示当前缺少的项；若出现上述范围之外的配置，请取消。'),
       '',
       t('当前设备直接打开：'),
       url,
@@ -2259,7 +2474,9 @@ export class FeishuHarnessBridge {
           ? `preset:select:${option}`
           : action === 'model_pick' && typeof option === 'string'
             ? `model:select:${option}`
-            : action === 'archive_pick' && typeof option === 'string'
+            : action === 'reasoning_pick' && typeof option === 'string'
+              ? `reasoning:select:${option}`
+              : action === 'archive_pick' && typeof option === 'string'
               ? `archive:${option}`
               : action === 'steer_pick' && typeof option === 'string'
                 ? `steer:${option}`
@@ -2268,6 +2485,7 @@ export class FeishuHarnessBridge {
       ?? nonEmptyString(event?.open_message_id)
       ?? nonEmptyString(event?.message_id);
     const route = messageId ? this.#cardKeys.get(messageId) : null;
+    const modelPage = route?.modelPage ?? 0;
     if (!route) {
       // A route is also the trusted direct/group scope for the unified policy.
       // Without it, fail closed instead of producing an unauthorised side effect.
@@ -2297,17 +2515,19 @@ export class FeishuHarnessBridge {
       isCommand: !isInteractionResponse,
     });
     if (!access.allowed) {
+      this.#logAccessDenied(conversationType, access.reason);
       if (access.reason === 'command-not-allowed') {
         return this.#send(route.chatId, t(COMMAND_PERMISSION_DENIED_MESSAGE))
           .catch(() => undefined);
       }
-      this.#logger.warn?.('[dsh-feishu] ignoring card action blocked by access policy');
       return Promise.resolve();
     }
     // A used card is recent even if it was first created long ago.
     this.#cardKeys.delete(messageId);
     this.#cardKeys.set(messageId, route);
-    const entry = { ...route, messageId, selections: multiValues, operatorOpenId };
+    const newSessionActionId = nonEmptyString(actionValue.newSessionActionId);
+    if (resolvedAction === 'new' && (!route.menuContext || !newSessionActionId)) return Promise.resolve();
+    const entry = { ...route, messageId, selections: multiValues, operatorOpenId, newSessionActionId, modelPage };
     const source = nonEmptyString(actionValue.source);
     const formText = nonEmptyString(formValue.steer_text);
     const eventId = nonEmptyString(event?.event_id)
@@ -2316,6 +2536,7 @@ export class FeishuHarnessBridge {
       ?? nonEmptyString(event?.header?.uuid);
     const identity = JSON.stringify({
       messageId,
+      newSessionActionId,
       resolvedAction,
       option,
       multiValues,
@@ -2515,8 +2736,12 @@ export class FeishuHarnessBridge {
     sessionWorkspace = null,
     sessionPage = 0,
     sessionLimit = null,
+    modelPage = 0,
     selections = [],
     actor = null,
+    menuContext = null,
+    newSessionActionId = null,
+    fromMessageQueue = false,
   }) {
     // Confirmations triggered by a card interaction stay anchored to the
     // card's message so they land inside the same Feishu topic.
@@ -2666,12 +2891,17 @@ export class FeishuHarnessBridge {
       return;
     }
     if (action === 'new') {
-      if (this.#queues.has(key) || this.#hasPendingInteraction(key)) {
+      if (menuContext || newSessionActionId) {
+        await this.#handleNewSessionMenu({ key, chatId, messageId, menuContext, newSessionActionId });
+        return;
+      }
+      // A queued menu pick runs after earlier messages; its own unfinished
+      // queue (including later messages) must not prevent the reset.
+      if ((!fromMessageQueue && this.#queues.has(key)) || this.#hasPendingInteraction(key)) {
         await reply(t('当前任务仍在运行，请先停止任务或等待任务完成后再开启新会话。'));
         return;
       }
-      await this.#state.clearSession(key);
-      await reply(t('已开启全新 Harness 会话。'));
+      await reply(await startNewConversation({ state: this.#state, harness: this.#harness, key }));
       await this.#sendMenuCard(key, chatId, { updateMessageId: messageId, replyTo: messageId });
       return;
     }
@@ -2701,6 +2931,10 @@ export class FeishuHarnessBridge {
       await this.#handleCompact(key, chatId, messageId);
       return;
     }
+    if (action === 'clear') {
+      await this.#handleClear(key, chatId, messageId);
+      return;
+    }
     if (action === 'stop') {
       await this.#handleStop(key, chatId, messageId);
       return;
@@ -2723,8 +2957,9 @@ export class FeishuHarnessBridge {
       await this.#showPresetCard(key, chatId, { updateMessageId: messageId });
       return;
     }
-    if (action === 'models') {
-      await this.#showModelCard(key, chatId, { updateMessageId: messageId });
+    if (action === 'models' || /^models:\d+$/.test(action)) {
+      const page = action === 'models' ? 0 : Number(action.slice('models:'.length));
+      await this.#showModelCard(key, chatId, { updateMessageId: messageId, page: Math.max(0, page) });
       return;
     }
     if (action === 'status') {
@@ -2755,7 +2990,12 @@ export class FeishuHarnessBridge {
     }
     if (action.startsWith('model:select:')) {
       const modelId = action.slice('model:select:'.length);
-      await this.#handleModelSelect(key, chatId, modelId, { updateMessageId: messageId });
+      await this.#handleModelSelect(key, chatId, modelId, { updateMessageId: messageId, page: modelPage });
+      return;
+    }
+    if (action.startsWith('reasoning:select:')) {
+      const effort = action.slice('reasoning:select:'.length);
+      await this.#handleReasoningSelect(key, chatId, effort, { updateMessageId: messageId, page: modelPage });
       return;
     }
     if (action.startsWith('use:')) {
@@ -2799,6 +3039,62 @@ export class FeishuHarnessBridge {
     }
   }
 
+  async #handleNewSessionMenu({ key, chatId, messageId, menuContext, newSessionActionId }) {
+    // The generation belongs to this rendered menu, not the whole conversation.
+    // Check inside the queue as well as consuming the action before any await:
+    // distinct provider events and late callbacks must not clear a later session.
+    const action = menuContext?.newSessionAction;
+    if (!action || this.#cardKeys.get(messageId)?.menuContext !== menuContext
+      || action.id !== newSessionActionId
+      || !['idle', 'failed'].includes(action.status)) return;
+
+    action.status = 'processing';
+    delete action.message;
+    await this.#patchCardMessage(chatId, messageId, menuCard(menuContext));
+
+    const finish = async (status, message = null) => {
+      if (menuContext.currentSession && !this.#state.sessionFor(key)) {
+        menuContext.currentSession = null;
+        // The old menu may show a session-specific model. After unbinding,
+        // refresh the bot default just as opening a fresh menu would.
+        try {
+          menuContext.modelCatalog = await this.#harness.listModels({ signal: this.#cardDataSignal() });
+        } catch {
+          menuContext.modelCatalog = null;
+        }
+      }
+      menuContext.newSessionAction = {
+        id: status === 'failed' ? randomUUID() : action.id,
+        status,
+        message,
+      };
+      const patched = await this.#patchCardMessage(chatId, messageId, menuCard(menuContext));
+      if (!patched) {
+        await this.#send(chatId, t('新会话操作的卡片状态未能更新，请发送 /m 重新打开菜单。'), { replyTo: messageId })
+          .catch((error) => this.#logger.warn?.('[dsh-feishu] menu state notice failed:', error?.message));
+      }
+    };
+    // A task can start while Feishu is updating the processing card.
+    if (this.#queues.has(key) || this.#hasPendingInteraction(key)) {
+      const message = t('当前任务仍在运行，请先停止任务或等待任务完成后再开启新会话。');
+      await finish('failed', message);
+      await this.#send(chatId, message, { replyTo: messageId });
+      return;
+    }
+    let receipt;
+    try {
+      receipt = await startNewConversation({ state: this.#state, harness: this.#harness, key });
+    } catch (error) {
+      // A persistence error can still leave the in-memory binding cleared.
+      await finish('failed', safeErrorText(error));
+      throw error;
+    }
+    await finish('success');
+    // A receipt delivery failure must not turn a completed reset into a retry.
+    await this.#send(chatId, receipt, { replyTo: messageId })
+      .catch((error) => this.#logger.warn?.('[dsh-feishu] new session receipt failed:', error?.message));
+  }
+
   #rememberMenu(key, menu) {
     if (this.#menus.size >= MAX_TRACKED_MENUS) {
       const oldest = this.#menus.keys().next().value;
@@ -2834,7 +3130,9 @@ export class FeishuHarnessBridge {
         await this.#handleRepairCommand(event, '/repair');
         return;
       }
-      await this.#handleCardAction(action, { chatId, key, messageId: replyTo });
+      await this.#handleCardAction(action, {
+        chatId, key, messageId: replyTo, fromMessageQueue: action === 'new',
+      });
       return;
     }
     if (menu.kind === 'sessions') {
@@ -2946,16 +3244,16 @@ export class FeishuHarnessBridge {
     }
   }
 
-  async #showWorkspaces({ chatId, key, replyTo = null }, { updateMessageId = null } = {}) {
+  async #showWorkspaces({ chatId, key, replyTo = null }, { updateMessageId = null, includeConversationDirectories = false } = {}) {
     try {
-      const { current, paths } = await workspacePathSnapshot(
+      const { current, paths, titles } = await workspacePathSnapshot(
         this.#harness,
-        { signal: this.#cardDataSignal() },
+        { signal: this.#cardDataSignal(), includeTitles: true, includeConversationDirectories },
       );
       this.#rememberMenu(key, { kind: 'workspaces', paths });
       await this.#sendCard(
         chatId,
-        workspaceListCard(paths, current),
+        workspaceListCard(paths, current, titles),
         { key, updateMessageId, replyTo },
       );
     } catch (error) {
@@ -3002,11 +3300,15 @@ export class FeishuHarnessBridge {
       key: options.key,
       chatId,
       conversationWorkspace: options.conversationWorkspace,
+      menuContext: options.menuContext ?? null,
       sessionWorkspace: typeof options.sessionWorkspace === 'string' && options.sessionWorkspace
         ? options.sessionWorkspace
         : null,
       sessionPage: Number.isSafeInteger(options.sessionPage) && options.sessionPage >= 0
         ? options.sessionPage
+        : 0,
+      modelPage: Number.isSafeInteger(options.modelPage) && options.modelPage >= 0
+        ? options.modelPage
         : 0,
       sessionLimit: Number.isSafeInteger(options.sessionLimit) && options.sessionLimit > 0
         ? options.sessionLimit
@@ -3039,6 +3341,14 @@ export class FeishuHarnessBridge {
     }
   }
 
+  #cardRequest(stage, operation) {
+    return waitForFeishuOperation(operation, {
+      signal: this.#signal,
+      timeoutMs: this.#requestTimeoutMs,
+      stage: `${stage} (${this.#requestTimeoutMs}ms)`,
+    });
+  }
+
   async #sendCard(chatId, cardJson, options = {}) {
     const updateMessageId = nonEmptyString(options.updateMessageId);
     const replyTo = nonEmptyString(options.replyTo);
@@ -3046,28 +3356,29 @@ export class FeishuHarnessBridge {
     // Session-sync cards target the user's openId (the synced DM is a user,
     // not a chat), delivered fresh without topic/thread handling.
     if (options.receiveIdType === 'open_id') {
-      const response = await this.#client.im.v1.message.create({
+      const response = await this.#cardRequest('card create', () => this.#client.im.v1.message.create({
         params: { receive_id_type: 'open_id' },
         data: {
           receive_id: chatId,
           msg_type: 'interactive',
           content: cardJson,
         },
-      });
+      }));
       if (response?.code && response.code !== 0) {
         throw new Error(`Feishu card send failed: ${response.msg || response.code}`);
       }
       const sentId = nonEmptyString(response?.data?.message_id);
       if (!sentId) throw new Error('Feishu card send returned no message_id');
+      this.#rememberCardRoute(sentId, response?.data?.chat_id ?? chatId, options);
       return sentId;
     }
 
     if (updateMessageId) {
       try {
-        const response = await this.#client.im.v1.message.patch({
+        const response = await this.#cardRequest('card patch', () => this.#client.im.v1.message.patch({
           path: { message_id: updateMessageId },
           data: { content: cardJson },
-        });
+        }));
         if (response?.code && response.code !== 0) {
           throw new Error(`Feishu card update failed: ${response.msg || response.code}`);
         }
@@ -3084,14 +3395,14 @@ export class FeishuHarnessBridge {
     const content = cardJson;
     if (replyTo) {
       try {
-        const response = await this.#client.im.v1.message.reply({
+        const response = await this.#cardRequest('card reply', () => this.#client.im.v1.message.reply({
           path: { message_id: replyTo },
           data: {
             msg_type: 'interactive',
             content,
             ...(this.#replyInThreadFor(replyTo) ? { reply_in_thread: true } : {}),
           },
-        });
+        }));
         if (response?.code && response.code !== 0) {
           throw new Error(`Feishu card reply failed: ${response.msg || response.code}`);
         }
@@ -3107,10 +3418,10 @@ export class FeishuHarnessBridge {
         this.#forgetTopicRoot(replyTo);
       }
     }
-    const response = await this.#client.im.v1.message.create({
+    const response = await this.#cardRequest('card create', () => this.#client.im.v1.message.create({
       params: { receive_id_type: 'chat_id' },
       data: { receive_id: chatId, msg_type: 'interactive', content: cardJson },
-    });
+    }));
     if (response?.code && response.code !== 0) {
       throw new Error(`Feishu card send failed: ${response.msg || response.code}`);
     }
@@ -3137,7 +3448,7 @@ export class FeishuHarnessBridge {
     const dataSignal = this.#cardDataSignal();
     // Independent sections start together. Each one degrades on its own so a
     // slow preset/model RPC cannot force redundant session-list scans.
-    const workspaceTask = workspacePathSnapshot(this.#harness, { signal: dataSignal })
+    const workspaceTask = workspacePathSnapshot(this.#harness, { signal: dataSignal, includeTitles: true })
       .catch(() => {
         const current = typeof this.#harness.currentWorkspace === 'function'
           ? this.#harness.currentWorkspace()
@@ -3213,14 +3524,16 @@ export class FeishuHarnessBridge {
     }
     const archiveVisible = this.#state?.includesArchivedSessions?.() ?? false;
     this.#rememberMenu(key, { kind: 'menu', chatId });
+    const menuContext = {
+      workspaces, currentWorkspace, workspaceTitles: snapshot.titles,
+      currentSession: currentSessionId ? { id: currentSessionId, title: currentSessionTitle } : null,
+      sessions, archiveVisible, presetCatalog, modelCatalog,
+      newSessionAction: { id: randomUUID(), status: 'idle' },
+    };
     await this.#sendCard(
       chatId,
-      menuCard({
-        workspaces, currentWorkspace,
-        currentSession: currentSessionId ? { id: currentSessionId, title: currentSessionTitle } : null,
-        sessions, archiveVisible, presetCatalog, modelCatalog,
-      }),
-      { key, updateMessageId, replyTo, conversationWorkspace },
+      menuCard(menuContext),
+      { key, updateMessageId, replyTo, conversationWorkspace, menuContext },
     );
   }
 
@@ -3277,7 +3590,7 @@ export class FeishuHarnessBridge {
   /**
    * Fetch the model catalog and show the model selection card.
    */
-  async #showModelCard(key, chatId, { updateMessageId = null } = {}) {
+  async #showModelCard(key, chatId, { updateMessageId = null, page = 0 } = {}) {
     try {
       const signal = this.#cardDataSignal();
       await this.#harness.ensureRunning({ signal });
@@ -3293,7 +3606,7 @@ export class FeishuHarnessBridge {
       if (!catalog) {
         catalog = await this.#harness.listModels({ signal });
       }
-      await this.#sendCard(chatId, modelCard(catalog), { key, updateMessageId });
+      await this.#sendCard(chatId, modelCard(catalog, { page }), { key, updateMessageId, modelPage: page });
     } catch (error) {
       await this.#sendFailure(chatId, error, { logLabel: 'model card', replyTo: updateMessageId });
     }
@@ -3401,6 +3714,22 @@ export class FeishuHarnessBridge {
       await this.#send(chatId, result?.message || t('上下文压缩失败。'), { replyTo });
     } catch (error) {
       await this.#sendFailure(chatId, error, { logLabel: 'compact', replyTo });
+    }
+  }
+
+  /** Run /clear while retaining the current Session binding. */
+  async #handleClear(key, chatId, replyTo = null) {
+    try {
+      const result = await runClearCommand(
+        '/clear', this.#harness, this.#state, key, {
+          signal: this.#signal,
+          pendingInteraction: this.#hasPendingInteraction(key),
+          busy: this.#queues.has(key),
+        },
+      );
+      await this.#send(chatId, result?.message || t('清空当前会话上下文失败，当前会话未修改，请稍后重试。'), { replyTo });
+    } catch (error) {
+      await this.#sendFailure(chatId, error, { logLabel: 'clear', replyTo });
     }
   }
 
@@ -3521,7 +3850,29 @@ export class FeishuHarnessBridge {
    * catalog validation, busy checks, pending-interaction checks and the
    * session binding lock stay in one place.
    */
-  async #handleModelSelect(key, chatId, modelId, { updateMessageId = null, replyTo = null } = {}) {
+  async #handleReasoningSelect(key, chatId, effort, { updateMessageId = null, replyTo = null, page = 0 } = {}) {
+    try {
+      const command = effort === REASONING_DEFAULT_SENTINEL ? '/reasoning --default' : `/reasoning ${effort}`;
+      const result = await runModelCommand(command, this.#harness, this.#state, key, {
+        signal: this.#signal,
+        pendingInteraction: this.#hasPendingInteraction(key),
+        control: { owner: this, key },
+      });
+      for (const reply of result?.messages ?? [result?.message]) {
+        if (reply) await this.#send(chatId, reply, { replyTo });
+      }
+    } catch (error) {
+      await this.#sendFailure(chatId, error, { logLabel: 'reasoning selection', replyTo: updateMessageId });
+      return;
+    }
+    try {
+      await this.#showModelCard(key, chatId, { updateMessageId, page });
+    } catch (error) {
+      this.#logger.warn?.('[dsh-feishu] model card refresh failed after reasoning select:', error.message);
+    }
+  }
+
+  async #handleModelSelect(key, chatId, modelId, { updateMessageId = null, replyTo = null, page = 0 } = {}) {
     try {
       const result = await runModelCommand(
         `/model ${modelId}`, this.#harness, this.#state, key, {
@@ -3538,9 +3889,9 @@ export class FeishuHarnessBridge {
       return;
     }
     try {
-      await this.#sendMenuCard(key, chatId, { updateMessageId, replyTo });
+      await this.#showModelCard(key, chatId, { updateMessageId, page });
     } catch (error) {
-      this.#logger.warn?.('[dsh-feishu] menu refresh failed after model select:', error.message);
+      this.#logger.warn?.('[dsh-feishu] model card refresh failed after model select:', error.message);
     }
   }
 
@@ -4053,10 +4404,12 @@ export class FeishuHarnessBridge {
     mirror.result = { ok: result?.ok === true, text };
     mirror.finishedAt = Date.now();
     // Keep the last successful snapshot on failure so recovery can preserve it.
-    if (result?.ok) await this.#state.clearMirror?.(mirror.key);
-    else if (recovering) {
+    if (result?.ok) await this.#clearMirrorRecovery(mirror.key);
+    else if (isExpiredMirrorError(result?.error)) {
+      await this.#clearMirrorRecovery(mirror.key, 'message expired');
+    } else if (recovering) {
       this.#sessionSyncTurns.delete(mirror.key);
-      this.#scheduleMirrorCheck(`recovery\0${mirror.key}`, () => this.#sealOrphanMirrors());
+      this.#scheduleMirrorCheck(`recovery\0${mirror.key}`, () => this.#sealOrphanMirrors(mirror.key));
     }
     return result?.ok === true;
   }
@@ -4108,7 +4461,12 @@ export class FeishuHarnessBridge {
     this.#scheduleMirrorCheck(key, () => this.#checkMirror(mirror));
     const openId = mirror.target.openId;
     if (type === 'user/message' && event.surfaceOp === 'append') {
-      const text = textFromHarnessContent(event.data?.content);
+      const source = event.data?.source;
+      // Goal rounds carry a `<goal_round>` driver prompt: announce the round
+      // instead of echoing that machine text into the chat.
+      const text = source?.kind === 'goal'
+        ? goalRoundLabel(source.round)
+        : textFromHarnessContent(event.data?.content);
       if (text.trim()) {
         const excerpt = text.length > 400 ? `${text.slice(0, 399)}…` : text;
         await this.#appendStepCardUpdate(key, openId, null,
@@ -4136,6 +4494,199 @@ export class FeishuHarnessBridge {
     }
   }
 
+  // ── Goal rounds opened outside the IM ───────────────────────────────────
+
+  /** Any conversation route bound to this session (the goal-round target). */
+  #hasConversationFor(sessionId) {
+    for (const key of this.#conversationRoutes.keys()) {
+      if (this.#state.sessionFor?.(key) === sessionId) return true;
+    }
+    return false;
+  }
+
+  /**
+   * A goal round is injected by the Harness goal driver: no inbound message
+   * opened it, so the step-card ladder of #answerWithStepPush never runs and
+   * a conversation bound to that session stays silent for the whole round.
+   * Announce the round and stream its tools/answer into the same live card
+   * the IM turns use, so a long auto-run still shows progress and delivers
+   * each round's result. IM-owned turns and sessions already mirrored into a
+   * synced DM are skipped.
+   */
+  async #feedGoalRoundTurn(sessionId, event, imOwned = false) {
+    if (this.#signal?.aborted) return;
+    const type = event.type;
+    if (type === 'turn/start') {
+      const started = event.data?.turn;
+      if (Number.isSafeInteger(started)) {
+        this.#goalTurnStarts.set(sessionId, { turn: started, seq: event.seq });
+      }
+      return;
+    }
+    if (type === 'user/message') {
+      const source = event.data?.source;
+      if (source?.kind !== 'goal' || imOwned) return;
+      const turn = this.#goalRoundTurn(sessionId, event);
+      if (!Number.isSafeInteger(turn) || this.#goalRoundsFor(sessionId, turn).length > 0) return;
+      await this.#openGoalRounds(sessionId, turn, source.round);
+      return;
+    }
+    if (type !== 'tool/call' && type !== 'assistant/message' && type !== 'turn/end') return;
+    const turn = event.data?.turn;
+    // A later turn proves earlier rounds are over even when their turn/end was
+    // lost, so close them instead of leaving a card open forever.
+    if (Number.isSafeInteger(turn)) await this.#sealStaleGoalRounds(sessionId, turn);
+    const rounds = Number.isSafeInteger(turn)
+      ? this.#goalRoundsFor(sessionId, turn)
+      : this.#goalRoundsFor(sessionId);
+    if (!rounds.length) return;
+    if (imOwned) {
+      // The user took the conversation back with a real IM turn: that turn's
+      // ask owns this key's card now, so sealing it here would truncate the
+      // reply the user is waiting for. Hand the round over instead — whatever
+      // streamed so far stays on the card the ask continues.
+      for (const round of rounds) {
+        round.finished = true;
+        this.#goalRounds.delete(round.key);
+      }
+      return;
+    }
+    for (const round of rounds) {
+      if (round.finished || event.seq <= round.lastSeq) continue;
+      if (this.#state.sessionFor?.(round.key) !== sessionId) {
+        // The conversation was rebound to another session: this session's
+        // later output must not land in the card the user now sees there.
+        await this.#sealGoalRound(round, 'completed');
+        continue;
+      }
+      round.lastSeq = event.seq;
+      if (type === 'tool/call') {
+        if (round.pendingStep) {
+          this.#morphStepCardAnswerToNote(round.key, round.pendingStep);
+          round.pendingStep = null;
+        }
+        await this.#appendStepCardUpdate(round.key, round.chatId, round.replyToMessageId,
+          this.#stepCardToolBlock({
+            name: event.data?.name ?? '',
+            arguments: typeof event.data?.arguments === 'string' ? event.data.arguments : '',
+          }), { billable: false });
+      } else if (type === 'assistant/message'
+        && event.surfaceOp === 'append'
+        && event.data?.interrupted !== true) {
+        const text = textFromHarnessContent(event.data?.message?.content);
+        if (!text.trim()) continue;
+        round.assistant.setCanonical(event.data?.step, text);
+        round.pendingStep = text;
+        this.#streamStepCardAnswer(round.key, round.chatId, round.replyToMessageId, text);
+      } else if (type === 'turn/end') {
+        const reason = typeof event.data?.reason === 'string' ? event.data.reason : event.data?.reason?.kind;
+        await this.#sealGoalRound(round, reason);
+      }
+    }
+  }
+
+  /**
+   * The turn a goal round belongs to. Harness `user/message` events injected by
+   * the goal driver omit `data.turn`, so fall back to the turn/start that
+   * opened the turn immediately before it.
+   */
+  #goalRoundTurn(sessionId, event) {
+    const declared = event.data?.turn;
+    if (Number.isSafeInteger(declared)) return declared;
+    const started = this.#goalTurnStarts.get(sessionId);
+    if (!started || !validEventSeq(started.seq) || started.seq >= event.seq) return undefined;
+    return started.turn;
+  }
+
+  #goalRoundsFor(sessionId, turn = null) {
+    const rounds = [];
+    for (const round of this.#goalRounds.values()) {
+      if (round.sessionId !== sessionId) continue;
+      if (turn !== null && round.turn !== turn) continue;
+      rounds.push(round);
+    }
+    return rounds;
+  }
+
+  async #openGoalRounds(sessionId, turn, roundNumber) {
+    const syncedOpenIds = await this.#sessionSyncOpenIds(sessionId);
+    for (const [key, route] of this.#conversationRoutes) {
+      // Only this session's own conversations take part. A key bound to some
+      // other session is not "rebound" from here — it is another session's
+      // card, and its round keeps running until that session says otherwise.
+      if (this.#state.sessionFor?.(key) !== sessionId) continue;
+      const existing = this.#goalRounds.get(key);
+      if (existing && existing.turn !== turn) {
+        // The previous round never reported turn/end (dropped event, crashed
+        // Host): it cannot be updated any more, so close it instead of
+        // letting it block this round.
+        await this.#sealGoalRound(existing);
+      }
+      if (this.#isSyncedDmKey(key, syncedOpenIds)) continue;
+      if (this.#goalRounds.has(key)) continue;
+      // A card left open by an abnormal exit is sealed before the new round
+      // reuses the conversation's card slot.
+      if (this.#stepCards.has(key)) await this.#finishStepCard(key);
+      this.#goalRounds.set(key, {
+        key,
+        sessionId,
+        turn,
+        chatId: route.chatId,
+        replyToMessageId: route.replyToMessageId,
+        assistant: new AssistantTextAccumulator(),
+        pendingStep: null,
+        lastSeq: -1,
+        finished: false,
+      });
+      await this.#appendStepCardUpdate(key, route.chatId, route.replyToMessageId,
+        { kind: 'message', text: goalRoundLabel(roundNumber) }, { billable: false });
+    }
+  }
+
+  /**
+   * Peers whose synced DM already mirrors this session with this bot. The
+   * mirror owns exactly that direct chat, not every conversation bound to the
+   * session, so a group topic keeps rendering alongside it.
+   */
+  async #sessionSyncOpenIds(sessionId) {
+    if (!this.#sessionSyncTargetsFor) return new Set();
+    try {
+      const targets = await this.#sessionSyncTargetsFor(sessionId);
+      const openIds = new Set();
+      for (const target of Array.isArray(targets) ? targets : []) {
+        if (target?.botId === this.#botId && nonEmptyString(target?.openId)) openIds.add(target.openId);
+      }
+      return openIds;
+    } catch {
+      return new Set();
+    }
+  }
+
+  /** The plain peer DM key the session-sync mirror delivers into. */
+  #isSyncedDmKey(key, openIds) {
+    if (!(openIds instanceof Set) || openIds.size === 0) return false;
+    if (!key.startsWith('p2p:')) return false;
+    const peer = key.slice(4);
+    // Managed topics inside a DM are separate surfaces the mirror does not
+    // reach: only the plain direct chat is duplicated by it.
+    return !peer.includes(':') && openIds.has(peer);
+  }
+
+  async #sealStaleGoalRounds(sessionId, turn) {
+    const stale = this.#goalRoundsFor(sessionId).filter((round) => round.turn < turn);
+    for (const round of stale) await this.#sealGoalRound(round, 'completed');
+  }
+
+  async #sealGoalRound(round, reason = 'completed') {
+    if (round.finished) return;
+    round.finished = true;
+    this.#goalRounds.delete(round.key);
+    await this.#finishStepCard(round.key, {
+      stopped: reason === 'stopped' || reason === 'aborted' || reason === 'cancelled',
+      answerText: round.assistant.text,
+    });
+  }
+
   #onHarnessEvent({ sessionId, event }) {
     if (this.#signal?.aborted
       || !sessionId
@@ -4149,10 +4700,15 @@ export class FeishuHarnessBridge {
     // card, tool/call and assistant/message feed it, turn/end seals it);
     // IM-opened turns are skipped — they already own their card via the ask
     // callbacks. turn/end ALSO continues below for watch completions.
+    const imOwned = this.#isImTurn(sessionId);
     if (this.#sessionSyncTargetsFor) {
-      const imOwned = this.#isImTurn(sessionId);
       void this.#queueEventTask(sessionId, () => this.#feedSessionSyncTurn(sessionId, event, imOwned));
-      if (event.type !== 'turn/end') return;
+    }
+    // Goal auto-continuation: a round opened by the Harness goal driver has
+    // no inbound message behind it, so it renders into the bound conversation
+    // through this bridge instead of an ask callback. Same event ladder.
+    if (this.#goalRounds.size > 0 || this.#hasConversationFor(sessionId)) {
+      void this.#queueEventTask(sessionId, () => this.#feedGoalRoundTurn(sessionId, event, imOwned));
     }
     if (event.type !== 'turn/end') return;
     // Record before consulting state: /watch may still be resolving its target
@@ -4294,6 +4850,7 @@ export class FeishuHarnessBridge {
 
   #interactionAskOptions(event, key, files, images) {
     return {
+      groupHistory: event.groupHistory,
       timeoutMs: this.#replyTimeoutMs,
       signal: this.#signal,
       control: { owner: this, key },
@@ -4613,7 +5170,13 @@ export class FeishuHarnessBridge {
 
   /** Replace the draft interval with `text` chunked into splitter-safe blocks. */
   #writeStepCardAnswer(card, text) {
-    const blocks = splitStepPostMarkdown(text, STEP_STREAM_ANSWER_CHUNK_MAX_BYTES)
+    // JSON can expand one UTF-16 unit to six bytes (for example a control
+    // character). Leave room for the element wrapper, and let the existing
+    // Markdown splitter reopen fences in each independently rendered block.
+    const chunks = Buffer.byteLength(JSON.stringify(text), 'utf8') + 128 <= STEP_STREAM_ANSWER_CHUNK_MAX_BYTES
+      ? [text]
+      : chunkMarkdownText(text, Math.floor((STEP_STREAM_ANSWER_CHUNK_MAX_BYTES - 128) / 6));
+    const blocks = chunks
       .map((chunk) => ({ kind: 'message', text: chunk }));
     if (card.answerStart !== null) {
       card.blocks.splice(card.answerStart, card.answerEnd - card.answerStart + 1, ...blocks);
@@ -4676,7 +5239,7 @@ export class FeishuHarnessBridge {
    * their lifecycle is owned by the ask path, not the mirror recovery.
    * lastContent keeps stepStreamCard's raw JSON string (single-encoded).
    */
-  async #persistMirrorState(card, liveBlocks, status) {
+  async #persistMirrorState(card, liveBlocks, status, stepCardPanels) {
     const sessionId = card.sessionSyncSessionId;
     if (!sessionId || typeof this.#state.setMirror !== 'function') return;
     await this.#state.setMirror(card.sessionSyncKey, {
@@ -4684,7 +5247,7 @@ export class FeishuHarnessBridge {
       chatId: card.chatId,
       cardIds: [...card.cardIds],
       claimedAt: Date.now(),
-      lastContent: stepStreamCard(liveBlocks, { status }),
+      lastContent: stepStreamCard(liveBlocks, { status, stepCardPanels }),
       blocks: structuredClone(card.blocks), answerStart: card.answerStart, answerEnd: card.answerEnd,
       lastSeq: this.#sessionSyncTurns.get(card.sessionSyncKey)?.lastSeq ?? -1,
       pendingStep: this.#sessionSyncTurns.get(card.sessionSyncKey)?.pendingStep ?? null,
@@ -4692,7 +5255,7 @@ export class FeishuHarnessBridge {
   }
 
   /** Sync only this interaction's cards; earlier interactions remain sealed. */
-  async #syncStepCardChunks(card, chunks, status) {
+  async #syncStepCardChunks(card, chunks, status, stepCardPanels) {
     const answerVersion = card.answerVersion ?? 0;
     const activeIds = card.cardIds.slice(card.activeCardStart);
     const groups = chunks.length ? [...chunks] : [[]];
@@ -4705,6 +5268,7 @@ export class FeishuHarnessBridge {
     // payload halfway through this render or be marked as already delivered.
     const contents = groups.map((blocks, index) => stepStreamCard(blocks, {
       status: index === groups.length - 1 ? status : 'sealed',
+      stepCardPanels,
     }));
     for (let index = 0; index < contents.length; index += 1) {
       let id = activeIds[index];
@@ -4729,22 +5293,25 @@ export class FeishuHarnessBridge {
 
   async #renderStepCardNow(chatId, card) {
     if (card.broken) return;
-    const chunks = splitStepStreamCardBlocks(card.blocks);
+    const stepCardPanels = this.#stepCardPanels;
+    const chunks = splitStepStreamCardBlocks(card.blocks, undefined, undefined, stepCardPanels);
     if (!chunks.length && card.messageId === null) return;
     const live = chunks[chunks.length - 1] ?? [];
     try {
-      await this.#syncStepCardChunks(card, chunks, 'running');
-      await this.#persistMirrorState(card, live, 'running');
+      await this.#syncStepCardChunks(card, chunks, 'running', stepCardPanels);
+      await this.#persistMirrorState(card, live, 'running', stepCardPanels);
       card.lastRenderAt = this.#stepPushClock.now();
     } catch (error) {
       card.broken = true;
+      card.lastError = error;
       this.#logger.warn?.(
         '[dsh-feishu] step streaming card render failed; the turn continues without it:',
-        error?.message ?? String(error),
+        mirrorErrorText(error),
       );
       if (card.deliveryViaOpenId) {
         this.#logger.warn?.('[dsh-feishu] session-sync mirror card render failed:',
-          error?.message ?? String(error));
+          mirrorErrorText(error),
+          { sessionId: card.sessionSyncSessionId, turn: card.sessionSyncTurn });
       }
     }
   }
@@ -4753,9 +5320,8 @@ export class FeishuHarnessBridge {
    * Seal the turn's card with a terminal status and the final answer. The
    * streamed answer draft is rewritten in place with the delivery text; when
    * no draft exists the answer is appended. Returns `{ ok, cardIds }` when
-   * the answer is visible on the cards, or null when the caller must fall
-   * back to the post ladder (absent/broken card, or the answer never reached
-   * a successful render). Safe to call twice.
+   * the answer is visible, `{ ok: false, error }` on failure, or null when
+   * no card exists. Callers fall back unless ok is true. Safe to call twice.
    */
   async #finishStepCard(key, { stopped = false, answerText = null } = {}) {
     const card = this.#stepCards.get(key);
@@ -4764,7 +5330,7 @@ export class FeishuHarnessBridge {
     try {
       await card.renderChain?.catch?.(() => {});
     } catch { /* the seal below decides what the user sees */ }
-    if (card.broken) return null;
+    if (card.broken) return { ok: false, error: card.lastError };
     const status = stopped ? 'stopped' : 'completed';
     const body = typeof answerText === 'string' ? answerText : '';
     // Whether the answer was already visible from a streamed draft render —
@@ -4773,9 +5339,10 @@ export class FeishuHarnessBridge {
     if (body.trim()) {
       this.#writeStepCardAnswer(card, body);
     }
-    const chunks = splitStepStreamCardBlocks(card.blocks);
+    const stepCardPanels = this.#stepCardPanels;
+    const chunks = splitStepStreamCardBlocks(card.blocks, undefined, undefined, stepCardPanels);
     try {
-      await this.#syncStepCardChunks(card, chunks, status);
+      await this.#syncStepCardChunks(card, chunks, status, stepCardPanels);
       return { ok: true, cardIds: card.cardIds };
     } catch (error) {
       // Only trust the streamed draft when the LAST SUCCESSFUL render actually
@@ -4794,9 +5361,10 @@ export class FeishuHarnessBridge {
       }
       this.#logger.warn?.(
         '[dsh-feishu] step streaming card finish failed:',
-        error?.message ?? String(error),
+        mirrorErrorText(error),
+        { sessionId: card.sessionSyncSessionId, turn: card.sessionSyncTurn },
       );
-      return null;
+      return { ok: false, error };
     }
   }
 
@@ -4825,8 +5393,9 @@ export class FeishuHarnessBridge {
     if (card.broken) return;
     if (card.messageId === null) return;
     try {
-      const chunks = splitStepStreamCardBlocks(card.blocks);
-      await this.#syncStepCardChunks(card, chunks, 'sealed');
+      const stepCardPanels = this.#stepCardPanels;
+      const chunks = splitStepStreamCardBlocks(card.blocks, undefined, undefined, stepCardPanels);
+      await this.#syncStepCardChunks(card, chunks, 'sealed', stepCardPanels);
     } catch (error) {
       this.#logger.warn?.(
         '[dsh-feishu] step streaming card rotate seal failed:',
@@ -4845,12 +5414,15 @@ export class FeishuHarnessBridge {
   }
 
   async #patchStepCard(messageId, cardJson) {
-    const response = await this.#client.im.v1.message.patch({
+    const response = await this.#cardRequest('step card patch', () => this.#client.im.v1.message.patch({
       path: { message_id: messageId },
       data: { content: cardJson },
-    });
+    }));
     if (response?.code && response.code !== 0) {
-      throw new Error(`Feishu step card patch failed: ${response.msg || response.code}`);
+      const error = new Error(`Feishu step card patch failed: ${response.msg || response.code}`);
+      error.code = response.code;
+      error.feishuCode = response.code;
+      throw error;
     }
   }
 
@@ -5102,10 +5674,15 @@ export class FeishuHarnessBridge {
 
   async #preparePrompt(event, key, message) {
     const snapshot = this.#acceptedMessageIds.get(event.message.message_id);
+    const originalFiles = Array.isArray(message.files) ? [...message.files] : [];
     const build = async (input) => {
       const rich = hasInboundImages(input) || hasReplyReference(input);
       const original = rich
-        ? await promptContentForInboundMessage(input, { signal: this.#signal, deferImages: true })
+        ? await promptContentForInboundMessage(input, {
+          signal: this.#signal,
+          deferImages: true,
+          originalFiles,
+        })
         : input.content;
       const enhanced = enhanceContextContent(original, snapshot, () => ({
         channel: 'feishu',
@@ -5127,7 +5704,12 @@ export class FeishuHarnessBridge {
       && (nonEmptyString(message.content) || hasInboundImages(message) || hasInboundFiles(message));
     if (!topicAnchor) return build(message);
 
-    const withoutAnchor = { ...message };
+    // Keep the temporary topic-root copy connected to the final request's
+    // attachment array. Reply resolution may append lazy files to it.
+    const withoutAnchor = {
+      ...message,
+      files: Array.isArray(message.files) ? message.files : (message.files = []),
+    };
     delete withoutAnchor.replyTo;
     const base = await build(withoutAnchor);
     let preparedSessionId;
@@ -5143,6 +5725,7 @@ export class FeishuHarnessBridge {
         }
         const prepared = await build({
           ...message,
+          files: message.files,
           replyTo: {
             ...message.replyTo,
             load: async (options) => {
@@ -5288,6 +5871,7 @@ export class FeishuHarnessBridge {
     let completed;
     try {
       completed = await askInWorkspaceSession({
+        onNotice: (notice) => this.#send(chatId, notice, { replyTo: messageId }),
       deferredDelivery: () => ({ coordinator: this.#deferred, chatId, replyToMessageId: messageId }),
       harness: this.#harness,
       state: this.#state,
@@ -5538,6 +6122,7 @@ export class FeishuHarnessBridge {
     const { content, contextEnhanced } = prompt;
     if (!this.#channel?.stream) {
       const { sessionId, answer, artifacts = [] } = await askInWorkspaceSession({
+        onNotice: (notice) => this.#send(chatId, notice, { replyTo: messageId }),
         deferredDelivery: () => ({ coordinator: this.#deferred, chatId, replyToMessageId: messageId }),
         harness: this.#harness,
         state: this.#state,
@@ -5621,6 +6206,7 @@ export class FeishuHarnessBridge {
             },
           };
           const completed = await askInWorkspaceSession({
+            onNotice: (notice) => this.#send(chatId, notice, { replyTo: messageId }),
             deferredDelivery: () => ({ coordinator: this.#deferred, chatId, replyToMessageId: messageId }),
             harness: this.#harness,
             state: this.#state,
@@ -5696,6 +6282,7 @@ export class FeishuHarnessBridge {
 
       this.#logger.warn?.('[dsh-feishu] native stream unavailable; using text fallback:', error.message);
       const { sessionId, answer, artifacts = [] } = await askInWorkspaceSession({
+        onNotice: (notice) => this.#send(chatId, notice, { replyTo: messageId }),
         deferredDelivery: () => ({ coordinator: this.#deferred, chatId, replyToMessageId: messageId }),
         harness: this.#harness,
         state: this.#state,
@@ -5802,6 +6389,7 @@ export class FeishuHarnessBridge {
       });
     }
     pending.chatId = event.message.chat_id;
+    pending.receiveIdType = 'chat_id';
     if (pending.needsPresentation) {
       try {
         await this.#presentInteraction(pending);
@@ -5857,9 +6445,17 @@ export class FeishuHarnessBridge {
   }
 
   async #submitQuestionAnswer(pending, answerText, { chatId, messageId, questionMessageId } = {}) {
+    const expectedIndex = pending.index;
+    try { if (pending.validate) await pending.validate(); }
+    catch {
+      if (chatId) await this.#send(chatId, INTERACTION_RESOLVED_TEXT(), { replyTo: messageId }).catch(() => undefined);
+      return;
+    }
+    if (pending.inactive || pending.submitting || pending.index !== expectedIndex) return;
     const question = pending.questions[pending.index];
     if (!question) return;
     pending.chatId = chatId ?? pending.chatId;
+    if (chatId) pending.receiveIdType = 'chat_id';
 
     // issue #162：已答状态卡以推进前的题号渲染，并整卡替换原提问卡。
     const answeredIndex = pending.index;
@@ -5937,20 +6533,16 @@ export class FeishuHarnessBridge {
     }
   }
 
-  async #handleInteraction(interaction, {
-    key,
-    actor,
-    chatId,
-    requiresMention,
-    replyToMessageId,
-  }) {
+  #approvalContext({ key, actor, chatId, requiresMention, replyToMessageId, receiveIdType,
+    validate, send = (text) => this.#send(chatId, text, { replyTo: replyToMessageId }) }) {
     let approvalCardMessageId = null;
     let approvalCardData = null;
-    if (await this.#approvals.handleRequested(interaction, {
+    return {
       key,
       actor,
       requiresMention,
-      send: (text) => this.#send(chatId, text, { replyTo: replyToMessageId }),
+      send,
+      validate,
       // Approvals render as interactive cards with approve/reject buttons by
       // default. Set the bridge `interactionCards` option (or
       // DSH_IM_INTERACTION_CARDS=0) to keep the plain-text reply flow.
@@ -5967,27 +6559,107 @@ export class FeishuHarnessBridge {
               approvalCardMessageId = await this.#sendCard(
                 chatId,
                 approvalCard(approvalCardData),
-                { key, replyTo: replyToMessageId },
+                { key, replyTo: replyToMessageId, receiveIdType },
               ).catch(async () => {
                 // Fall back to the plain-text approval if the card cannot be
                 // sent. If the text send also fails, let the error propagate so
                 // the pending approval is not marked as presented and the
                 // existing retry/reconnect logic can run.
-                await this.#send(chatId, pending.text, { replyTo: replyToMessageId });
+                await send(pending.text);
                 return null;
               });
             },
             onResolved: async (resolvedText) => {
               if (!approvalCardMessageId) return;
-              await this.#patchCardMessage(
+              const patched = await this.#patchCardMessage(
                 chatId,
                 approvalCardMessageId,
                 approvalCard({ ...approvalCardData, resolvedText }),
               );
+              if (!patched) throw new Error('Approval card update failed');
             },
           }
         : {}),
-    })) return;
+    };
+
+  }
+
+  async presentSessionSyncApproval(interaction, context, options = {}) {
+    return this.#approvals.handleSessionSyncRequested(interaction, this.#approvalContext(context), {
+      ...options, runtimeSignal: this.#signal, accessPolicy: this.#accessPolicy,
+    });
+  }
+
+  /** Use the normal question/reply state machine without submitting a new IM prompt. */
+  async presentSessionSyncQuestion(interaction, context, { signal, completion } = {}) {
+    if (signal?.aborted || this.#signal?.aborted || this.#hasPendingInteraction(context.key)) return false;
+    let finished = false;
+    const cleanup = () => {
+      finished = true;
+      signal?.removeEventListener('abort', finish);
+      this.#signal?.removeEventListener('abort', onStop);
+    };
+    const finish = () => {
+      const pending = this.#pendingInteractions.get(context.key);
+      if (pending?.interactionId === interaction.interactionId) {
+        this.#rememberResolvedInteraction(context.key, pending);
+        this.#clearPendingInteraction(context.key, pending.interactionId);
+      }
+      cleanup();
+    };
+    const withdraw = async () => {
+      finish();
+      await interaction.withdraw?.();
+    };
+    const onStop = () => {
+      void withdraw().catch((error) => this.#logger.warn?.('[dsh-feishu] question withdrawal failed:', error?.code));
+    };
+    const validate = async () => {
+      try {
+        await context.validate?.();
+        if (finished || signal?.aborted || this.#signal?.aborted
+          || (!this.#accessPolicy && !this.#allowedSenderOpenIds.has('*')
+            && !this.#allowedSenderOpenIds.has(context.actor))
+          || !context.actor || !evaluateInboundAccess(this.#accessPolicy, {
+            conversationType: 'direct', senderIds: [context.actor], text: 'yes',
+          }).allowed) throw new Error('Question recipient is no longer available');
+      } catch (cause) {
+        await withdraw();
+        throw Object.assign(new Error('Question is no longer answerable', { cause }), { code: 'interaction-not-pending' });
+      }
+    };
+    signal?.addEventListener('abort', finish, { once: true });
+    this.#signal?.addEventListener('abort', onStop, { once: true });
+    Promise.resolve(completion).then(finish, finish);
+    try {
+      await validate();
+      await this.#handleInteraction(interaction, {
+        ...context, validate, onClear: cleanup, lifecycle: 'session-sync',
+      });
+      if (finished) finish(); // A completion during delivery must not leave a pending behind.
+      const available = !finished && this.#pendingInteractions.get(context.key)?.interactionId === interaction.interactionId;
+      if (!available) cleanup();
+      return available;
+    } catch (error) {
+      await withdraw();
+      throw error;
+    }
+  }
+
+  async #handleInteraction(interaction, {
+    key,
+    actor,
+    chatId,
+    requiresMention,
+    replyToMessageId,
+    receiveIdType,
+    validate,
+    onClear,
+    lifecycle = 'turn',
+  }) {
+    if (await this.#approvals.handleRequested(interaction, this.#approvalContext({
+      key, actor, chatId, requiresMention, replyToMessageId,
+    }))) return;
 
     // Approval requests return above; the existing question state machine stays unchanged.
     if (interaction?.kind !== 'question') return;
@@ -6030,6 +6702,10 @@ export class FeishuHarnessBridge {
     }
     if (this.#interactionKeys.has(interactionId)) return;
     if (existing) {
+      if (interaction.withdraw) {
+        await interaction.withdraw();
+        return;
+      }
       await interaction.respond({
         ok: false,
         error: {
@@ -6054,6 +6730,10 @@ export class FeishuHarnessBridge {
       index: 0,
       chatId,
       replyToMessageId,
+      receiveIdType,
+      validate,
+      onClear,
+      lifecycle,
       queue: null,
       claimedReplyMessageId: null,
       submitting: false,
@@ -6079,6 +6759,8 @@ export class FeishuHarnessBridge {
   }
 
   async #presentInteraction(pending) {
+    if (pending.validate) await pending.validate();
+    if (pending.inactive) return;
     const question = pending.questions[pending.index];
     if (!question) return;
     const options = Array.isArray(question?.options) ? question.options : [];
@@ -6106,7 +6788,7 @@ export class FeishuHarnessBridge {
           index: pending.index,
           total: pending.questions.length,
         }),
-        { key: pending.key, replyTo: pending.replyToMessageId },
+        { key: pending.key, replyTo: pending.replyToMessageId, receiveIdType: pending.receiveIdType },
       ).then((sent) => {
         presentedAsCard = true;
         return sent;
@@ -6114,12 +6796,14 @@ export class FeishuHarnessBridge {
         // Fall back to the plain-text question if the card cannot be sent.
         // If the text send also fails, let the error propagate so the pending
         // question is not marked as presented and the existing retry logic runs.
+        if (pending.inactive) return null;
+        if (pending.validate) await pending.validate();
         return this.#send(
           pending.chatId,
           harnessQuestionText(question, pending.index, pending.questions.length, {
             requiresMention: pending.requiresMention,
           }),
-          { replyTo: pending.replyToMessageId },
+          { replyTo: pending.replyToMessageId, receiveIdType: pending.receiveIdType },
         );
       });
     } else {
@@ -6132,7 +6816,7 @@ export class FeishuHarnessBridge {
           pending.questions.length,
           { requiresMention: pending.requiresMention },
         ),
-        { replyTo: pending.replyToMessageId },
+        { replyTo: pending.replyToMessageId, receiveIdType: pending.receiveIdType },
       );
     }
     if (messageId) {
@@ -6186,6 +6870,7 @@ export class FeishuHarnessBridge {
     this.#pendingInteractions.delete(key);
     this.#interactionKeys.delete(pending.interactionId);
     pending.inactive = true;
+    pending.onClear?.();
     return pending;
   }
 
@@ -6198,6 +6883,13 @@ export class FeishuHarnessBridge {
     if (!pending || pending.kind !== 'question') return;
     this.#rememberResolvedInteraction(key, pending);
     try {
+      // A synced question is owned by its upstream provider, not this IM turn.
+      // Withdraw the IM route so the provider also releases its delivery state;
+      // DS Bot's answer endpoint does not accept a Harness cancellation answer.
+      if (pending.lifecycle === 'session-sync' && pending.interaction.withdraw) {
+        await pending.interaction.withdraw();
+        return;
+      }
       await pending.interaction.respond({
         ok: false,
         error: {
@@ -6242,7 +6934,7 @@ export class FeishuHarnessBridge {
     else processingReaction.success();
   }
 
-  async #send(chatId, text, { replyTo } = {}) {
+  async #send(chatId, text, { replyTo, receiveIdType = 'chat_id' } = {}) {
     const content = JSON.stringify({ text });
     if (replyTo) {
       try {
@@ -6271,7 +6963,7 @@ export class FeishuHarnessBridge {
       }
     }
     const response = await this.#client.im.v1.message.create({
-      params: { receive_id_type: 'chat_id' },
+      params: { receive_id_type: receiveIdType },
       data: {
         receive_id: chatId,
         msg_type: 'text',

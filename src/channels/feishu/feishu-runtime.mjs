@@ -1,10 +1,11 @@
 import { createConnectionDiagnostics, atConnectionStage } from '../shared/connection-error.mjs';
+import { readExternalHistory } from './history-reader.mjs';
 import { randomUUID } from 'node:crypto';
 import { FeishuHarnessBridge } from './bridge.mjs';
 import { cardActionProbeCard } from './feishu-cards.mjs';
-import { VerifiedFeishuChannel } from './feishu-channel.mjs';
+import { VerifiedFeishuChannel, waitForFeishuOperation } from './feishu-channel.mjs';
 import { normalizeFeishuGroupResponseMode } from './group-response-mode.mjs';
-import { normalizeFeishuStepPushMode } from './step-push-mode.mjs';
+import { normalizeFeishuStepPushMode, normalizeFeishuStepCardPanels } from './step-push-mode.mjs';
 import { createVoice } from './voice.mjs';
 import {
   syncSlashCommands,
@@ -118,12 +119,14 @@ export class FeishuRuntime {
   #mentionTopicReply;
   #stepPush;
   #stepPushMode;
+  #stepCardPanels;
   #voice = null;
   #sessionSyncTargetsFor;
   #ownerOpenIds;
   #harness;
   #state;
   #contextEnhancement;
+  #groupHistory;
   #accessPolicy;
   #replyTimeoutMs;
   #connectTimeoutMs;
@@ -134,6 +137,8 @@ export class FeishuRuntime {
   #repair;
   #client = null;
   #bridge = null;
+  #consumerMode;
+  #acceptExternal;
   #wsClient = null;
   #starting = null;
   #stopping = null;
@@ -157,6 +162,8 @@ export class FeishuRuntime {
 
   constructor({
     lark,
+    consumerMode = 'standalone',
+    acceptExternal,
     botId,
     appId,
     appSecret,
@@ -166,6 +173,7 @@ export class FeishuRuntime {
     mentionTopicReply = true,
     stepPush = false,
     stepPushMode = 'post',
+    stepCardPanels,
     voice = null,
     sessionSyncTargetsFor = null,
     ownerOpenId,
@@ -173,6 +181,7 @@ export class FeishuRuntime {
     harness,
     state,
     contextEnhancement,
+    groupHistory,
     accessPolicy,
     repair,
     replyTimeoutMs = 600000,
@@ -197,6 +206,8 @@ export class FeishuRuntime {
       throw new TypeError('FeishuRuntime requestTimeoutMs must be a positive number');
     }
 
+    this.#consumerMode = consumerMode;
+    this.#acceptExternal = acceptExternal;
     this.#lark = lark;
     this.#botId = nonEmptyString(botId);
     this.#appId = appId;
@@ -207,6 +218,7 @@ export class FeishuRuntime {
     this.#mentionTopicReply = mentionTopicReply !== false;
     this.#stepPush = stepPush === true;
     this.#stepPushMode = normalizeFeishuStepPushMode(stepPushMode);
+    this.#stepCardPanels = normalizeFeishuStepCardPanels(stepCardPanels);
     // voice 为 { config, secret } 来源;凭据缺失时 createVoice 返回禁用对象,
     // 桥接层完全跳过语音路径,不影响连接。
     this.#voice = voice == null
@@ -219,12 +231,13 @@ export class FeishuRuntime {
     this.#harness = harness;
     this.#state = state;
     this.#contextEnhancement = contextEnhancement;
+    this.#groupHistory = groupHistory;
     this.#accessPolicy = accessPolicy;
     this.#repair = repair ?? null;
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#connectTimeoutMs = connectTimeoutMs;
     this.#requestTimeoutMs = requestTimeoutMs;
-    this.#slashCommands = Boolean(slashCommands);
+    this.#slashCommands = consumerMode !== 'external-consumer' && Boolean(slashCommands);
     this.#slashPanel = normalizeSlashPanelConfig(slashPanel);
     this.#wsAgent = wsAgent;
     this.#logger = logger; this.#diagnostics = createConnectionDiagnostics({ channel: 'feishu', logger });
@@ -253,6 +266,11 @@ export class FeishuRuntime {
   setStepPushMode(value) {
     this.#stepPushMode = normalizeFeishuStepPushMode(value);
     this.#bridge?.setStepPushMode(this.#stepPushMode);
+  }
+
+  setStepCardPanels(value) {
+    this.#stepCardPanels = normalizeFeishuStepCardPanels(value);
+    this.#bridge?.setStepCardPanels(this.#stepCardPanels);
   }
 
   setVoice(source) {
@@ -348,12 +366,14 @@ export class FeishuRuntime {
         client,
         initialText: t('已连接 DeepSeek Harness，正在思考…'),
       });
-      const bridge = new FeishuHarnessBridge({
+      const bridge = this.#consumerMode === 'external-consumer' ? null : new FeishuHarnessBridge({
         client,
         channel,
         harness: this.#harness,
         state: this.#state,
         contextEnhancement: this.#contextEnhancement,
+      groupHistory: this.#groupHistory,
+        groupHistoryScope: this.#domain,
         accessPolicy: this.#accessPolicy,
         status: this.#status,
         allowedSenderOpenIds: new Set(this.#ownerOpenIds),
@@ -364,9 +384,11 @@ export class FeishuRuntime {
         mentionTopicReply: this.#mentionTopicReply,
         stepPush: this.#stepPush,
         stepPushMode: this.#stepPushMode,
+        stepCardPanels: this.#stepCardPanels,
         voice: this.#voice,
         sessionSyncTargetsFor: this.#sessionSyncTargetsFor,
         repair: this.#repair,
+        requestTimeoutMs: this.#requestTimeoutMs,
         replyTimeoutMs: this.#replyTimeoutMs,
         // Interaction cards (approval/question buttons) are on by default.
         // Set DSH_IM_INTERACTION_CARDS=0 to fall back to plain-text replies.
@@ -380,6 +402,12 @@ export class FeishuRuntime {
 
       const dispatcher = new this.#lark.EventDispatcher({}).register({
         'im.message.receive_v1': (event) => {
+          if (this.#consumerMode === 'external-consumer') {
+            assertCurrentStart();
+            if (typeof this.#acceptExternal !== 'function')
+              throw Object.assign(new Error('consumer-unavailable'), { code: 'consumer-unavailable' });
+            return this.#acceptExternal(event, { signal });
+          }
           if (isCurrentStart()) void bridge.accept(event);
         },
         'im.message.reaction.created_v1': () => undefined,
@@ -388,7 +416,7 @@ export class FeishuRuntime {
         // subscribes card.action.trigger; the number-reply fallback covers
         // apps that do not).
         'card.action.trigger': (event) => {
-          if (!isCurrentStart()) return;
+          if (!isCurrentStart() || this.#consumerMode === 'external-consumer') return;
           this.#status.cardActionsReceived += 1;
           this.#status.lastCardActionAt = new Date().toISOString();
           if (!this.#consumeCardActionProbe(event)) void bridge.onCardAction(event);
@@ -674,7 +702,28 @@ export class FeishuRuntime {
     });
   }
 
-  async sendProactiveText(target, text, { signal, format = 'plain' } = {}) {
+  async presentSessionSyncApproval(target, interaction, options = {}) {
+    if (!this.#status.ready || !this.#bridge) return false;
+    const actor = typeof target?.route?.openId === 'string' ? target.route.openId.trim() : '';
+    if (!actor) return false;
+    return this.#bridge.presentSessionSyncApproval(interaction, {
+      key: options.key, actor, validate: options.validate,
+      chatId: actor, receiveIdType: 'open_id',
+      send: (text) => this.sendProactiveText(target, text),
+    }, options);
+  }
+
+  async presentSessionSyncQuestion(target, interaction, options = {}) {
+    if (!this.#status.ready || !this.#bridge || target?.kind !== 'user') return false;
+    const actor = nonEmptyString(target.route?.openId);
+    if (!actor) return false;
+    return this.#bridge.presentSessionSyncQuestion(interaction, {
+      key: options.key, actor, validate: options.validate,
+      chatId: actor, receiveIdType: 'open_id', requiresMention: false,
+    }, options);
+  }
+
+  async sendProactiveText(target, text, { signal, format = 'plain', receipt = false } = {}) {
     if (!this.#status.ready || !this.#client) {
       const error = new Error('飞书机器人尚未连接');
       error.code = 'bot-not-connected';
@@ -697,26 +746,85 @@ export class FeishuRuntime {
       error.code = 'bad-request';
       throw error;
     }
+    if (typeof receipt !== 'boolean' || (receipt && target.kind !== 'group'))
+      throw Object.assign(new Error('capability-unavailable'), { code: 'capability-unavailable' });
     signal?.throwIfAborted();
     // Use the same native Markdown element as chat, without opening a stream
     // or retrying as plain text after a possibly accepted delivery.
     const content = format === 'markdown'
       ? { schema: '2.0', body: { elements: [{ tag: 'markdown', content: text }] } }
       : { text };
-    const response = await this.#client.im.v1.message.create({
+    const activeSignal = signal
+      ? AbortSignal.any([signal, this.#abortController.signal])
+      : this.#abortController.signal;
+    const response = await waitForFeishuOperation(() => this.#client.im.v1.message.create({
       params: { receive_id_type: receiveIdType },
       data: {
         receive_id: receiveId,
         msg_type: format === 'markdown' ? 'interactive' : 'text',
         content: JSON.stringify(content),
       },
+    }), {
+      signal: activeSignal,
+      timeoutMs: this.#requestTimeoutMs,
+      stage: `proactive text send (${this.#requestTimeoutMs}ms)`,
     });
     if (response?.code && response.code !== 0) {
       const error = new Error(`Feishu proactive delivery failed: ${response.msg || response.code}`);
       error.code = 'target-rejected';
       throw error;
     }
-    return { sent: true };
+    if (!receipt) return { sent: true };
+    const messageId = response?.data?.message_id;
+    const conversationId = response?.data?.chat_id;
+    if (typeof messageId !== 'string' || !messageId || messageId.length > 512 || conversationId !== receiveId)
+      throw Object.assign(new Error('send-result-unknown'), { code: 'send-result-unknown' });
+    return { sent: true, receipt: { version: 1, messageId, conversationId } };
+  }
+
+  async historyChecked(identity, route, query, { signal } = {}) {
+    const client = this.#client;
+    if (!client || this.#consumerMode !== 'external-consumer')
+      throw Object.assign(new Error('bot-not-connected'), { code: 'bot-not-connected' });
+    const result = await readExternalHistory(client, identity, route, query, signal);
+    signal?.throwIfAborted();
+    if (this.#client !== client)
+      throw Object.assign(new Error('bot-not-connected'), { code: 'bot-not-connected' });
+    return result;
+  }
+
+  async replyChecked(route, text, { signal } = {}) {
+    if (!route || typeof route.messageId !== 'string' || typeof route.conversationId !== 'string'
+      || typeof route.actorId !== 'string' || typeof text !== 'string' || !text.trim() || text.length > 4000)
+      throw Object.assign(new Error('bad-request'), { code: 'bad-request' });
+    const client = this.#client;
+    if (!client || this.#consumerMode !== 'external-consumer')
+      throw Object.assign(new Error('bot-not-connected'), { code: 'bot-not-connected' });
+    signal?.throwIfAborted();
+    const current = await client.im.v1.message.get({ path: { message_id: route.messageId } });
+    const source = current?.data?.items?.find(item => item.message_id === route.messageId);
+    if (current?.code || !source || source.deleted === true || source.chat_id !== route.conversationId
+      || source.sender?.sender_type !== 'user' || source.sender?.id_type !== 'open_id'
+      || source.sender?.id !== route.actorId || (source.thread_id || undefined) !== route.threadId
+      || (source.root_id || undefined) !== route.rootId || (source.parent_id || undefined) !== route.parentId)
+      throw Object.assign(new Error('stale-route'), { code: 'stale-route' });
+    signal?.throwIfAborted();
+    if (this.#client !== client) throw Object.assign(new Error('bot-not-connected'), { code: 'bot-not-connected' });
+    let response;
+    try {
+      response = await client.im.v1.message.reply({
+        path: { message_id: route.messageId },
+        data: { msg_type: 'text', content: JSON.stringify({ text }), reply_in_thread: Boolean(route.threadId) },
+      });
+    } catch (cause) {
+      // The request may have reached Lark. Do not turn an ambiguous result into
+      // a retryable pre-send failure or send again on the group mainline.
+      throw Object.assign(new Error('reply-result-unknown', { cause }), { code: 'reply-result-unknown' });
+    }
+    const messageId = response?.data?.message_id;
+    if (response?.code || typeof messageId !== 'string' || !messageId)
+      throw Object.assign(new Error('reply-result-unknown'), { code: 'reply-result-unknown' });
+    return { sent: true, messageId };
   }
 
   /**
@@ -840,7 +948,19 @@ export class FeishuRuntime {
     wsClient?.close({ force: true });
     const bridge = this.#bridge;
     this.#bridge = null;
-    if (bridge) await bridge.waitForIdle();
+    let timer;
+    try {
+      const idle = await Promise.race([
+        (bridge?.waitForIdle() ?? Promise.resolve()).then(() => true),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(false), 2_000);
+          timer.unref?.();
+        }),
+      ]);
+      if (!idle) this.#logger.warn?.('[dsh-feishu] bridge idle wait timed out after 2000ms; continuing cleanup');
+    } finally {
+      clearTimeout(timer);
+    }
     this.#client = null;
     this.#status.feishuLongConnectionState = preserveError ? 'failed' : 'idle';
     this.#status.slashCommandRegistration = 'idle';

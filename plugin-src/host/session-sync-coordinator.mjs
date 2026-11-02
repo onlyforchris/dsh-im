@@ -6,7 +6,7 @@ import {
 import { deliverSessionSyncMirror } from '../../src/channels/shared/session-sync-registry.mjs';
 
 const DSH_USER_PREFIX = '[来自 DSH]\n';
-const DSH_ASSISTANT_PREFIX = '[DSH 助手]\n';
+const DSH_ASSISTANT_PREFIX = '[DSH 助手]\n\n';
 
 function completedTurn(reason) {
   return (typeof reason === 'string' ? reason : reason?.kind) === 'completed';
@@ -23,6 +23,7 @@ function sessionIdOf(session) {
 
 function userInputOrigin(scope, event) {
   const source = event?.data?.source;
+  if (source?.kind === 'schedule' || source?.kind === 'user-question-reply') return 'dsh';
   if (source?.kind !== 'user' || typeof source.rpcId !== 'string' || !source.rpcId) {
     return 'other';
   }
@@ -54,7 +55,7 @@ export function createSessionSyncCoordinator({ deliveryService, logger = console
     );
   };
 
-  const deliver = async (sessionId, targets, text, phase) => {
+  const deliver = async (sessionId, targets, text, phase, format = 'plain') => {
     const unique = new Map();
     for (const target of targets) {
       if (validRecipient(target)) unique.set(recipientKey(target), target);
@@ -66,6 +67,9 @@ export function createSessionSyncCoordinator({ deliveryService, logger = console
         target.targetId,
         sessionId,
         text,
+        // Feishu has already tried its dedicated mirror card. Preserve its
+        // existing plain fallback instead of attempting another rich card.
+        { format: target.channel === 'feishu' ? 'plain' : format },
       )
     )));
     const successful = new Map();
@@ -112,12 +116,9 @@ export function createSessionSyncCoordinator({ deliveryService, logger = console
       if (event.surfaceOp !== 'append') return;
       if (state.origin === 'unknown') state.origin = origin;
       if (state.origin !== 'dsh' || origin !== 'dsh') return;
-      // The user echo stays as plain text even when the mirror owns the
-      // turn: the card also quotes the question, but keeping the echo here
-      // guarantees recipients are established so a failed mirror can still
-      // fall back to the final-answer text delivery.
+      const internalInput = ['schedule', 'user-question-reply'].includes(event.data?.source?.kind);
       const text = textFromHarnessContent(event.data?.content);
-      if (!text) return;
+      if (!text && !internalInput) return;
 
       let targets;
       try {
@@ -126,17 +127,16 @@ export function createSessionSyncCoordinator({ deliveryService, logger = console
         logFailure('lookup', null, error);
         targets = [];
       }
-      const successful = await deliver(
-        sessionId,
-        targets,
-        `${DSH_USER_PREFIX}${text}`,
-        'user delivery',
-      );
+      // Reminder/question-answer framing is internal: select recipients without echoing it.
+      // Direct DSH input still requires a successful echo before the final answer.
+      const recipients = internalInput
+        ? new Map(targets.filter(validRecipient).map((target) => [recipientKey(target), target]))
+        : await deliver(sessionId, targets, `${DSH_USER_PREFIX}${text}`, 'user delivery');
       if (state.recipients === null) {
-        state.recipients = successful;
+        state.recipients = recipients;
       } else {
         for (const key of [...state.recipients.keys()]) {
-          if (!successful.has(key)) state.recipients.delete(key);
+          if (!recipients.has(key)) state.recipients.delete(key);
         }
       }
       return;
@@ -168,13 +168,14 @@ export function createSessionSyncCoordinator({ deliveryService, logger = console
         return false;
       }
     }));
-    const plain = recipients.filter((_target, index) => !rendered[index]);
-    if (plain.length === 0) return;
+    const fallback = recipients.filter((_target, index) => !rendered[index]);
+    if (fallback.length === 0) return;
     await deliver(
       sessionId,
-      plain,
+      fallback,
       `${DSH_ASSISTANT_PREFIX}${state.assistant.text}`,
       'assistant delivery',
+      'markdown',
     );
   };
 

@@ -3,8 +3,8 @@ export default {
   // workspace-command.mjs
   '用法：/session Session ID 或当前工作区序号（/session N）':
     'Usage: /session Session ID or the session index in the current Workspace (/session N)',
-  '用法：\n/sessionlist  列出当前工作区会话\n/sessionlist --limit N  列出当前工作区前 N 个会话（N 为正整数）\n/sessionlist 工作区序号  按 /workspacelist 序号列出会话\n/sessionlist 工作区绝对路径  列出指定工作区会话':
-    'Usage:\n/sessionlist  List Sessions in the current Workspace\n/sessionlist --limit N  List the first N Sessions in the current Workspace (N must be a positive integer)\n/sessionlist Workspace index  List Sessions by /workspacelist index\n/sessionlist Workspace absolute path  List Sessions in the given Workspace',
+  '用法：\n/sessionlist  列出当前工作区会话\n/sessionlist --limit N  列出当前工作区前 N 个会话（N 为正整数）\n/sessionlist 工作区序号  按 /workspacelist 序号列出会话\n/sessionlist 工作区绝对路径  列出指定工作区会话\n不带工作区参数时，默认列出当前对话的有效工作区（未设置对话专属工作区时即 bot 默认工作区）。':
+    'Usage:\n/sessionlist  List Sessions in the current Workspace\n/sessionlist --limit N  List the first N Sessions in the current Workspace (N must be a positive integer)\n/sessionlist Workspace index  List Sessions by /workspacelist index\n/sessionlist Workspace absolute path  List Sessions in the given Workspace\nWithout a workspace argument it lists the workspace this conversation effectively uses (the bot default when no conversation workspace is set).',
   '工作区必须是绝对路径。\n{usage}': 'The Workspace must be an absolute path.\n{usage}',
   '工作区路径包含不支持的字符或长度超过限制。\n{usage}':
     'The Workspace path contains unsupported characters or exceeds the length limit.\n{usage}',
@@ -83,6 +83,11 @@ export default {
   '否': 'No',
   '用法：/workspace 工作区序号或绝对路径':
     'Usage: /workspace Workspace index or absolute path',
+  '查看或切换工作区': 'View or switch Workspace',
+  '/workspace 或 /ws  查看可切换的工作区（点按钮切换）':
+    '/workspace or /ws  View switchable Workspaces (tap a button to switch)',
+  '/workspacelist、/wsl、/workspaces  工作区列表别名（等同 /ws）':
+    '/workspacelist, /wsl, /workspaces  Workspace-list aliases (same as /ws)',
   '当前机器人暂不支持切换工作区。': 'This bot does not support switching Workspaces yet.',
   '工作区已切换为：{workspace}': 'Workspace switched to: {workspace}',
   '{message}\n用法：/workspace 工作区序号或绝对路径':
@@ -244,6 +249,32 @@ export default {
   '当前 Harness 未注册 /compact 命令，请确认上下文压缩组件已启用。':
     'The current Harness has not registered the /compact command; please make sure the context compaction component is enabled.',
 
+  // clear-command.mjs
+  '/clear  清空当前会话上下文（保留 Session 绑定和历史记录）':
+    '/clear  Clear the current session context (keep the Session binding and history)',
+  '清空当前会话上下文并保留会话绑定':
+    'Clear the current session context and keep the Session binding',
+  '用法：/clear（不带参数且不可附带图片或文件）':
+    'Usage: /clear (no arguments, images or files)',
+  '当前聊天绑定的会话已不存在，未清空上下文；请先发送新消息开启会话。':
+    'The Session bound to this chat no longer exists; the context was not cleared. Send a new message to start a Session first.',
+  '当前会话正在生成回复或等待交互，请先完成交互或发送 /stop，再执行 /clear。':
+    'The current Session is generating a reply or waiting for an interaction. Finish it or send /stop before running /clear.',
+  '上下文清理已取消，当前会话未修改。':
+    'Context clearing was cancelled; the current Session was not changed.',
+  '工作区或机器人状态已发生变化，未清空当前会话，请重试。':
+    'The workspace or bot state changed, so the current Session was not cleared. Please try again.',
+  '当前 Host 不支持 /clear，当前会话未修改。':
+    'The current Host does not support /clear; the current Session was not changed.',
+  '清空当前会话上下文失败，当前会话未修改，请稍后重试。':
+    'Failed to clear the current Session context; the Session was not changed. Please try again later.',
+  '当前机器人没有可用的会话状态，未清空当前会话。':
+    'This bot has no available Session state; the current Session was not cleared.',
+  '当前聊天还没有可清空的会话，请先发送一条消息。':
+    'This chat has no Session to clear yet; please send a message first.',
+  '当前会话上下文已清空；Session 绑定和历史记录仍保留。':
+    'The current Session context was cleared; its binding and history were retained.',
+
   // control-command.mjs
   '用法：/stop（不带参数）': 'Usage: /stop (no arguments)',
   '用法：/version（不带参数）': 'Usage: /version (no arguments)',
@@ -258,6 +289,9 @@ export default {
     'No session is bound to this chat, so an additional instruction cannot be given. Bind a session first.',
   '任务已结束，没有正在运行的任务，无法补充指令。请直接发送消息开始新任务。':
     'The task has ended and there is no running task to steer. Send a message to start a new task.',
+  '已排队，等待前序消息处理。': 'Queued. Waiting for the preceding messages to finish.',
+  '排队中的消息在服务重启时被中断。为避免重复执行，未自动重放；如果该消息尚未处理，请重新发送。':
+    'A queued message was interrupted when the service restarted. It was not replayed automatically to avoid running it twice; if it was not processed, please send it again.',
   '已提交补充指令，Agent 会在下一步读取。':
     'Additional instruction submitted; the Agent will read it at the next step.',
 };

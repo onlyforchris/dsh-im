@@ -1,5 +1,8 @@
+import { captureGroupHistory, groupHistoryEntry } from '../shared/group-history.mjs';
 import { extractConnectionEvidence, createConnectionDiagnostics, atConnectionStage } from '../shared/connection-error.mjs';
 import { createEditableMessageStream, splitMessageText } from '../shared/editable-message-stream.mjs';
+import { chunkMarkdownText } from '../shared/markdown-chunks.mjs';
+import { createTextDeliveryBlock } from '../shared/semantic/delivery.mjs';
 import { fetchFileStream } from '../shared/file-download.mjs';
 import { fetchImageBuffer } from '../shared/image-prompt.mjs';
 import { t } from '../shared/i18n.mjs';
@@ -428,10 +431,19 @@ export class DiscordBotClient {
     this.#signal = signal;
   }
 
-  async sendText(target, text) {
+  sendText(target, text) {
+    return this.#sendText(target, text, false);
+  }
+
+  sendDelivery(target, value) {
+    const block = createTextDeliveryBlock(value);
+    return this.#sendText(target, block.text, block.format === 'markdown');
+  }
+
+  async #sendText(target, text, markdown) {
     const notice = !this.#deliveredNotices.has(target) && target?.notice
       ? String(target.notice) : null;
-    const chunks = splitMessageText(notice ? `${notice}\n\n${text}` : text, 1_900);
+    const chunks = (markdown ? chunkMarkdownText : splitMessageText)(notice ? `${notice}\n\n${text}` : text, 1_900);
     const providerMessageIds = [];
     for (const [index, chunk] of chunks.entries()) {
       const result = await this.#api.createMessage({
@@ -533,6 +545,7 @@ export class DiscordRuntime {
   #harness;
   #state;
   #contextEnhancement;
+  #groupHistory;
   #accessPolicy;
   #logger;
   #diagnostics;
@@ -567,6 +580,7 @@ export class DiscordRuntime {
     harness,
     state,
     contextEnhancement,
+    groupHistory,
     accessPolicy,
     logger = console,
     replyTimeoutMs = 600_000,
@@ -585,6 +599,7 @@ export class DiscordRuntime {
     this.#harness = harness;
     this.#state = state;
     this.#contextEnhancement = contextEnhancement;
+    this.#groupHistory = groupHistory;
     this.#accessPolicy = accessPolicy;
     this.#logger = logger; this.#diagnostics = createConnectionDiagnostics({ channel: 'discord', logger });
     this.#replyTimeoutMs = replyTimeoutMs;
@@ -606,6 +621,19 @@ export class DiscordRuntime {
       throw error;
     }
     return this.#bridge.sendConnectionTest(text);
+  }
+
+  async presentSessionSyncApproval(target, interaction, options = {}) {
+    if (!this.#status.ready || !this.#bridge) return false;
+    const channelId = target?.route?.channelId;
+    const channel = await this.#api.getChannel({ channelId, signal: options.signal });
+    const actor = channel?.type === 1 && channel.recipients?.length === 1
+      ? channel.recipients[0]?.id : '';
+    if (!actor) return false;
+    return this.#bridge.presentSessionSyncApproval(interaction, {
+      key: options.key, actor, validate: options.validate,
+      send: (text) => this.sendProactiveText(target, text),
+    }, options);
   }
 
   async sendProactiveText(target, text, options = {}) {
@@ -844,6 +872,9 @@ export class DiscordRuntime {
     const messageId = String(message?.id ?? '');
     if (!messageId || this.#state.hasSeen(messageId)) return;
     const preflight = normalizeDiscordMessage(message, this.#config.platformId);
+    if (preflight) await captureGroupHistory(this.#groupHistory, preflight, groupHistoryEntry('discord', message, preflight, {
+      groupName: this.#channels.get(String(message.channel_id))?.name,
+    }), { logger: this.#logger });
     let accessDecision;
     if (preflight?.kind === 'group' && preflight.addressed === true
       && preflight.senderIsBot !== true) {
@@ -867,13 +898,14 @@ export class DiscordRuntime {
         this.#contextEnhancement,
         message.guild_id ? 'group' : 'direct',
       );
+      const busyMessageMode = this.#harness.currentBusyMessageMode?.() ?? 'queue';
       const pendingRoute = resolveDiscordMessageRoute(message, this.#config.platformId, {
         api: this.#api,
         channel: this.#channels.get(String(message.channel_id)),
         signal: this.#abortController?.signal,
         onChannel: (resolved) => this.#rememberChannel(resolved),
       });
-      route = { pendingRoute, contextSnapshot };
+      route = { pendingRoute, contextSnapshot, busyMessageMode };
       this.#routing.set(messageId, route);
       void pendingRoute.finally(() => {
         if (this.#routing.get(messageId) === route) this.#routing.delete(messageId);
@@ -882,8 +914,10 @@ export class DiscordRuntime {
     try {
       const normalized = await route.pendingRoute;
       if (normalized) {
+        normalized.groupHistory = preflight?.groupHistory;
         await bridge.accept(normalized, {
           contextSnapshot: route.contextSnapshot,
+          busyMessageMode: route.busyMessageMode,
           ...(accessDecision ? { accessDecision } : {}),
         });
       }

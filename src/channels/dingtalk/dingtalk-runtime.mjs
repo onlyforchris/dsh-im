@@ -163,7 +163,7 @@ export class DingtalkRuntime {
     maxMessageChars = 4_000,
     connectTimeoutMs = 15_000,
     connectPollIntervalMs = 25,
-    api = createDingtalkApi(),
+    api = createDingtalkApi({ logger }),
     streamFactory = defaultStreamFactory,
   }) {
     if (!config || !nonEmptyString(config.clientId) || !nonEmptyString(clientSecret)) {
@@ -311,6 +311,7 @@ export class DingtalkRuntime {
         } catch {
           // Optional settings failures leave the original message path active.
         }
+        const busyMessageMode = this.#harness.currentBusyMessageMode?.() ?? 'queue';
         const task = Promise.resolve().then(async () => {
           if (this.#bridge !== bridge) return;
           let message;
@@ -330,7 +331,7 @@ export class DingtalkRuntime {
             get botId() { return contextEnhancement?.botId; },
           }, message.conversationType === '1' || message.conversationType === 1 ? 'direct'
             : message.conversationType === '2' || message.conversationType === 2 ? 'group' : null);
-          await bridge.accept(message, { contextSnapshot });
+          await bridge.accept(message, { contextSnapshot, busyMessageMode });
         }).catch(() => {
           if (signal.aborted || this.#bridge !== bridge) return;
           this.#status.lastError = t('钉钉消息处理失败。');
@@ -432,7 +433,17 @@ export class DingtalkRuntime {
     });
   }
 
-  async sendProactiveText(target, text, { signal } = {}) {
+  async presentSessionSyncApproval(target, interaction, options = {}) {
+    if (!this.#status.ready || !this.#bridge) return false;
+    const actor = typeof target?.route?.userId === 'string' ? target.route.userId.trim() : '';
+    if (!actor) return false;
+    return this.#bridge.presentSessionSyncApproval(interaction, {
+      key: options.key, actor, validate: options.validate,
+      send: (text) => this.sendProactiveText(target, text),
+    }, options);
+  }
+
+  async sendProactiveText(target, text, { signal, format = 'plain' } = {}) {
     const userId = typeof target?.route?.userId === 'string'
       ? target.route.userId.trim() : '';
     const openConversationId = typeof target?.route?.openConversationId === 'string'
@@ -460,6 +471,7 @@ export class DingtalkRuntime {
           ...(target.kind === 'user' ? { userId } : { openConversationId }),
         },
         text,
+        format,
         signal: signal ?? this.#abortController.signal,
       });
     } catch (cause) {

@@ -7,7 +7,9 @@ import {
   HarnessClient,
   HarnessReplyTracker,
 } from '../../../src/channels/feishu/harness-client.mjs';
+import { HarnessTransportError } from '../../../src/channels/shared/harness-client.mjs';
 import { imSourceGuidance } from '../../../src/channels/shared/im-source-guidance.mjs';
+import { extractConnectionEvidence } from '../../../src/channels/shared/connection-error.mjs';
 import {
   OUTBOUND_ARTIFACT_TOOL,
   createOutboundArtifactTool,
@@ -286,6 +288,33 @@ test('HarnessClient lists only absolute workspace paths', async () => {
 
   response = { items: 'invalid' };
   assert.deepEqual(await client.listWorkspaces(), []);
+});
+
+test('HarnessClient workspace entries retain only paths and optional titles in one RPC', async () => {
+  const client = new HarnessClient({ baseUrl: 'http://127.0.0.1:3080', workspace: '/tmp' });
+  const options = { signal: new AbortController().signal };
+  let calls = 0;
+  client.ensureRunning = async (received) => assert.equal(received, options);
+  client.rpc = async (method, payload, timeout, received) => {
+    calls += 1;
+    assert.equal(method, 'workspace.list');
+    assert.deepEqual(payload, {});
+    assert.equal(timeout, 30_000);
+    assert.equal(received, options);
+    return { items: [
+      { path: '/tmp/a', title: '策略研究', sessionIds: ['private'] },
+      { path: '/tmp/b', title: 123 }, { path: '/tmp/c' },
+      { path: 'relative', title: 'invalid' }, null,
+    ] };
+  };
+  assert.deepEqual(await client.listWorkspaceEntries(options), [
+    { path: '/tmp/a', title: '策略研究' }, { path: '/tmp/b', title: '' }, { path: '/tmp/c', title: '' },
+  ]);
+  assert.equal(calls, 1);
+  assert.deepEqual(await client.listWorkspaces(options), ['/tmp/a', '/tmp/b', '/tmp/c']);
+  assert.equal(calls, 2);
+  client.rpc = async () => ({ items: null });
+  assert.deepEqual(await client.listWorkspaceEntries(options), []);
 });
 
 test('HarnessClient lists sessions by workspace accounting in its stored order', async () => {
@@ -610,6 +639,7 @@ test('HarnessClient asks do not control file-return tool availability', async ()
     },
   };
   client.rpc = async (method, _payload, _timeoutMs, options) => {
+    if (method === 'workspace.list') return { items: [], archivedSessionIds: [] };
     if (method === 'session.history' && !prompted) return { events: [] };
     if (method === 'session.prompt') {
       prompted = true;
@@ -647,6 +677,117 @@ test('HarnessClient asks do not control file-return tool availability', async ()
   }), 'done');
 });
 
+test('HarnessClient confirms a timed-out prompt submit via session.history instead of failing', async () => {
+  const client = new HarnessClient({
+    baseUrl: 'http://127.0.0.1:3080',
+    workspace: '/tmp/dsh-feishu-workspace',
+  });
+  client.ensureRunning = async () => undefined;
+  let promptRpcId;
+  let promptTimeouts = 0;
+  client.rpc = async (method, _payload, _timeoutMs, options) => {
+    if (method === 'workspace.list') return { items: [], archivedSessionIds: [] };
+    if (method === 'session.history' && !promptRpcId) return { events: [] };
+    if (method === 'session.prompt') {
+      promptRpcId = options.rpcId;
+      promptTimeouts += 1;
+      // 提交窗口到期瞬间消息其实已经落账本：Host 忙，只是应答迟到。
+      throw new HarnessTransportError('harness-timeout', 'session.prompt');
+    }
+    return {
+      events: [
+        { event: { type: 'turn/start', seq: 1, data: { turn: 1 } } },
+        {
+          event: {
+            type: 'user/message',
+            seq: 2,
+            data: { turn: 1, source: { rpcId: promptRpcId } },
+          },
+        },
+        {
+          event: {
+            type: 'assistant/message',
+            seq: 3,
+            data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: 'done' }] } },
+          },
+        },
+        { event: { type: 'turn/end', seq: 4, data: { turn: 1, reason: { kind: 'completed' } } } },
+      ],
+    };
+  };
+
+  assert.equal(await client.ask('session-submit-timeout-confirm', 'hello', {
+    onArtifact: async () => undefined,
+  }), 'done');
+  assert.equal(promptTimeouts, 1);
+});
+
+test('HarnessClient confirms a queued-but-not-started submit via agent/inbox/spliced', async () => {
+  const client = new HarnessClient({
+    baseUrl: 'http://127.0.0.1:3080',
+    workspace: '/tmp/dsh-feishu-workspace',
+  });
+  client.ensureRunning = async () => undefined;
+  let promptRpcId;
+  let promptTimeouts = 0;
+  let probeReads = 0;
+  client.rpc = async (method, _payload, _timeoutMs, options) => {
+    if (method === 'workspace.list') return { items: [], archivedSessionIds: [] };
+    if (method === 'session.history' && !promptRpcId) return { events: [] };
+    if (method === 'session.prompt') {
+      promptRpcId = options.rpcId;
+      promptTimeouts += 1;
+      throw new HarnessTransportError('harness-timeout', 'session.prompt');
+    }
+    probeReads += 1;
+    // 第一次探测：消息已持久入队（spliced 回执）但尚未开始执行——没有 user/message。
+    if (probeReads === 1) {
+      return {
+        events: [
+          { event: { type: 'turn/start', seq: 1, data: { turn: 1 } } },
+          {
+            event: {
+              type: 'agent/inbox/spliced',
+              seq: 2,
+              data: {
+                target: 'next-turn',
+                start: 0,
+                inserted: [{ source: { rpcId: promptRpcId }, content: [{ type: 'text', text: 'hello' }] }],
+              },
+            },
+          },
+        ],
+      };
+    }
+    return {
+      events: [
+        { event: { type: 'turn/start', seq: 3, data: { turn: 1 } } },
+        {
+          event: {
+            type: 'user/message',
+            seq: 4,
+            data: { turn: 1, source: { rpcId: promptRpcId } },
+          },
+        },
+        {
+          event: {
+            type: 'assistant/message',
+            seq: 5,
+            data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: 'done' }] } },
+          },
+        },
+        { event: { type: 'turn/end', seq: 6, data: { turn: 1, reason: { kind: 'completed' } } } },
+      ],
+    };
+  };
+
+  assert.equal(await client.ask('session-queued-submit-confirm', 'hello', {
+    onArtifact: async () => undefined,
+  }), 'done');
+  assert.equal(promptTimeouts, 1);
+  assert.equal(probeReads, 2);
+});
+
 test('HarnessClient stages inbound files, appends a neutral manifest, and cleans after turn end', async () => {
   const inboundSources = [{ name: '用户报告.bin', load: async () => Buffer.from('bytes') }];
   const ingressCalls = [];
@@ -672,6 +813,7 @@ test('HarnessClient stages inbound files, appends a neutral manifest, and cleans
   });
   client.ensureRunning = async () => undefined;
   client.rpc = async (method, payload, _timeoutMs, options) => {
+    if (method === 'workspace.list') return { items: [], archivedSessionIds: [] };
     if (method === 'session.history' && !prompted) return { events: [] };
     if (method === 'session.list') {
       return { items: [{ sessionId: 'session-inbound-files', cwd: '/tmp/exact-session-cwd' }] };
@@ -749,6 +891,7 @@ test('HarnessClient cleans staged inbound files when session.prompt rejects them
   });
   client.ensureRunning = async () => undefined;
   client.rpc = async (method) => {
+    if (method === 'workspace.list') return { items: [], archivedSessionIds: [] };
     if (method === 'session.history' && !prompted) return { events: [] };
     if (method === 'session.list') {
       return { items: [{ sessionId: 'session-rejected-file', cwd: '/tmp/rejected-cwd' }] };
@@ -762,7 +905,11 @@ test('HarnessClient cleans staged inbound files when session.prompt rejects them
     client.ask('session-rejected-file', '', {
       files: [{ name: 'rejected.dat', data: Buffer.from('bytes') }],
     }),
-    (error) => error === promptFailure,
+    (error) => {
+      assert.deepEqual(error, promptFailure);
+      assert.equal(extractConnectionEvidence(error).details.submissionState, 'unknown');
+      return true;
+    },
   );
   assert.equal(cleanupCalls, 1);
 });
@@ -781,6 +928,7 @@ test('HarnessClient retains staged files when an accepted turn outcome is unknow
   });
   client.ensureRunning = async () => undefined;
   client.rpc = async (method) => {
+    if (method === 'workspace.list') return { items: [], archivedSessionIds: [] };
     if (method === 'session.history' && !prompted) return { events: [] };
     if (method === 'session.list') {
       return { items: [{ sessionId: 'session-uncertain-file', cwd: '/tmp/uncertain-cwd' }] };
@@ -798,7 +946,11 @@ test('HarnessClient retains staged files when an accepted turn outcome is unknow
       files: [{ name: 'uncertain.dat', data: Buffer.from('bytes') }],
       timeoutMs: 1_000,
     }),
-    (error) => error === uncertainFailure,
+    (error) => {
+      assert.deepEqual(error, uncertainFailure);
+      assert.equal(extractConnectionEvidence(error).details.submissionState, 'accepted');
+      return true;
+    },
   );
   assert.equal(cleanupCalls, 0, 'uncertain accepted turns may still be reading the staged path');
 });
@@ -826,6 +978,7 @@ for (const failHandoff of [false, true]) {
       },
     };
     client.rpc = async (method, _payload, _timeoutMs, options) => {
+      if (method === 'workspace.list') return { items: [], archivedSessionIds: [] };
       if (method === 'session.history' && !prompted) return { events: [] };
       if (method === 'session.prompt') {
         prompted = true;
@@ -834,6 +987,7 @@ for (const failHandoff of [false, true]) {
           { type: 'turn/start', data: { turn: 2 } },
           { type: 'user/message', data: { turn: 2, source: { rpcId: promptRpcId } } },
         ];
+        for (const event of agent.session.events) outboundArtifactRegistry.observeSessionEvent(agent.session, event);
         const exec = {
           name: OUTBOUND_ARTIFACT_TOOL,
           callId: 'file-only-call',
@@ -868,7 +1022,11 @@ for (const failHandoff of [false, true]) {
       },
     });
     if (failHandoff) {
-      await assert.rejects(asking, (error) => error === handoffError);
+      await assert.rejects(asking, (error) => {
+        assert.deepEqual(error, handoffError);
+        assert.equal(extractConnectionEvidence(error).details.submissionState, 'accepted');
+        return true;
+      });
       assert.deepEqual(delivered, []);
       assert.deepEqual(outboundArtifactRegistry.take('session-file-only', 2), []);
       return;
@@ -889,6 +1047,7 @@ test('HarnessClient completes tool-only turns and retains earlier visible text a
     const client = new HarnessClient({ baseUrl: 'http://127.0.0.1:3080', workspace: '/tmp/workspace' });
     client.ensureRunning = async () => undefined;
     client.rpc = async (method, _payload, _timeoutMs, options) => {
+      if (method === 'workspace.list') return { items: [], archivedSessionIds: [] };
       if (method === 'session.prompt') {
         promptRpcId = options.rpcId;
         return {};
@@ -1206,6 +1365,7 @@ test('new turn events renew the stall window beyond the original fixed deadline'
   let sessionListPolls = 0;
   const events = [];
   client.rpc = async (method, _payload, _timeoutMs, options) => {
+    if (method === 'workspace.list') return { items: [], archivedSessionIds: [] };
     if (method === 'session.history') {
       if (!prompted) return { events: [] };
       historyPolls += 1;
@@ -1263,6 +1423,7 @@ test('latest-mode ask() filters assistant-message updates out of delivered progr
   let sessionListPolls = 0;
   const events = [];
   client.rpc = async (method, _payload, _timeoutMs, options) => {
+    if (method === 'workspace.list') return { items: [], archivedSessionIds: [] };
     if (method === 'session.history') {
       if (!prompted) return { events: [] };
       historyPolls += 1;
@@ -1326,6 +1487,7 @@ test('default ask() consumers never receive reasoning updates from canonical mes
   let sessionListPolls = 0;
   const events = [];
   client.rpc = async (method, _payload, _timeoutMs, options) => {
+    if (method === 'workspace.list') return { items: [], archivedSessionIds: [] };
     if (method === 'session.history') {
       if (!prompted) return { events: [] };
       historyPolls += 1;
@@ -1395,6 +1557,7 @@ test('reasoning-subscribed all-mode ask() receives reasoning updates', async () 
   let sessionListPolls = 0;
   const events = [];
   client.rpc = async (method, _payload, _timeoutMs, options) => {
+    if (method === 'workspace.list') return { items: [], archivedSessionIds: [] };
     if (method === 'session.history') {
       if (!prompted) return { events: [] };
       historyPolls += 1;
@@ -1465,6 +1628,7 @@ test('a production-owned turn that starts and then stalls still times out', asyn
   let sessionListPolls = 0;
   let events = [];
   client.rpc = async (method, _payload, _timeoutMs, options) => {
+    if (method === 'workspace.list') return { items: [], archivedSessionIds: [] };
     if (method === 'session.history') {
       if (!prompted) return { events: [] };
       historyPolls += 1;
@@ -1512,6 +1676,7 @@ test('a silent turn renews only after Harness confirms the Session is running', 
   let sessionListPolls = 0;
   const events = [];
   client.rpc = async (method, _payload, _timeoutMs, options) => {
+    if (method === 'workspace.list') return { items: [], archivedSessionIds: [] };
     if (method === 'session.history') {
       if (!prompted) return { events: [] };
       historyPolls += 1;
@@ -1561,6 +1726,7 @@ test('a failed liveness probe does not renew a stalled turn', async () => {
   let sessionListPolls = 0;
   let events = [];
   client.rpc = async (method, _payload, _timeoutMs, options) => {
+    if (method === 'workspace.list') return { items: [], archivedSessionIds: [] };
     if (method === 'session.history') {
       if (!prompted) return { events: [] };
       historyPolls += 1;
@@ -1613,6 +1779,7 @@ test('ask() publishes the guidance a channel captured and never reads the prompt
   let promptRpcId;
   let seq = 0;
   client.rpc = async (method, payload, _timeoutMs, options) => {
+    if (method === 'workspace.list') return { items: [], archivedSessionIds: [] };
     if (method === 'session.history') {
       if (!prompted) return { events: [] };
       polls += 1;
@@ -1783,4 +1950,42 @@ test('tracker (all mode) recovers the final answer in the same reconnect scenari
 
   assert.equal(tracker.finished, true);
   assert.equal(tracker.answer, '先读取文件\n\n最终答案');
+});
+
+
+test('HarnessClient does not advertise a file consumer without an artifact callback', async (t) => {
+  outboundArtifactRegistry.clear();
+  t.after(() => outboundArtifactRegistry.clear());
+  const workspace = await mkdtemp(join(tmpdir(), 'dsh-im-no-file-consumer-'));
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  await writeFile(join(workspace, 'file.txt'), 'file');
+  const client = new HarnessClient({ baseUrl: 'http://127.0.0.1:3080', workspace });
+  client.ensureRunning = async () => undefined;
+  const session = { header: { id: 'session-no-file-consumer', cwd: workspace }, events: [] };
+  const tool = createOutboundArtifactTool({ registry: outboundArtifactRegistry });
+  let prompted = false;
+  client.rpc = async (method, _payload, _timeoutMs, options) => {
+    if (method === 'workspace.list') return { items: [], archivedSessionIds: [] };
+    if (method === 'session.prompt') {
+      prompted = true;
+      session.events = [
+        { type: 'turn/start', seq: 1, data: { turn: 1 } },
+        { type: 'user/message', seq: 2, data: { turn: 1, source: { rpcId: options.rpcId } } },
+      ];
+      for (const event of session.events) outboundArtifactRegistry.observeSessionEvent(session, event);
+      assert.equal(outboundArtifactRegistry.hasActiveConsumer(session), false);
+      await assert.rejects(tool.definition.execute({ path: 'file.txt' }, {
+        name: OUTBOUND_ARTIFACT_TOOL, agent: { session }, callId: 'no-consumer',
+      }), { code: 'artifact-consumer-required' });
+      return {};
+    }
+    assert.equal(method, 'session.history');
+    if (!prompted) return { events: [] };
+    return { events: [...session.events,
+      { type: 'assistant/message', seq: 3, data: { turn: 1, step: 1, message: { content: [{ type: 'text', text: 'Use present.' }] } } },
+      { type: 'turn/end', seq: 4, data: { turn: 1, reason: { kind: 'completed' } } },
+    ].map((event) => ({ event })) };
+  };
+  assert.equal(await client.ask(session.header.id, 'return the file'), 'Use present.');
+  assert.deepEqual(outboundArtifactRegistry.take(session.header.id, 1), []);
 });

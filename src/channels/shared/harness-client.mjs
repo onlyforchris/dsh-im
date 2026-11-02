@@ -1,7 +1,9 @@
+import { groupHistoryAccess } from './group-history-access.mjs';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
+import { performance } from 'node:perf_hooks';
 
 import { adoptRegisteredWorkspaceSession } from './harness-session-binding.mjs';
 import { sameWorkspacePath } from './default-workspace.mjs';
@@ -21,6 +23,9 @@ import { imSourceGuidance } from './im-source-guidance.mjs';
 import { outboundArtifactRegistry } from './semantic/artifact.mjs';
 import { t } from './i18n.mjs';
 import { watchHarnessMux } from './harness-mux.mjs';
+import { extractConnectionEvidence, messageDiagnosticError } from './connection-error.mjs';
+import { PromptFailureTracker } from './prompt-failure-tracker.mjs';
+import { isSessionLogCorrupt, isSessionNotFound } from './session-error.mjs';
 
 // Every channel plugin runs in the same Host process. Sharing ownership by
 // Host identity (or an explicitly configured HTTP origin) prevents clients
@@ -28,9 +33,39 @@ import { watchHarnessMux } from './harness-mux.mjs';
 // from claiming or cancelling each other's interactions.
 const interactionRegistries = new Map();
 const hostInteractionRegistries = new WeakMap();
+const modelCatalogCaches = new WeakMap();
+const MODEL_CATALOG_TTL_MS = 30_000;
 const MAX_ERROR_CLASSIFICATION_BYTES = 64;
 const IM_INPUT_ORIGIN_TTL_MS = 30 * 60 * 1000;
 const MAX_IM_INPUT_ORIGINS = 4096;
+
+function invalidateModelCatalog(entry) {
+  if (!entry) return;
+  entry.value = null;
+  entry.expiresAt = 0;
+  // Old readers may finish, but must not repopulate the cache after a fresh read.
+  entry.pending = null;
+}
+
+export function clearModelCatalogCache(apiProxy) {
+  const entry = modelCatalogCaches.get(apiProxy);
+  if (!entry) return;
+  modelCatalogCaches.delete(apiProxy);
+  invalidateModelCatalog(entry);
+  entry.controller.abort(new DOMException('Harness model catalog disposed', 'AbortError'));
+}
+
+function clientTimeZoneFields() {
+  try {
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return typeof timeZone === 'string' && timeZone.trim()
+      ? { clientTimeZone: timeZone }
+      : {};
+  } catch {
+    // Time-zone metadata is optional; unresolved values are not JSON-safe.
+    return {};
+  }
+}
 
 async function smallResponseText(response) {
   const stream = response?.body;
@@ -242,10 +277,12 @@ function turnStoppedError() {
   return error;
 }
 
-function workspacePaths(value) {
+function workspaceEntries(value) {
   if (!Array.isArray(value?.items)) return [];
   return value.items.flatMap((item) => (
-    typeof item?.path === 'string' && isAbsolute(item.path) ? [item.path] : []
+    typeof item?.path === 'string' && isAbsolute(item.path)
+      ? [{ path: item.path, title: typeof item.title === 'string' ? item.title : '' }]
+      : []
   ));
 }
 
@@ -378,6 +415,11 @@ export class AssistantTextAccumulator {
   #steps = new Map();
   #legacyText = '';
 
+  clear() {
+    this.#steps.clear();
+    this.#legacyText = '';
+  }
+
   appendDelta(step, index, text) {
     if (typeof text !== 'string' || !text) return;
     const stepNumber = Number.isSafeInteger(step) ? step : 0;
@@ -410,6 +452,22 @@ export class AssistantTextAccumulator {
         .trim())
       .filter(Boolean)
       .join('\n\n');
+  }
+}
+
+/** Keep answer text after the last tool boundary, shared by live and recovered replies. */
+export function accumulateFinalAssistantText(accumulator, event) {
+  if (event.type === 'tool/call') {
+    accumulator.clear();
+  } else if (event.type === 'assistant/chunk' && event.data?.chunk?.type === 'text-delta') {
+    accumulator.appendDelta(event.data.step, event.data.chunk.index, event.data.chunk.text);
+  } else if (event.type === 'assistant/message') {
+    const content = event.data?.message?.content;
+    const text = textFromHarnessContent(content);
+    // Canonical tool messages can arrive before or after the separate call.
+    // An explicitly empty final message must not revive an earlier preamble.
+    if (!text || content.some((part) => part?.type === 'tool-call')) accumulator.clear();
+    else accumulator.setCanonical(event.data.step, text);
   }
 }
 
@@ -481,33 +539,9 @@ function consumeInteractionOwnership(ownership, entries) {
       ownership.completed = true;
       continue;
     }
-    let toolCall = null;
-    if (event.type === 'tool/call'
-      && ownership.active
-      && event.data?.turn === ownership.turn
-      && typeof event.data?.callId === 'string'
-      && event.data.callId) {
-      toolCall = {
-        callId: event.data.callId,
-        name: event.data?.name,
-        arguments: event.data?.arguments,
-      };
-    } else if (event.type === 'tool/code-dispatch-start'
-      && ownership.active
-      && typeof event.data?.subCallId === 'string'
-      && event.data.subCallId) {
-      let argumentsText;
-      try {
-        argumentsText = JSON.stringify(event.data?.arguments);
-      } catch {
-        argumentsText = undefined;
-      }
-      toolCall = {
-        callId: event.data.subCallId,
-        name: event.data?.name,
-        arguments: argumentsText,
-      };
-    }
+    const toolCall = ownership.active
+      && (event.type !== 'tool/call' || event.data?.turn === ownership.turn)
+      ? harnessToolCallFromEvent(event) : null;
     if (toolCall) ownership.toolCalls.set(toolCall.callId, Object.freeze(toolCall));
   }
 }
@@ -517,25 +551,46 @@ function consumeInteractionOwnership(ownership, entries) {
  * this Session.  The modern Harness adapter uses the same ownership registry
  * as HarnessClient so it never steals a browser-owned question or approval.
  */
-export function hasActiveHarnessInteractionOwner(scope, sessionId, entries = []) {
+export function activeHarnessInteractionOwner(scope, sessionId, entries = []) {
   if (!scope || !['object', 'function', 'string'].includes(typeof scope)
-    || typeof sessionId !== 'string' || !sessionId) return false;
+    || typeof sessionId !== 'string' || !sessionId) return null;
   const owners = interactionRegistry(scope).ownerships.get(sessionId);
-  if (!owners || owners.size === 0) return false;
+  if (!owners || owners.size === 0) return null;
   for (const ownership of owners) consumeInteractionOwnership(ownership, entries);
-  return [...owners].some((ownership) => (
+  return [...owners].filter((ownership) => (
     ownership.active
     && !ownership.completed
     && typeof ownership.reconnect === 'function'
-  ));
+  )).sort((left, right) => left.order - right.order)[0] ?? null;
+}
+
+/** Whether a live IM consumer owns this turn. */
+export function hasActiveHarnessInteractionOwner(scope, sessionId, entries = []) {
+  return activeHarnessInteractionOwner(scope, sessionId, entries) !== null;
+}
+
+/** Read the operation attached to a normal or PTC tool-call event. */
+export function harnessToolCallFromEvent(event) {
+  const data = event?.data;
+  if (event?.type === 'tool/call' && typeof data?.callId === 'string') {
+    return { callId: data.callId, name: data.name, arguments: data.arguments };
+  }
+  if (event?.type === 'tool/code-dispatch-start' && typeof data?.subCallId === 'string') {
+    let argumentsText;
+    try { argumentsText = JSON.stringify(data.arguments); } catch { /* Unserializable details cannot be approved. */ }
+    return { callId: data.subCallId, name: data.name, arguments: argumentsText };
+  }
+  return null;
 }
 
 export class HarnessReplyTracker {
   #promptRpcId;
+  #promptFailure;
   #lastSeq;
   #openTurn = null;
   #targetTurn = null;
   #assistantText = new AssistantTextAccumulator();
+  #finalAssistantText = null;
   #latestText = '';
   #finished = false;
   #reason = null;
@@ -546,13 +601,15 @@ export class HarnessReplyTracker {
   #pendingReasoningChars = 0;
   #reasoning = false;
 
-  constructor({ promptRpcId, afterSeq = -1, reasoning = false }) {
+  constructor({ promptRpcId, afterSeq = -1, reasoning = false, finalAnswerOnly = false }) {
     this.#promptRpcId = promptRpcId;
+    this.#promptFailure = new PromptFailureTracker(promptRpcId, afterSeq);
     this.#lastSeq = afterSeq;
     // Reasoning updates are opt-in per consumer: only channels that surface
     // thinking traces (Telegram thinking mode) subscribe; every other channel
     // keeps its pre-thinking-traces update stream untouched.
     this.#reasoning = reasoning === true;
+    if (finalAnswerOnly === true) this.#finalAssistantText = new AssistantTextAccumulator();
   }
 
   get finished() {
@@ -566,6 +623,10 @@ export class HarnessReplyTracker {
 
   get answer() {
     return this.#latestText.trim();
+  }
+
+  get finalAnswer() {
+    return this.#finalAssistantText ? this.#finalAssistantText.text : this.answer;
   }
 
   get reason() {
@@ -641,6 +702,7 @@ export class HarnessReplyTracker {
       // The mux is lossy across reconnects. Only history may advance the
       // durable cursor or finish the reply; the mux supplements reasoning.
       if (fromMux && !isReasoning) continue;
+      const failedTurn = fromMux ? null : this.#promptFailure.consume(event);
       if (isReasoning) {
         if (!live || !Number.isFinite(seq)) continue;
         if (this.#targetTurn === null) this.#bufferReasoning(event);
@@ -664,8 +726,12 @@ export class HarnessReplyTracker {
               this.#emitReasoning(pending, pushUpdate);
             }
           }
+          continue;
         }
-        continue;
+        // Model resolution or pre-step hooks can fail after the inbox claim
+        // but before user/message. Only a proved claim may close this wait.
+        if (event.type !== 'turn/end' || failedTurn === null || failedTurn !== event.data?.turn) continue;
+        this.#targetTurn = failedTurn;
       }
       if (seq <= this.#lastSeq) continue;
       this.#lastSeq = seq;
@@ -694,6 +760,8 @@ export class HarnessReplyTracker {
         continue;
       }
       if (event.data?.turn !== this.#targetTurn) continue;
+
+      if (this.#finalAssistantText) accumulateFinalAssistantText(this.#finalAssistantText, event);
 
       if (event.type === 'assistant/chunk' && event.data?.chunk?.type === 'text-delta') {
         const step = event.data?.step ?? 0;
@@ -823,6 +891,16 @@ export class HarnessTransportError extends Error {
   }
 }
 
+/**
+ * session.prompt 提交超时（30 秒窗口到期）只说明应答迟到，不代表提交失败：
+ * 单进程 Host 忙碌时 prompt 往往已入队。这类错误需要先回查持久账本再定性。
+ */
+function isPromptSubmitTimeout(error) {
+  return error instanceof HarnessTransportError
+    && error.code === 'harness-timeout'
+    && error.method === 'session.prompt';
+}
+
 export class HarnessHealthError extends Error {
   constructor(cause) {
     super('Harness health RPC was rejected', { cause });
@@ -874,6 +952,14 @@ function harnessTurnSucceeded(reason) {
   return (nonEmptyText(reason?.kind) ?? nonEmptyText(reason)) === 'completed';
 }
 
+function sessionArchivedError(sessionId, cause) {
+  const error = new Error('The Session is archived and cannot process this message.', { cause });
+  error.code = 'session-archived';
+  error.promptAccepted = false;
+  error.details = { sessionId };
+  return error;
+}
+
 export class HarnessClient {
   #baseUrl;
   #apiProxy;
@@ -895,6 +981,7 @@ export class HarnessClient {
   #managedProcess = null;
   #interactionRegistry;
   #interactionOwnerships;
+  #competitiveApprovals;
   #interactionClaims;
   #controlOwnerships;
 
@@ -902,6 +989,7 @@ export class HarnessClient {
     baseUrl,
     apiProxy,
     interactionScope = apiProxy,
+    competitiveApprovals = false,
     workspace,
     ungroupedWorkspace,
     agentPreset,
@@ -952,6 +1040,7 @@ export class HarnessClient {
       || !['object', 'function'].includes(typeof interactionScope))) {
       throw new TypeError('interactionScope must identify the current Host');
     }
+    this.#competitiveApprovals = competitiveApprovals === true;
     this.#workspace = workspace;
     // Only the reserved IM directory bypasses grouping, even after /ws switches.
     this.#ungroupedWorkspace = ungroupedWorkspace;
@@ -981,6 +1070,12 @@ export class HarnessClient {
   }
 
   async rpc(method, payload = {}, timeoutMs = 30_000, options = {}) {
+    const startedAt = performance.now();
+    const withDiagnostics = error => Object.assign(error, {
+      durationMs: Math.round(performance.now() - startedAt),
+      timeoutMs,
+      transport: this.#apiProxy ? 'host-api' : 'http',
+    });
     const rpcId = options.rpcId ?? `${this.#rpcIdPrefix}-${randomUUID()}`;
     const timeoutSignal = AbortSignal.timeout(timeoutMs);
     const signal = options.signal
@@ -1019,24 +1114,24 @@ export class HarnessClient {
       // Preserve an explicit caller cancellation; it is control flow, not a
       // Harness availability diagnosis.
       if (options.signal?.aborted) throw error;
-      if (error instanceof HarnessTransportError) throw error;
-      throw new HarnessTransportError(
+      if (error instanceof HarnessTransportError) throw withDiagnostics(error);
+      throw withDiagnostics(new HarnessTransportError(
         timeoutSignal.aborted ? 'harness-timeout' : 'harness-connect-failed',
         method,
         { cause: error },
-      );
+      ));
     }
     if (body?.type !== 'server-response' || body?.rpcId !== rpcId) {
-      throw new HarnessTransportError('harness-response-invalid', method, {
+      throw withDiagnostics(new HarnessTransportError('harness-response-invalid', method, {
         cause: new Error(`Harness returned an invalid response for ${method}`),
-      });
+      }));
     }
     if (!body.result || typeof body.result !== 'object' || typeof body.result.ok !== 'boolean') {
-      throw new HarnessTransportError('harness-response-invalid', method, {
+      throw withDiagnostics(new HarnessTransportError('harness-response-invalid', method, {
         cause: new Error(`Harness returned an invalid result for ${method}`),
-      });
+      }));
     }
-    if (!body.result?.ok) throw new HarnessRpcError(method, body.result?.error);
+    if (!body.result?.ok) throw withDiagnostics(new HarnessRpcError(method, body.result?.error));
     return body.result.value;
   }
 
@@ -1086,8 +1181,12 @@ export class HarnessClient {
   }
 
   async listWorkspaces(options = {}) {
+    return (await this.listWorkspaceEntries(options)).map((item) => item.path);
+  }
+
+  async listWorkspaceEntries(options = {}) {
     await this.ensureRunning(options);
-    return workspacePaths(await this.rpc('workspace.list', {}, 30_000, options));
+    return workspaceEntries(await this.rpc('workspace.list', {}, 30_000, options));
   }
 
   async listWorkspaceSessions(workspacePath, options = {}) {
@@ -1132,9 +1231,46 @@ export class HarnessClient {
   }
 
   async listModels(options = {}) {
+    options.signal?.throwIfAborted();
     await this.ensureRunning(options);
-    const value = await this.rpc('llm.models', {}, 30_000, options);
-    return validateModelCatalog(value, 'llm.models');
+    options.signal?.throwIfAborted();
+    if (!this.#apiProxy || options.fresh === true) {
+      try {
+        const value = await this.rpc('llm.models', {}, 30_000, options);
+        return validateModelCatalog(value, 'llm.models');
+      } finally {
+        if (this.#apiProxy) invalidateModelCatalog(modelCatalogCaches.get(this.#apiProxy));
+      }
+    }
+
+    let entry = modelCatalogCaches.get(this.#apiProxy);
+    if (!entry) {
+      entry = { value: null, expiresAt: 0, pending: null, controller: new AbortController() };
+      modelCatalogCaches.set(this.#apiProxy, entry);
+    }
+    if (entry.value && Date.now() < entry.expiresAt) return structuredClone(entry.value);
+    if (!entry.pending) {
+      // The Host owns this read; one caller cancelling must not cancel its peers.
+      const pending = this.rpc('llm.models', {}, 30_000, {
+        ...options, signal: entry.controller.signal,
+      }).then((value) => {
+        const catalog = structuredClone(validateModelCatalog(value, 'llm.models'));
+        if (modelCatalogCaches.get(this.#apiProxy) === entry && entry.pending === pending) {
+          entry.value = catalog;
+          entry.expiresAt = Date.now() + MODEL_CATALOG_TTL_MS;
+        }
+        return catalog;
+      }).finally(() => {
+        if (entry.pending === pending) entry.pending = null;
+      });
+      entry.pending = pending;
+    }
+    const pending = entry.pending;
+    const value = await callWithSignal(
+      () => pending,
+      options.signal ?? entry.controller.signal,
+    );
+    return structuredClone(value);
   }
 
   async getSessionModels(sessionId, options = {}) {
@@ -1142,6 +1278,12 @@ export class HarnessClient {
     await this.ensureRunning(options);
     const value = await this.rpc('session.models', { sessionId }, 30_000, options);
     return validateModelCatalog(value, 'session.models', { session: true });
+  }
+
+  async getSessionPermissions(sessionId, options = {}) {
+    if (typeof sessionId !== 'string' || !sessionId) throw new TypeError('sessionId is required');
+    await this.ensureRunning(options);
+    return this.rpc('session.permissions', { sessionId }, 30_000, options);
   }
 
   async selectSessionModel(sessionId, selection, options = {}) {
@@ -1163,13 +1305,18 @@ export class HarnessClient {
           : { reasoningEffort: selection.reasoningEffort }),
       }, 30_000, signal ? { ...options, signal } : options);
     };
-    const value = this.#sessionMaintenanceExecutor
-      ? await this.#sessionMaintenanceExecutor({ sessionId, operation })
-      : await operation();
-    if (!value || typeof value !== 'object' || !validModelSelection(value.selected)) {
-      throw new Error('Harness returned an invalid response for session.selectModel');
+    try {
+      const value = this.#sessionMaintenanceExecutor
+        ? await this.#sessionMaintenanceExecutor({ sessionId, operation })
+        : await operation();
+      if (!value || typeof value !== 'object' || !validModelSelection(value.selected)) {
+        throw new HarnessTransportError('harness-response-invalid', 'session.selectModel');
+      }
+      return value;
+    } catch (error) {
+      if (options.signal?.aborted) throw error;
+      throw messageDiagnosticError(error, { stage: 'session.prepare', sessionId });
     }
-    return value;
   }
 
   async isSessionRunning(sessionId, options = {}) {
@@ -1190,7 +1337,10 @@ export class HarnessClient {
   }
 
   async adoptWorkspaceSession(value, options = {}) {
-    return adoptRegisteredWorkspaceSession(this, value, options);
+    // Modern Hosts separate observing an existing Session from creating one.
+    // Keep the legacy transport contract for Hosts without this adapter seam.
+    const method = typeof this.#apiProxy?.sessions?.adopt === 'function' ? 'session.adopt' : 'session.create';
+    return adoptRegisteredWorkspaceSession(this, value, options, 30_000, method);
   }
 
   async isUngroupedWorkspace(workspace) {
@@ -1206,6 +1356,14 @@ export class HarnessClient {
     return created.workspace.workspaceId;
   }
 
+  /**
+   * This client can name a Session up front (`session.create` accepts `sessionId`),
+   * which lets a caller bind a conversation before prompt assembly runs.
+   */
+  get canChooseSessionId() {
+    return true;
+  }
+
   async createSession(options = {}) {
     const { agentPreset: requestedPreset, ...rpcOptions } = options;
     const workspace = rpcOptions.workspace ?? this.#workspace;
@@ -1217,7 +1375,15 @@ export class HarnessClient {
       : { workspaceId: await this.workspaceId(rpcOptions) };
     const agentPreset = requestedPreset !== undefined ? requestedPreset : this.#agentPreset;
     if (agentPreset != null) payload.agentPreset = agentPreset;
+    // The caller may name the Session: it then knows the identity before the
+    // Session exists, which is the only way prompt assembly can see it.
+    if (typeof options.sessionId === 'string' && options.sessionId !== '') {
+      payload.sessionId = options.sessionId;
+    }
     const created = await this.rpc('session.create', payload, 30_000, rpcOptions);
+    if (typeof created?.sessionId !== 'string' || !created.sessionId) {
+      throw new HarnessTransportError('harness-response-invalid', 'session.create');
+    }
     return created.sessionId;
   }
 
@@ -1258,12 +1424,94 @@ export class HarnessClient {
     }, timeoutMs, options);
   }
 
-  async sessionExists(sessionId, options = {}) {
+  async #isSessionArchived(sessionId, options = {}) {
+    const value = await this.rpc('workspace.list', {}, 30_000, options);
+    if (!Array.isArray(value?.archivedSessionIds)
+      || value.archivedSessionIds.some((id) => typeof id !== 'string' || !id)) {
+      throw new HarnessTransportError('harness-response-invalid', 'workspace.list');
+    }
+    return value.archivedSessionIds.includes(sessionId);
+  }
+
+  // A diagnostic recheck must not hide the original failure or cancellation.
+  async #confirmedSessionError(sessionId, options, cause) {
     try {
-      await this.rpc('session.history', { sessionId, maxMessages: 1 }, 30_000, options);
+      if (await this.#isSessionArchived(sessionId, options)) return sessionArchivedError(sessionId, cause);
+      if (isSessionLogCorrupt(cause)) {
+        return Object.assign(new Error('Stored Session log is unreadable', { cause }), {
+          code: 'session-unreadable', method: cause.method,
+          details: { reason: 'session-log-corrupt' },
+        });
+      }
+    } catch (error) {
+      if (options?.signal?.aborted) throw options.signal.reason ?? error;
+    }
+    return null;
+  }
+
+  async #sessionRpc(method, payload, timeoutMs, options) {
+    try {
+      return await this.rpc(method, payload, timeoutMs, options);
+    } catch (error) {
+      if (options?.signal?.aborted) throw options.signal.reason ?? error;
+      if (error instanceof HarnessRpcError
+        && (['internal', 'gateway/internal'].includes(error.code) || isSessionNotFound(error.code))) {
+        throw await this.#confirmedSessionError(payload.sessionId, { signal: options?.signal }, error) ?? error;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * 提交超时后的入库确认：session.history 是持久账本，按 promptRpcId 找回我们的
+   * 持久化痕迹（已执行的 user/message，或已入队待执行的 agent/inbox/spliced
+   * 回执）即视为提交已成功，让 ask() 继续等回复而不是误报失败。
+   * 确认探测自身的失败一律吞掉——它们不能掩盖或改变原始提交超时的定性；
+   * 唯独取消例外：取消原因必须优先于超时透出。
+   */
+  async #confirmPromptSubmit(sessionId, promptRpcId, { signal } = {}) {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      if (signal?.aborted) return false;
+      try {
+        const history = await this.#sessionRpc('session.history', {
+          sessionId,
+          maxMessages: 50,
+        }, 30_000, { signal });
+        const confirmed = (history?.events ?? []).some((entry) => {
+          const event = entry?.event ?? entry;
+          if (event?.type === 'user/message') {
+            return event?.data?.source?.rpcId === promptRpcId;
+          }
+          // queue 模式下消息可能已持久入队但尚未产生 user/message：
+          // agent/inbox/spliced 的 inserted[].source.rpcId 就是入队回执。
+          if (event?.type === 'agent/inbox/spliced') {
+            return (event?.data?.inserted ?? [])
+              .some((message) => message?.source?.rpcId === promptRpcId);
+          }
+          return false;
+        });
+        if (confirmed) return true;
+      } catch (probeError) {
+        // 取消优先于超时定性：最后一次探测期间被取消时，循环后面没有
+        // sleep 再检查 abort，必须在这里把取消原因抛出，不能被超时覆盖。
+        if (signal?.aborted) throw signal.reason ?? probeError;
+        // 其余账本探测失败不改变定性：本轮未确认，继续轮询或最终按原超时上报。
+      }
+      if (attempt < 4) await sleep(2_000, signal);
+    }
+    return false;
+  }
+
+  async sessionExists(sessionId, options = {}) {
+    // Archived Sessions still exist. Returning false here would silently bind
+    // the conversation to a new Session; reading their active log can also fail.
+    if (await this.#isSessionArchived(sessionId, options)) return true;
+    try {
+      await this.#sessionRpc('session.history', { sessionId, maxMessages: 1 }, 30_000, options);
       return true;
     } catch (error) {
-      if (error instanceof HarnessRpcError && error.code === 'session-not-found') return false;
+      if (error.code === 'session-archived') return true;
+      if (error instanceof HarnessRpcError && isSessionNotFound(error.code)) return false;
       throw error;
     }
   }
@@ -1312,6 +1560,7 @@ export class HarnessClient {
     onSessionEvent,
     onOpen,
     ownership,
+    onDiagnostic,
   } = {}) {
     if (typeof sessionId !== 'string' || !sessionId) throw new TypeError('sessionId is required');
     if (!signal || typeof signal.addEventListener !== 'function') {
@@ -1329,8 +1578,17 @@ export class HarnessClient {
     if (onOpen !== undefined && typeof onOpen !== 'function') {
       throw new TypeError('onOpen must be a function');
     }
-
+    let attempts = 0;
+    let lastFailureReason;
+    const report = () => {
+      try {
+        Promise.resolve(onDiagnostic?.({ attempts, ...(lastFailureReason ? { lastFailureReason } : {}) }))
+          .catch(() => undefined);
+      } catch { /* Diagnostics cannot change stream/reconnect behavior. */ }
+    };
     while (!signal.aborted) {
+      attempts += 1;
+      report();
       try {
         await this.#watchInteractionStream(sessionId, {
           signal,
@@ -1342,6 +1600,8 @@ export class HarnessClient {
         });
       } catch (error) {
         if (signal.aborted) return;
+        lastFailureReason = extractConnectionEvidence(error).details.reason;
+        report();
         console.warn('[dsh-im] Harness interaction stream disconnected:', this.#logPrefix, error.message);
       }
       if (signal.aborted) return;
@@ -1425,7 +1685,7 @@ export class HarnessClient {
       );
       this.#consumeInteractionOwnerships(sessionId, history.events ?? []);
     } catch (error) {
-      if (!(error instanceof HarnessRpcError) || error.code !== 'session-not-found') throw error;
+      if (!(error instanceof HarnessRpcError) || !isSessionNotFound(error.code)) throw error;
       for (const ownership of candidates) {
         ownership.active = false;
         ownership.completed = true;
@@ -1496,7 +1756,7 @@ export class HarnessClient {
       if (this.#activeControlOwnership(sessionId, control) === ownership) {
         ownership.stopRequested = false;
       }
-      if (error instanceof HarnessRpcError && error.code === 'session-not-found') return false;
+      if (error instanceof HarnessRpcError && isSessionNotFound(error.code)) return false;
       throw error;
     }
   }
@@ -1536,7 +1796,7 @@ export class HarnessClient {
         sessionId,
         mode: 'steer',
         content: [{ type: 'text', text }],
-        clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        ...clientTimeZoneFields(),
       }, 30_000, { ...options, rpcId: inputRpcId });
       return true;
     } catch (error) {
@@ -1614,6 +1874,16 @@ export class HarnessClient {
 
   async ask(sessionId, prompt, options = {}) {
     if (typeof options === 'number') options = { timeoutMs: options };
+    const diagnostic = { stage: 'prompt.prepare', submissionState: 'not-submitted', sessionId };
+    try {
+      return await this.#ask(sessionId, prompt, options, diagnostic);
+    } catch (error) {
+      if (options.signal?.aborted) throw error;
+      throw messageDiagnosticError(error, diagnostic);
+    }
+  }
+
+  async #ask(sessionId, prompt, options, diagnostic) {
     const timeoutMs = options.timeoutMs ?? 600_000;
     const signal = options.signal;
     const onUpdate = typeof options.onUpdate === 'function' ? options.onUpdate : null;
@@ -1634,7 +1904,8 @@ export class HarnessClient {
     const inboundFiles = Array.isArray(options.files) ? options.files.filter(Boolean) : [];
     const inboundImages = Array.isArray(options.images) ? options.images.filter(Boolean) : [];
     await this.ensureRunning({ signal });
-    const before = await this.rpc(
+    if (await this.#isSessionArchived(sessionId, { signal })) throw sessionArchivedError(sessionId);
+    const before = await this.#sessionRpc(
       'session.history',
       { sessionId, maxMessages: 1 },
       30_000,
@@ -1642,8 +1913,12 @@ export class HarnessClient {
     );
     const baselineSeq = Math.max(-1, ...(before.events ?? []).map(({ event }) => event.seq ?? -1));
     const promptRpcId = `${this.#rpcIdPrefix}-${randomUUID()}`;
+    diagnostic.promptRpcId = promptRpcId;
     const releasePromptInputOrigin = registerImInputOrigin(this.#interactionRegistry, promptRpcId);
-    const tracker = new HarnessReplyTracker({ promptRpcId, afterSeq: baselineSeq, reasoning });
+    const tracker = new HarnessReplyTracker({
+      promptRpcId, afterSeq: baselineSeq, reasoning, finalAnswerOnly: options.finalAnswerOnly,
+    });
+    let checkedBlockedSeq = baselineSeq;
     let lastProgressAt = Date.now();
     let lastPollSeq = tracker.lastSeq;
     let progressTail = Promise.resolve();
@@ -1665,10 +1940,15 @@ export class HarnessClient {
         progressTail = progressTail
           .then(() => onUpdate(update))
           .catch((error) => {
+            // The WeCom SDK rejects with the raw ack frame (no .message), so
+            // surface errcode/errmsg explicitly instead of printing undefined.
+            const detail = error instanceof Error
+              ? error.message
+              : `${error?.errmsg ?? error?.body?.errmsg ?? '(no message)'} (errcode=${error?.errcode ?? error?.body?.errcode ?? 'unknown'})`;
             console.warn(
               '[dsh-im] ignored a progress update failure:',
               this.#logPrefix,
-              error.message,
+              detail,
             );
           });
       }
@@ -1699,6 +1979,7 @@ export class HarnessClient {
           lastSeq: baselineSeq,
           reconnect: null,
           order: -1,
+          competitiveApprovals: this.#competitiveApprovals,
           toolCalls: new Map(),
           control,
         }
@@ -1734,9 +2015,11 @@ export class HarnessClient {
       this.#registerInteractionOwnership(sessionId, ownership);
       this.#registerControlOwnership(ownership);
     }
-    // This is resource ownership, not a feature Gate: it lets the Host retain
-    // this Turn's snapshots until the channel has polled and claimed them.
-    const closeArtifactConsumer = outboundArtifactRegistry.openConsumer(sessionId, promptRpcId);
+    // Advertise delivery only when this request can actually claim its files.
+    const closeGroupHistoryAccess = groupHistoryAccess.open(sessionId, promptRpcId, options.groupHistory);
+    const closeArtifactConsumer = typeof onArtifact === 'function'
+      ? outboundArtifactRegistry.openConsumer(sessionId, promptRpcId)
+      : null;
 
     try {
       const basePrompt = prompt;
@@ -1766,6 +2049,9 @@ export class HarnessClient {
         });
       }
       if (interactionSignal) {
+        diagnostic.stage = 'interaction.open';
+        const startedAt = performance.now();
+        let streamDiagnostic = { attempts: 0 };
         let markOpen;
         const opened = new Promise((resolve) => { markOpen = resolve; });
         interactionTask = this.watchInteractions(sessionId, {
@@ -1777,16 +2063,25 @@ export class HarnessClient {
             : undefined,
           onOpen: markOpen,
           ownership,
+          onDiagnostic: (value) => { streamDiagnostic = value; },
         });
         void interactionTask.catch(() => undefined);
         await Promise.race([
           opened,
           sleep(30_000, interactionSignal).then(() => {
-            throw new Error('Harness interaction stream did not open within 30 seconds');
+            throw Object.assign(new HarnessInteractionError(
+              'harness-interaction-timeout',
+              'Harness interaction stream did not open within 30 seconds',
+            ), {
+              transport: this.#apiProxy ? 'host-api' : 'websocket',
+              durationMs: Math.round(performance.now() - startedAt),
+              timeoutMs: 30_000,
+              ...streamDiagnostic,
+            });
           }),
         ]);
       }
-
+      diagnostic.stage = 'prompt.prepare';
       const content = typeof prompt === 'string'
         ? [{ type: 'text', text: prompt }]
         : prompt;
@@ -1799,15 +2094,39 @@ export class HarnessClient {
       // `content`: the prompt also carries whatever the user typed, and a
       // message that merely looks like a guidance block is not configuration.
       imSourceGuidance.publish(sessionId, options.sourceGuidance);
-      const clientTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-      const sendPrompt = (promptContent) => this.rpc('session.prompt', {
-        sessionId,
-        mode: 'queue',
-        content: promptContent,
-        clientTimeZone,
-      }, 30_000, { rpcId: promptRpcId, signal });
+      const timeZoneFields = clientTimeZoneFields();
+      const sendPrompt = (promptContent) => {
+        diagnostic.stage = 'prompt.submit';
+        diagnostic.submissionState = 'unknown';
+        return this.#sessionRpc('session.prompt', {
+          sessionId,
+          mode: 'queue',
+          content: promptContent,
+          ...timeZoneFields,
+        }, 30_000, { rpcId: promptRpcId, signal });
+      };
+      // 30 秒提交窗口到期只说明 Host 忙到没来得及应答，prompt 可能早已入队。
+      // 先按 promptRpcId 回查持久账本，确认入库就继续等回复；确认不到才把
+      // 原始超时错误向上抛，由文案层标注「提交请求超时、是否送达未知」。
+      const submitPrompt = async (promptContent) => {
+        try {
+          await sendPrompt(promptContent);
+        } catch (error) {
+          if (!isPromptSubmitTimeout(error) || signal?.aborted) throw error;
+          let confirmed = false;
+          try {
+            confirmed = await this.#confirmPromptSubmit(sessionId, promptRpcId, { signal });
+          } catch (confirmError) {
+            // 确认途中被取消时恢复调用方的取消语义（与图片暂存路径一致）。
+            if (signal?.aborted) throw signal.reason ?? confirmError;
+            throw error;
+          }
+          if (!confirmed) throw error;
+          diagnostic.submissionState = 'accepted';
+        }
+      };
       try {
-        await sendPrompt(content);
+        await submitPrompt(content);
       } catch (error) {
         // The Host refuses image blocks for a non-vision model before any
         // durable user message exists. Re-deliver the same bytes the way
@@ -1842,9 +2161,11 @@ export class HarnessClient {
           ...contentWithoutImages(baseContent),
           { type: 'text', text: t(isModelImageRejection(error) ? IMAGE_FILE_FALLBACK_PROMPT : IMAGE_HOST_LIMIT_FALLBACK_PROMPT) },
         ], { files: stagedBatches.flatMap((batch) => batch?.files ?? []) });
-        await sendPrompt(fallbackPrompt);
+        await submitPrompt(fallbackPrompt);
       }
       promptAccepted = true;
+      diagnostic.submissionState = 'accepted';
+      diagnostic.stage = 'reply.wait';
 
       try {
         // Treat timeoutMs as a stall window rather than a hard runtime limit.
@@ -1854,7 +2175,7 @@ export class HarnessClient {
         // active until turn/end and can therefore outlive a stalled turn.
         while (true) {
           await sleep(300, signal);
-          const history = await this.rpc(
+          const history = await this.#sessionRpc(
             'session.history',
             { sessionId, maxMessages: 50 },
             30_000,
@@ -1869,16 +2190,19 @@ export class HarnessClient {
           if (tracker.finished) {
             turnFinished = true;
             if (!ownership?.stopRequested && !harnessTurnSucceeded(tracker.reason)) {
-              throw harnessTurnError(tracker.reason);
+              const failure = harnessTurnError(tracker.reason);
+              if (failure.code === 'turn-blocked') {
+                throw await this.#confirmedSessionError(sessionId, { signal }, failure) ?? failure;
+              }
+              throw failure;
             }
             // An accepted /stop revokes attachment delivery even when Harness
             // preserved a useful partial text answer for the existing UX.
             const artifactCount = ownership?.stopRequested
               ? 0
               : await deliverArtifacts();
-            if (tracker.answer) {
-              return tracker.answer;
-            }
+            const answer = ownership?.stopRequested ? tracker.answer : tracker.finalAnswer;
+            if (answer) return answer;
             if (artifactCount > 0) return '';
             if (ownership?.stopRequested) throw turnStoppedError();
             if (artifactHandoffError) throw artifactHandoffError;
@@ -1890,7 +2214,29 @@ export class HarnessClient {
             throw harnessTurnError(tracker.reason);
           }
 
+          if (tracker.turn === null && !ownership?.stopRequested) {
+            // An admission gate can block before user/message supplies rpcId.
+            // This event only prompts a Session-level archive check; it never
+            // grants ownership of another caller's turn, artifacts or approvals.
+            const blockedSeq = Math.max(checkedBlockedSeq, ...(history.events ?? [])
+              .map((entry) => entry?.event ?? entry)
+              .filter((event) => event?.type === 'turn/end'
+                && (event.data?.reason?.kind ?? event.data?.reason) === 'blocked'
+                && Number.isSafeInteger(event.seq))
+              .map((event) => event.seq));
+            if (blockedSeq > checkedBlockedSeq) {
+              checkedBlockedSeq = blockedSeq;
+              const archived = await this.#confirmedSessionError(sessionId, { signal });
+              if (archived) throw archived;
+            }
+          }
+
           if (Date.now() - lastProgressAt < timeoutMs) continue;
+
+          if (!ownership?.stopRequested) {
+            const archived = await this.#confirmedSessionError(sessionId, { signal });
+            if (archived) throw archived;
+          }
 
           let running = false;
           try {
@@ -1904,11 +2250,17 @@ export class HarnessClient {
             continue;
           }
           const timeoutError = new HarnessTurnError('harness-reply-timeout');
+          timeoutError.durationMs = Date.now() - lastProgressAt;
+          timeoutError.timeoutMs = timeoutMs;
           // Data-only context for deferred delivery; timeout semantics unchanged.
           timeoutError.details = { sessionId, promptRpcId, baselineSeq, turn: tracker.turn, lastSeq: tracker.lastSeq };
           throw timeoutError;
         }
       } catch (error) {
+        if (error.code === 'session-archived') {
+          error.promptAccepted = promptAccepted;
+          error.details = { ...error.details, promptRpcId, baselineSeq, turn: tracker.turn, lastSeq: tracker.lastSeq };
+        }
         if (error instanceof HarnessTurnError) {
           error.details ??= {
             sessionId, promptRpcId, baselineSeq, turn: tracker.turn, lastSeq: tracker.lastSeq,
@@ -1934,7 +2286,8 @@ export class HarnessClient {
           }
         }
       }
-      closeArtifactConsumer();
+      closeArtifactConsumer?.();
+      closeGroupHistoryAccess();
       if (ownership) {
         this.#unregisterControlOwnership(ownership);
         this.#unregisterInteractionOwnership(sessionId, ownership);
@@ -2016,6 +2369,11 @@ export class HarnessClient {
             ? this.#interactionClaims.get(claimKey)?.recovered === true
             : false,
           ...(toolCall ? { toolCall } : {}),
+          ...(kind === 'approval' && payload.competitive === true ? {
+            withdraw: () => this.respondInteraction(envelope.rpcId, {
+              ok: false, error: { code: 'unavailable', message: 'IM cannot answer this approval', details: {} },
+            }, { signal: AbortSignal.timeout(5_000) }),
+          } : {}),
           reconnect: close,
           respond: (result, options = {}) => this.respondInteraction(
             envelope.rpcId,

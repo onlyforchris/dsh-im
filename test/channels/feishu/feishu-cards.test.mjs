@@ -24,6 +24,40 @@ import {
 } from '../../../src/channels/feishu/feishu-cards.mjs';
 import { setImHostLanguage } from '../../../src/channels/shared/i18n.mjs';
 
+test('streaming card expansion keeps legacy defaults and respects all four panel combinations', () => {
+  const blocks = [{ kind: 'notes', lines: ['过程说明'] }, { kind: 'tools', lines: ['工具摘要'] }, { kind: 'message', text: '最终答案' }];
+  const panels = (card) => card.body.elements.filter((element) => element.tag === 'collapsible_panel');
+  assert.deepEqual(panels(JSON.parse(stepStreamCard(blocks))).map((panel) => panel.expanded), [false, true]);
+  for (const thinkingExpanded of [false, true]) {
+    for (const toolsExpanded of [false, true]) {
+      const stepCardPanels = { thinkingExpanded, toolsExpanded };
+      const running = JSON.parse(stepStreamCard(blocks, { stepCardPanels }));
+      assert.deepEqual(panels(running).map((panel) => panel.expanded), [thinkingExpanded, toolsExpanded]);
+      for (const status of ['completed', 'stopped', 'sealed']) {
+        const card = JSON.parse(stepStreamCard(blocks, { status, stepCardPanels }));
+        const [details] = panels(card);
+        assert.equal(details.expanded, false);
+        assert.deepEqual(details.elements.map((panel) => panel.expanded), [false, false]);
+        assert.equal(card.body.elements[0].content, '最终答案');
+        assert.match(JSON.stringify(details), /过程说明/);
+        assert.match(JSON.stringify(details), /工具摘要/);
+      }
+    }
+  }
+  assert.equal(panels(JSON.parse(stepStreamCard([{ kind: 'notes', lines: [] }], { stepCardPanels: { thinkingExpanded: true } }))).length, 0);
+});
+
+test('streaming card splitting measures the selected panel expansion at the byte boundary', () => {
+  const blocks = [{ kind: 'tools', lines: ['first'] }, { kind: 'tools', lines: ['second'] }];
+  const limit = Buffer.byteLength(stepStreamCard(blocks));
+  const stepCardPanels = { thinkingExpanded: false, toolsExpanded: false };
+  assert.equal(splitStepStreamCardBlocks(blocks, limit).length, 1);
+  const chunks = splitStepStreamCardBlocks(blocks, limit, undefined, stepCardPanels);
+  assert.equal(chunks.length, 2, 'false uses more serialized bytes than true');
+  assert.deepEqual(chunks.flat(), blocks);
+  assert.ok(chunks.every((chunk) => Buffer.byteLength(stepStreamCard(chunk, { stepCardPanels })) <= limit));
+});
+
 test('approval cards replace actions with the resolved text and preserve operation details', () => {
   const details = {
     toolName: 'write',
@@ -90,10 +124,119 @@ test('menu exposes the increased command set and keeps permission completion num
   ));
   assert.deepEqual(actions, [
     'presets', 'models', 'new', 'sessions', 'workspaces',
-    'stop', 'compact', 'archive_toggle', 'status', 'help',
+    'stop', 'compact', 'clear', 'archive_toggle', 'status', 'help',
   ]);
   // 补全权限不占位按钮：仅通过数字兜底「5🔧」触发（见 bridge）
   assert.equal(actions.includes('repair'), false);
+});
+
+test('workspace cards share title labels while preserving full paths and selection', () => {
+  const paths = [
+    'E:\\very-long-common-prefix\\DS.HarnessWorkspace\\research',
+    'E:\\very-long-common-prefix\\DS.HarnessWorkspace\\交流区',
+    '/data/customer-a/project', '/data/customer-b/project',
+    '/data/a', '/data/b', '/', 'C:\\', '\\\\server\\share\\notes',
+  ];
+  const titles = { [paths[0]]: '  策略\n研究\u202e  ', [paths[1]]: '\n',
+    '/data/a': '研究', '/data/b': '研究', '/': 123 };
+  const expected = ['策略 研究', '交流区', 'project · customer-a', 'project · customer-b',
+    '研究 · data/a', '研究 · data/b', '/', 'C:\\', 'notes'];
+  const menu = JSON.parse(menuCard({ workspaces: paths, workspaceTitles: titles, currentWorkspace: paths[0] }));
+  const picker = selects(menu).find((item) => item.name === 'workspace_pick');
+  assert.equal(picker.initial_index, 1);
+  assert.deepEqual(picker.options.map((item) => item.value), paths);
+  assert.deepEqual(picker.options.map((item) => item.text.content), expected.map((label, i) => `${i ? '' : '✓ '}${label}`));
+  const list = buttons(JSON.parse(workspaceListCard(paths, paths[0], titles))).slice(0, paths.length);
+  assert.deepEqual(list.map((item) => item.text.content), expected.map((label, i) => `${i + 1}. ${label}${i ? '' : '（当前）'}`));
+  assert.deepEqual(list.map((item) => item.behaviors[0].value.action), paths.map((path) => `workspace:${path}`));
+});
+
+test('workspace labels distinguish nested parents and truncation collisions without splitting emoji', () => {
+  const paths = ['/a/same/project', '/b/same/project', '/data/a', '/data/b', '/data/emoji'];
+  const titles = { '/data/a': '前'.repeat(11) + 'A'.repeat(20) + '后'.repeat(10),
+    '/data/b': '前'.repeat(11) + 'B'.repeat(20) + '后'.repeat(10), '/data/emoji': '😀'.repeat(30) };
+  const menu = JSON.parse(menuCard({ workspaces: paths, workspaceTitles: titles }));
+  const picker = selects(menu).find((item) => item.name === 'workspace_pick');
+  const labels = picker.options.map((item) => item.text.content);
+  assert.deepEqual(labels.slice(0, 2), ['project · a/same', 'project · b/same']);
+  assert.equal(labels[2], `3. ${'前'.repeat(11)}…${'后'.repeat(10)}`);
+  assert.equal(labels[3], `4. ${'前'.repeat(11)}…${'后'.repeat(10)}`);
+  assert.equal(labels[4], '😀'.repeat(11) + '…' + '😀'.repeat(10));
+  assert.equal(new Set(labels).size, paths.length);
+  const list = buttons(JSON.parse(workspaceListCard(paths, null, titles)));
+  assert.equal(list[2].text.content, labels[2], 'list numbering is not duplicated');
+});
+
+test('workspace label disambiguation uses the full snapshot before the menu limit', () => {
+  const paths = Array.from({ length: 21 }, (_, i) => `/group${i}/item`);
+  const titles = Object.fromEntries(paths.map((path, i) => [path, i % 20 === 0 ? '重复' : `名称${i}`]));
+  const picker = selects(JSON.parse(menuCard({ workspaces: paths, workspaceTitles: titles })))
+    .find((item) => item.name === 'workspace_pick');
+  assert.equal(picker.options.length, 20);
+  assert.equal(picker.options[0].text.content, '重复 · group0/item');
+  const list = buttons(JSON.parse(workspaceListCard(paths, null, titles)));
+  assert.equal(list[0].text.content, `1. ${picker.options[0].text.content}`);
+  assert.equal(list[20].text.content, '21. 重复 · group20/item');
+});
+
+test('menu new-session states remain visible while only that action is disabled', () => {
+  const context = {
+    workspaces: ['/work'],
+    currentWorkspace: '/work',
+    sessions: [{ id: 'session-one', title: 'Session One' }],
+    presetCatalog: { items: [{ id: 'preset-one', label: 'Preset One' }] },
+    modelCatalog: {
+      groups: [{ id: 'provider', name: 'Provider', models: [
+        { id: 'model-one', name: 'Model One' },
+        { id: 'model-two', name: 'Model Two' },
+      ] }],
+    },
+  };
+  const baseline = JSON.parse(menuCard(context));
+  const otherButtons = (card) => buttons(card).filter((button) => button.behaviors[0].value.action !== 'new');
+  for (const [status, label, notice, disabled] of [
+    ['idle', '🆕 新会话', null, false],
+    ['processing', '正在开启…', '正在开启新会话…', true],
+    ['success', '已执行：新会话', '已执行：新会话。发送消息即可开始。', true],
+    ['failed', '🆕 新会话', '新会话操作失败：**failure** <error>', false],
+  ]) {
+    const id = `new-session-${status}`;
+    const card = JSON.parse(menuCard({
+      ...context,
+      newSessionAction: { id, status, message: '**failure** <error>' },
+    }));
+    const newButton = buttons(card).find((button) => button.behaviors[0].value.action === 'new');
+    assert.deepEqual(newButton.text, { tag: 'plain_text', content: label });
+    assert.deepEqual(newButton.behaviors, [{ type: 'callback', value: { action: 'new', newSessionActionId: id } }]);
+    assert.equal(newButton.disabled === true, disabled, `${status} button availability`);
+    if (notice) {
+      assert.deepEqual(card.body.elements[0], { tag: 'div', text: { tag: 'plain_text', content: notice } });
+    } else {
+      assert.deepEqual(card.body.elements[0], baseline.body.elements[0]);
+    }
+    assert.deepEqual(otherButtons(card), otherButtons(baseline), `${status} must preserve other menu buttons`);
+    assert.deepEqual(selects(card), selects(baseline), `${status} must preserve all menu dropdowns`);
+    assert.equal(card.config, undefined, 'action feedback must not change card-wide interaction settings');
+  }
+});
+
+test('menu new-session feedback is localized in English, including a failure without details', () => {
+  setImHostLanguage('en');
+  try {
+    for (const [status, label, notice] of [
+      ['processing', 'Starting…', 'Starting a new session…'],
+      ['success', 'Done: new session', 'Done: new session. Send a message to start.'],
+      ['failed', '🆕 New session', 'New session action failed: The card action failed. Please try again later.'],
+    ]) {
+      const card = JSON.parse(menuCard({ newSessionAction: { id: 'action-one', status } }));
+      const newButton = buttons(card).find((button) => button.behaviors[0].value.action === 'new');
+      assert.equal(newButton.text.content, label);
+      assert.equal(card.body.elements[0].text.content, notice);
+      assert.doesNotMatch(JSON.stringify(card), /[\u3400-\u9fff]/u);
+    }
+  } finally {
+    setImHostLanguage('zh');
+  }
 });
 
 test('menu and card help advertise Agent Preset, reasoning, and batch commands', () => {
@@ -177,6 +320,53 @@ test('menu session dropdown highlights the currently bound session via initial_i
   assert.ok(pick, 'menu must render a session dropdown');
   // initial_index is 1-based; the currently bound session sits at index 2.
   assert.equal(pick.initial_index, 2);
+});
+
+test('model cards expose reasoning levels for the selected model', () => {
+  const card = JSON.parse(modelCard({
+    groups: [{ id: 'provider', name: 'Provider', models: [{
+      id: 'model', name: 'Model', reasoning: {
+        defaultEffort: 'balanced', efforts: [
+          { id: 'fast', name: 'Fast' }, { id: 'balanced', name: 'Balanced' },
+        ],
+      },
+    }] }],
+    current: { provider: 'provider', model: 'model', reasoningEffort: 'balanced' },
+  }));
+  const pick = selects(card).find((s) => s.name === 'reasoning_pick');
+  assert.deepEqual(pick?.options.map((option) => option.value), ['__reasoning_default__', 'fast', 'balanced']);
+  assert.equal(pick?.initial_index, 3);
+});
+
+test('menu model picker remains capped at the compact-menu limit', () => {
+  const models = Array.from({ length: 35 }, (_, index) => ({ id: `model-${index}`, name: `Model ${index}` }));
+  const card = JSON.parse(menuCard({
+    currentSession: { id: 'session-one', title: 'Session one' },
+    sessions: [{ id: 'session-one', title: 'Session one' }],
+    modelCatalog: { groups: [{ id: 'provider', name: 'Provider', models }], current: null },
+  }));
+  const pick = selects(card).find((select) => select.name === 'model_pick');
+  assert.equal(pick?.options.length, 30);
+});
+
+test('model cards paginate large catalogs and expose navigation actions', () => {
+  const models = Array.from({ length: 45 }, (_, index) => ({ id: `model-${index}`, name: `Model ${index}` }));
+  const first = JSON.parse(modelCard({ groups: [{ id: 'provider', name: 'Provider', models }], current: null }, { page: 0 }));
+  assert.equal(selects(first).find((s) => s.name === 'model_pick')?.options.length, 20);
+  assert.match(JSON.stringify(first), /models:1/);
+  const third = JSON.parse(modelCard({ groups: [{ id: 'provider', name: 'Provider', models }], current: null }, { page: 2 }));
+  assert.equal(selects(third).find((s) => s.name === 'model_pick')?.options.length, 5);
+  assert.match(JSON.stringify(third), /最后一页/);
+});
+
+test('model cards keep the full model catalog available across pages', () => {
+  const models = Array.from({ length: 35 }, (_, index) => ({ id: `model-${index}`, name: `Model ${index}` }));
+  const card = JSON.parse(modelCard({ groups: [{ id: 'provider', name: 'Provider', models }], current: null }));
+  const pick = selects(card).find((s) => s.name === 'model_pick');
+  assert.equal(pick?.options.length, 20);
+  assert.equal(pick?.options.at(-1)?.value, 'provider/model-19');
+  const later = JSON.parse(modelCard({ groups: [{ id: 'provider', name: 'Provider', models }], current: null }, { page: 1 }));
+  assert.equal(selects(later).find((s) => s.name === 'model_pick')?.options.at(-1)?.value, 'provider/model-34');
 });
 
 test('model card dropdown highlights the current model via initial_index', () => {

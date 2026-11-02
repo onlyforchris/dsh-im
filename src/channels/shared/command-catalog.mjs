@@ -29,25 +29,46 @@ export const SHARED_COMMAND_CATALOG = Object.freeze([
   defineCatalogCommand('compact', '压缩当前会话的较早上下文', [
     '/compact  压缩当前会话的较早上下文',
   ]),
+  defineCatalogCommand('clear', '清空当前会话上下文并保留会话绑定', [
+    '/clear  清空当前会话上下文（保留 Session 绑定和历史记录）',
+  ]),
   defineCatalogCommand('history', '查看最近历史消息（仅私聊）', [
     '/history [数量]  查看最近历史消息（默认 3 条，最多 5 条）',
   ], { privateOnly: true }),
-  defineCatalogCommand('workspace', '切换工作区', [
+  // Merged listing+switch command: no argument opens the picker, an argument
+  // switches directly. /wsl and friends stay accepted but leave the menu so
+  // there is one workspace entry to choose from.
+  defineCatalogCommand('workspace', '查看或切换工作区', [
+    '/workspace 或 /ws  查看可切换的工作区（点按钮切换）',
     '/workspace 工作区序号或绝对路径  切换工作区',
-  ], { aliases: ['ws'] }),
+  ], { aliases: [{ name: 'ws', menuVisible: false }] }),
   defineCatalogCommand('conv', '设置当前对话专属工作区', [
     '/conv 或 /conversation  查看当前对话工作区',
     '/conv 工作区绝对路径或序号  设置当前对话专属工作区',
     '/conv clear  清除专属工作区，回到 bot 默认工作区',
-  ], { aliases: ['conversation', 'thread'] }),
+  ], {
+    // Aliases stay typeable and stay in /help, but the native Telegram menu
+    // lists each command once; B16 in the command UX audit.
+    aliases: [
+      { name: 'conversation', menuVisible: false },
+      { name: 'thread', menuVisible: false },
+    ],
+  }),
   defineCatalogCommand('workspacelist', '列出工作区绝对路径', [
-    '/workspacelist  列出工作区绝对路径',
-    '/ws、/wsl、/workspaces  工作区命令别名',
-  ], { aliases: ['workspaces', 'wsl'] }),
+    '/workspacelist、/wsl、/workspaces  工作区列表别名（等同 /ws）',
+  ], {
+    // Aliases stay typeable and stay in /help, but the native Telegram menu
+    // lists each command once; B16 in the command UX audit.
+    aliases: [
+      { name: 'workspaces', menuVisible: false },
+      { name: 'wsl', menuVisible: false },
+    ],
+    menuVisible: false,
+  }),
   defineCatalogCommand('sessionlist', '列出会话 ID 和标题', [
     '/sessionlist 或 /sessions [工作区序号或绝对路径]  列出会话 ID 和标题',
     '/sessionlist --limit N  仅列出当前工作区前 N 个会话',
-  ], { aliases: ['sessions'] }),
+  ], { aliases: [{ name: 'sessions', menuVisible: false }] }),
   defineCatalogCommand('session', '将当前聊天绑定到指定会话', [
     '/session Session ID 或当前工作区序号  将当前聊天绑定到指定会话',
   ]),
@@ -56,7 +77,7 @@ export const SHARED_COMMAND_CATALOG = Object.freeze([
   ]),
   defineCatalogCommand('reasoninglist', '按序号列出当前模型可用推理等级', [
     '/reasoninglist 或 /reasonings  按序号列出当前模型可用推理等级',
-  ], { aliases: ['reasonings'] }),
+  ], { aliases: [{ name: 'reasonings', menuVisible: false }] }),
   defineCatalogCommand('reasoning', '查看或切换当前推理等级', [
     '/reasoning [序号、等级ID或 --default]  查看或切换当前推理等级',
   ]),
@@ -66,7 +87,7 @@ export const SHARED_COMMAND_CATALOG = Object.freeze([
   ]),
   defineCatalogCommand('presetlist', '列出可用 Agent Preset', [
     '/presetlist 或 /presets  按序号列出可用 Agent Preset',
-  ], { aliases: ['presets'] }),
+  ], { aliases: [{ name: 'presets', menuVisible: false }] }),
   defineCatalogCommand('preset', '查看或设置新会话 Agent Preset', [
     '/preset [序号或完整ID]  查看或设置当前机器人 Agent Preset',
     '纯数字 ID：/preset id:<ID>',

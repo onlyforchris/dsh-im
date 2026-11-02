@@ -1,4 +1,4 @@
-export const WECOM_APP_STYLE_ID = 'xmanrui-dsh-im-wecom-app-settings';
+export const WECOM_APP_STYLE_ID = 'onlyforchris-dsh-im-wecom-app-settings';
 
 const CSS = String.raw`
 .dwecomapp-page { --ddt-accent: #07c160; --ddt-accent-deep: #059a4c; --ddt-accent-wash: #eefaf3; }

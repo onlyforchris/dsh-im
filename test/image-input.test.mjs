@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { mkdtemp, readFile, rm, readdir, stat } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -13,6 +13,7 @@ import { HarnessClient, HarnessRpcError } from '../src/channels/shared/harness-c
 import { TextHarnessBridge } from '../src/channels/shared/text-harness-bridge.mjs';
 import { WecomAppBridge } from '../src/channels/wecom-app/wecom-app-bridge.mjs';
 import { createImageInputRpcHandler, IMAGE_INPUT_ENDPOINTS } from '../plugin-src/host/image-input-rpc.mjs';
+
 import { assertRestrictiveMode } from './support/filesystem.mjs';
 
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
@@ -52,6 +53,7 @@ async function clientFixture(t, { onPrompt, policy, retention = 'persistent' } =
   client.sessionExists = async () => true;
   client.createSession = async () => 'test-session';
   client.rpc = async (method, payload, _timeout, options) => {
+    if (method === 'workspace.list') return { items: [], archivedSessionIds: [] };
     if (method === 'session.list') return { items: [{ sessionId: 'test-session', cwd: root }] };
     if (method === 'session.prompt') {
       prompts.push({ ...payload, rpcId: options.rpcId });

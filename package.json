@@ -1,6 +1,6 @@
 {
   "name": "@onlyforchris/dsh-im",
-  "version": "4.32.0-3",
+  "version": "5.9.1-2",
   "icon": "./assets/logo-plugin-message-link-gradient.webp",
   "description": "把微信、飞书、企微、钉钉、QQ、Telegram、WhatsApp、Slack、Discord、Matrix接入DSH。 Connect Telegram, WhatsApp, Slack, Discord, Matrix, WeChat, Feishu, WeCom, DingTalk, and QQ to DSH.",
   "keywords": [
@@ -25,84 +25,7 @@
     "matrix",
     "ai-office"
   ],
-  "author": {
-    "name": "onlyforchris",
-    "url": "https://github.com/onlyforchris"
-  },
-  "contributors": [
-    {
-      "name": "xmanrui",
-      "url": "https://github.com/xmanrui"
-    },
-    {
-      "name": "C3H3-AI",
-      "url": "https://github.com/C3H3-AI"
-    },
-    {
-      "name": "divingleee",
-      "url": "https://github.com/divingleee"
-    },
-    {
-      "name": "Chan-0312",
-      "url": "https://github.com/Chan-0312"
-    },
-    {
-      "name": "BuvkB",
-      "url": "https://github.com/BuvkB"
-    },
-    {
-      "name": "masucc",
-      "url": "https://github.com/masucc"
-    },
-    {
-      "name": "cherryFloris",
-      "url": "https://github.com/cherryFloris"
-    },
-    {
-      "name": "geekyfoxlab",
-      "url": "https://github.com/geekyfoxlab"
-    },
-    {
-      "name": "grloper",
-      "url": "https://github.com/grloper"
-    },
-    {
-      "name": "baijian",
-      "url": "https://github.com/baijian"
-    },
-    {
-      "name": "lyzhu86",
-      "url": "https://github.com/lyzhu86"
-    },
-    {
-      "name": "Librazy",
-      "url": "https://github.com/Librazy"
-    },
-    {
-      "name": "Johnslee1207",
-      "url": "https://github.com/johnslee1207-commits"
-    },
-    {
-      "name": "Dong09",
-      "url": "https://github.com/Dong09"
-    },
-    {
-      "name": "wings1848",
-      "url": "https://github.com/wings1848"
-    },
-    {
-      "name": "Zhe (Phil) Yang",
-      "url": "https://github.com/yangzhe1991"
-    },
-    {
-      "name": "Biertolovisk",
-      "url": "https://github.com/rosalynthompson32-a11y"
-    },
-    {
-      "name": "Tianjun Cai",
-      "url": "https://github.com/Pegasus02"
-    }
-  ],
+  "author": "xmanrui (https://github.com/xmanrui)",
   "license": "MIT",
   "type": "module",
   "repository": {
@@ -110,7 +33,9 @@
     "url": "git+https://github.com/onlyforchris/dsh-im.git"
   },
   "homepage": "https://github.com/onlyforchris/dsh-im#readme",
-  "bugs": "https://github.com/onlyforchris/dsh-im/issues",
+  "bugs": {
+    "url": "https://github.com/onlyforchris/dsh-im/issues"
+  },
   "publishConfig": {
     "access": "public"
   },
@@ -131,6 +56,7 @@
     "lib",
     "locale/*.json",
     "plugin-src",
+    "scripts/telegram-menu-scopes.mjs",
     "scripts/verify-interface-language.mjs",
     "scripts/verify-injected-context.mjs",
     "scripts/verify-lan-management.mjs",
@@ -142,10 +68,12 @@
     "PROACTIVE_DELIVERY.md",
     "PROACTIVE_DELIVERY.en.md",
     "docs/client-integration.md",
+    "docs/preset-workspaces.md",
     "LICENSE",
     "README.md",
     "README.en.md",
-    "THIRD_PARTY_NOTICES.md"
+    "THIRD_PARTY_NOTICES.md",
+    "FORK_MAINTENANCE.md"
   ],
   "dsh": {
     "bundle": {
@@ -162,23 +90,11 @@
       "platform": "web"
     },
     "compatibility": {
-      "dsh": "0.1.2-alpha.4 || 0.1.2-alpha.5 || 0.1.2-rc.1 || 0.1.3-alpha.1 || 0.1.5-alpha.1 || 0.1.5-rc.1 || 0.1.5-rc.2 || 0.1.6-alpha.1 || 0.1.6-alpha.2 || 0.1.7-alpha.2 || 0.1.7-rc.1 || 0.1.7-rc.2 || 0.2.0-rc.1 || 0.2.0-rc.2 || 0.2.1-rc.2",
+      "dsh": "0.2.1-rc.5",
       "dshReleases": {
-        "0.1.2-alpha.4": "compatible",
-        "0.1.2-alpha.5": "compatible",
-        "0.1.2-rc.1": "compatible",
-        "0.1.3-alpha.1": "compatible",
-        "0.1.5-alpha.1": "compatible",
-        "0.1.5-rc.1": "compatible",
-        "0.1.5-rc.2": "compatible",
-        "0.1.6-alpha.1": "compatible",
-        "0.1.6-alpha.2": "compatible",
-        "0.1.7-alpha.2": "compatible",
-        "0.1.7-rc.1": "compatible",
-        "0.1.7-rc.2": "compatible",
-        "0.2.0-rc.1": "compatible",
         "0.2.0-rc.2": "compatible",
-        "0.2.1-rc.2": "compatible"
+        "0.2.1-rc.2": "compatible",
+        "0.2.1-rc.5": "compatible"
       },
       "profiles": [
         "web"
@@ -200,10 +116,10 @@
     "@wecom/aibot-node-sdk": "1.0.7",
     "dingtalk-stream": "2.1.4",
     "imapflow": "^2.0.5",
-    "mailparser": "^3.9.28",
-    "nodemailer": "^10.0.10",
+    "mailparser": "^3.9.43",
+    "nodemailer": "^10.1.4",
     "qrcode": "1.5.4",
-    "undici": "7.29.1"
+    "undici": "7.30.1"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.1",
@@ -223,6 +139,6 @@
   },
   "optionalDependencies": {
     "@tencent-qqmail/agently-cli": "^1.0.18",
-    "sharp": "0.35.4"
+    "sharp": "0.35.5"
   }
 }

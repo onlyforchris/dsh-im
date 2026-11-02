@@ -1,6 +1,8 @@
+import { SET_MESSAGE_MODE_ENDPOINT, validMessageModePayload } from '../../../../src/channels/shared/message-mode.mjs';
 import { SET_ALIAS_ENDPOINT, validAliasPayload } from '../shared/bot-alias-rpc.mjs';
 import { registerManagementRpc } from '../../../management-rpc.mjs';
 import QRCode from 'qrcode';
+import { qrEncodingError } from '../../../../src/channels/shared/qr-encoding-error.mjs';
 import { createWeixinDiagnostics, weixinStageError } from '../../../../src/channels/weixin/connection-error.mjs';
 import { SET_CONTEXT_ENHANCEMENT_ENDPOINT, validContextEnhancementPayload } from '../shared/context-enhancement-rpc.mjs';
 import { SET_ACCESS_POLICY_ENDPOINT, validAccessPolicyPayload } from '../shared/access-policy-rpc.mjs';
@@ -32,6 +34,7 @@ export const WEIXIN_ENDPOINTS = Object.freeze({
   setModel: SET_MODEL_ENDPOINT,
   setAgentPreset: SET_AGENT_PRESET_ENDPOINT,
   setContextEnhancement: SET_CONTEXT_ENHANCEMENT_ENDPOINT,
+  setBusyMessageMode: SET_MESSAGE_MODE_ENDPOINT,
   setAccessPolicy: SET_ACCESS_POLICY_ENDPOINT,
   setAlias: SET_ALIAS_ENDPOINT,
 });
@@ -94,6 +97,10 @@ function payloadFailure(endpoint, payload) {
   if (endpoint === WEIXIN_ENDPOINTS.setAgentPreset) {
     return validAgentPresetPayload(payload)
       ? null : '请选择 Agent Preset。';
+  }
+  if (endpoint === WEIXIN_ENDPOINTS.setBusyMessageMode) {
+    return validMessageModePayload(payload)
+      ? null : '请提交有效的消息处理方式。';
   }
   if (endpoint === WEIXIN_ENDPOINTS.setContextEnhancement) {
     return validContextEnhancementPayload(payload)
@@ -164,8 +171,8 @@ export function createWeixinRpcHandler(controller, { encodeQr = qrDataUrl, logge
     if (!encoded) {
       if (qrCache.size >= 16) qrCache.delete(qrCache.keys().next().value);
       encoded = Promise.resolve().then(() => encodeQr(url)).catch(error => {
-        qrCache.delete(url);
-        throw weixinStageError('qr-encode-failed', error);
+        if (qrCache.get(url) === encoded) qrCache.delete(url);
+        throw weixinStageError('qr-encode-failed', qrEncodingError(error));
       });
       qrCache.set(url, encoded);
     }
@@ -234,6 +241,11 @@ export function createWeixinRpcHandler(controller, { encodeQr = qrDataUrl, logge
         value = await publicStatus(
           await controller.updateModel(payload.botId, payload.model),
           cachedEncode,
+        );
+      } else if (endpoint === WEIXIN_ENDPOINTS.setBusyMessageMode) {
+        if (typeof controller.updateBusyMessageMode !== 'function') throw new Error('Message mode update is unavailable');
+        value = await controller.updateBusyMessageMode(
+          payload.botId, payload.busyMessageMode, (status) => publicStatus(status, cachedEncode),
         );
       } else if (endpoint === WEIXIN_ENDPOINTS.setContextEnhancement) {
         if (typeof controller.updateContextEnhancement !== 'function') throw new Error('Context enhancement update is unavailable');

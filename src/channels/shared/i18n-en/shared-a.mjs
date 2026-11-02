@@ -1,5 +1,10 @@
 // English translations (shared-a area). Keys are exact Chinese literals passed to t().
 export default {
+  '请发送你的问题。': 'Please send your question.',
+  '会话目录未生效：无法创建目录（权限或磁盘空间不足）；本次仍在原工作区运行。':
+    'Conversation directory isolation did not take effect: the directory could not be created. This session will use the original workspace.',
+  '会话目录未生效：无法切换目录；本次仍在原工作区运行。':
+    'Conversation directory isolation did not take effect: the directory could not be selected. This session will use the original workspace.',
   '这个问题已在其他客户端处理，无需再次回答。':
     'This question has already been answered from another client; no further reply is needed.',
   '任务已完成。': 'Task completed.',
@@ -78,8 +83,12 @@ export default {
     'The model rejected the current content. Revise the request and try again.',
   '模型达到输出长度上限，但没有生成可显示的结果。请缩小任务范围后重试。':
     'The model reached its output limit without producing a displayable result. Reduce the task scope and try again.',
-  '任务正在等待无法在当前渠道完成的操作。请在 DeepSeek Harness 中处理后再试。':
-    'The task is waiting for an action that cannot be completed in this channel. Handle it in DeepSeek Harness, then try again.',
+  '本轮处理被阻止，未能完成。请在 DSH 中查看会话状态和相关提示。':
+    'This turn was blocked and did not finish. Check the Session status and related notices in DSH.',
+  '当前会话已归档，无法继续处理。有命令权限时可发送 /new 创建新会话；否则请联系管理员在 DSH 中取消归档，或为你开启命令权限。':
+    'The current Session is archived and cannot continue. If you have command permission, send /new to create a new Session. Otherwise, ask an administrator to unarchive it in DSH or grant you command permission.',
+  '本条消息可能仍在会话队列中，请先到 DSH 查看状态，避免重复提交。':
+    'This message may still be queued in the Session. Check its status in DSH before submitting it again.',
   '任务被意外中断，本次未完成。请重试。':
     'The task was unexpectedly interrupted and did not finish. Please try again.',
   '当前会话已不存在。请发送 /new 创建新会话后重试。':
@@ -104,6 +113,10 @@ export default {
     'This message contains an image or file that cannot be processed. Adjust it and send it again.',
   '任务未完成，暂时无法确定原因。请重试；若持续发生，请将参考号提供给管理员。':
     'The task did not finish and the cause could not be determined. Try again; if it persists, give the reference ID to an administrator.',
+  '请求超时，当前操作结果尚未确认。请先检查任务状态或聊天记录，不要立即重复提交。':
+    'The request timed out and its outcome is unconfirmed. Check the task status or chat history before submitting it again.',
+  '网络请求失败，当前操作结果尚未确认。请先检查任务状态或聊天记录，不要立即重复提交。':
+    'The network request failed and its outcome is unconfirmed. Check the task status or chat history before submitting it again.',
   '错误码：{code}；参考号：{referenceId}': 'Error code: {code}; reference: {referenceId}',
   '{label}机器人': '{label} bot',
   '目前支持文字和图片消息。': 'Only text and image messages are supported at the moment.',
@@ -203,6 +216,15 @@ export default {
   '/help  显示本帮助': '/help  Show this help',
   '{label}机器人与 DeepSeek Harness 连接正常。':
     'The {label} bot is connected to DeepSeek Harness and working normally.',
+  // /status details (shared by every text channel that uses TextHarnessBridge).
+  '绑定会话：{session}': 'Session: {session}',
+  '绑定会话：未绑定（发送消息后自动创建）':
+    'Session: not bound yet (created after you send a message)',
+  '当前模型：暂无（创建会话后显示）':
+    'Current model: not available yet (shown after a Session is created)',
+  'Agent Preset（预设）：{preset}': 'Agent Preset: {preset}',
+  '运行中任务：有（发送 /stop 可停止）':
+    'Running task: yes (send /stop to stop it)',
   '{label}机器人凭据缺失，请移除后重新接入。':
     '{label} bot credentials are missing. Remove the bot and connect it again.',
   '{label}连接未就绪，插件会自动重试。':
@@ -221,6 +243,8 @@ export default {
   '正在使用{name}…': 'Using {name}…',
   '已停止。': 'Stopped.',
   '请用文字回答当前问题。': 'Please answer the current question with text.',
+  '已不再等待原有的待回答或待审批，已将其取消，先回应你的新请求。':
+    'The pending question or approval is no longer waited on and has been cancelled; your new request is being answered first.',
   '{label}交互问题发送失败。': 'Failed to send the {label} interaction question.',
   '回答提交失败。': 'Failed to submit the answer.',
   '回答提交失败，请重新发送当前问题的答案。':

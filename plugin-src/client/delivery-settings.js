@@ -1,10 +1,15 @@
 import * as React from 'react';
 
 import { AccessPolicySettingsPage } from './access-policy-settings.js';
+import { BotGeneralSettingsPage } from './bot-general-settings.js';
+import { BotSettingsTabs } from './bot-settings-tabs.js';
+import { DsBotSettingsPage } from './ds-bot-settings.js';
 import { FeishuGroupSettingsPage } from './channels/feishu/group-settings.js';
 import { FeishuVoiceSettingsPage } from './channels/feishu/voice-settings.js';
 import { FeishuSlashPanelSettingsPage } from './channels/feishu/slash-panel-settings.js';
-import { h, isEnglish, localizeText } from './i18n.js';
+import { FeishuConversationDirectorySettingsPage } from './channels/feishu/conversation-directory-settings.js';
+import { TelegramGroupTriggersSettings } from './channels/telegram/group-triggers-settings.js';
+import { h, imLocale, localizeTemplate, localizeText } from './i18n.js';
 
 export const DELIVERY_RPC_CHANNEL = '/dsh-im-delivery';
 
@@ -24,19 +29,29 @@ export const DELIVERY_ENDPOINTS = Object.freeze({
 });
 
 export const BOT_SETTINGS_TABS = Object.freeze([
+  Object.freeze({ id: 'general', label: '通用' }),
   Object.freeze({ id: 'delivery', label: '投递设置' }),
+  Object.freeze({ id: 'ds-bot', label: '绑定 DS Bot' }),
   Object.freeze({ id: 'access', label: '访问设置' }),
 ]);
 
 export const FEISHU_BOT_SETTINGS_TABS = Object.freeze([
   ...BOT_SETTINGS_TABS,
+  Object.freeze({ id: 'conversation-directory', label: '会话目录' }),
   Object.freeze({ id: 'group', label: '群聊' }),
   Object.freeze({ id: 'slash', label: '指令面板' }),
   Object.freeze({ id: 'voice', label: '语音交互' }),
 ]);
 
+export const TELEGRAM_BOT_SETTINGS_TABS = Object.freeze([
+  ...BOT_SETTINGS_TABS,
+  Object.freeze({ id: 'groups', label: '机器人群聊行为' }),
+]);
+
 export function botSettingsTabsForChannel(channel) {
-  return channel === 'feishu' ? FEISHU_BOT_SETTINGS_TABS : BOT_SETTINGS_TABS;
+  if (channel === 'feishu') return FEISHU_BOT_SETTINGS_TABS;
+  if (channel === 'telegram') return TELEGRAM_BOT_SETTINGS_TABS;
+  return BOT_SETTINGS_TABS;
 }
 
 const CHANNEL_DEFINITIONS = Object.freeze({
@@ -123,6 +138,15 @@ const CHANNEL_DEFINITIONS = Object.freeze({
     label: 'iMessage',
     kinds: [{ value: 'user', label: '私聊' }],
     fields: { user: [{ key: 'chatGuid', label: 'Chat GUID', placeholder: 'iMessage;+;chat123' }] },
+  },
+  // 邮箱渠道在 Host 侧（delivery-adapter 的 case 'email'）早于投递设置页面支持，
+  // route 只有 address 一个字段，kind 固定为 user，这里补齐表单定义让投递目标可选。
+  email: {
+    label: '邮箱',
+    kinds: [{ value: 'user', label: '收件人' }],
+    fields: {
+      user: [{ key: 'address', label: '邮箱地址', placeholder: 'name@example.com', inputMode: 'email' }],
+    },
   },
 });
 
@@ -766,39 +790,38 @@ export function DeliveryTargetSettingsPage({
 
   return h('section', {
     className: 'dim-deliveryPage',
-    'aria-label': `${account.botName || definition.label}机器人设置`,
+    'aria-label': localizeTemplate('{name}机器人设置', { name: account.botName || definition.label }),
   },
   h('header', { className: 'dim-deliveryHeader' },
     h(DeliveryButton, { className: 'dim-deliveryBack', onClick: onBack }, '← 返回机器人列表')),
-  h('div', { className: 'dim-botSettingsTabsBar' },
-    h('nav', {
-      className: 'dim-botSettingsTabs',
-      role: 'tablist',
-      'aria-label': '机器人设置页签',
-    }, settingsTabs.map((tab) => h('button', {
-      key: tab.id,
-      id: `dim-bot-settings-${tab.id}-tab`,
-      type: 'button',
-      role: 'tab',
-      className: 'dim-botSettingsTab',
-      'aria-selected': tab.id === activeTab.id,
-      'aria-controls': `dim-bot-settings-${tab.id}-panel`,
-      tabIndex: tab.id === activeTab.id ? 0 : -1,
-      onClick: () => setActiveTabId(tab.id),
-    }, tab.label)))),
+  h(BotSettingsTabs, { tabs: settingsTabs, activeTabId: activeTab.id, onChange: setActiveTabId }),
   h('div', {
     id: activePanelId,
     className: 'dim-botSettingsTabPanel',
     role: 'tabpanel',
     'aria-labelledby': activeTabDomId,
   },
-  activeTab.id === 'access'
+  activeTab.id === 'general'
+    ? h(BotGeneralSettingsPage, { key: `${channel}:${account.botId}`, channel, account, rpcCall: accessRpcCall })
+    : activeTab.id === 'ds-bot'
+    ? h(DsBotSettingsPage, {
+        key: account.botId, botId: account.botId, rpcCall: invoke,
+      })
+    : activeTab.id === 'access'
     ? h(AccessPolicySettingsPage, {
         channel,
         account: { ...account, accessPolicy },
         rpcCall: accessRpcCall,
         onSaved: setAccessPolicy,
       })
+    : activeTab.id === 'conversation-directory' && channel === 'feishu'
+      ? h(FeishuConversationDirectorySettingsPage, { account, rpcCall: accessRpcCall })
+    : activeTab.id === 'groups' && channel === 'telegram'
+      ? h(TelegramGroupTriggersSettings, {
+          key: `${channel}:${account.botId}:groups`,
+          account,
+          rpcCall: accessRpcCall,
+        })
     : activeTab.id === 'group' && channel === 'feishu'
       ? h(FeishuGroupSettingsPage, {
           account,
@@ -823,7 +846,7 @@ export function DeliveryTargetSettingsPage({
         account.botName || '机器人设置'),
       h('a', {
         className: 'dim-deliveryDocsLink',
-        href: isEnglish() ? DELIVERY_DOCS_URL.en : DELIVERY_DOCS_URL.zh,
+        href: imLocale() === 'zh' ? DELIVERY_DOCS_URL.zh : DELIVERY_DOCS_URL.en,
         target: '_blank',
         rel: 'noopener noreferrer',
         'aria-label': '打开主动投递使用文档',

@@ -263,8 +263,19 @@ test('DeliveryService exposes and revalidates local Session sync without changin
   );
   assert.deepEqual(syncCalls, [
     ['set', 'bot_one', 'direct', true],
-    ['send', 'bot_one', 'direct', 'session-one', 'hello', { signal: undefined }],
+    ['send', 'bot_one', 'direct', 'session-one', 'hello', { signal: undefined, format: 'plain' }],
   ]);
+  const signal = new AbortController().signal;
+  await service.sendSessionSyncText('bot_one', 'direct', 'session-one', '**answer**', { signal, format: 'markdown' });
+  assert.deepEqual(syncCalls.at(-1), ['send', 'bot_one', 'direct', 'session-one', '**answer**', { signal, format: 'markdown' }]);
+  const sent = syncCalls.length;
+  for (const format of ['html', '', null, false]) {
+    await assert.rejects(service.sendSessionSyncText('bot_one', 'direct', 'session-one', 'answer', { format }), { code: 'bad-request' });
+  }
+  await assert.rejects(service.sendSessionSyncText('bot_one', 'direct', 'session-one', 'answer', {
+    format: 'markdown', signal: AbortSignal.abort(),
+  }), { code: 'cancelled' });
+  assert.equal(syncCalls.length, sent);
 });
 
 test('DeliveryService marks explicit remote Harness channels unavailable for Session sync', async () => {
@@ -294,4 +305,255 @@ test('DeliveryService marks explicit remote Harness channels unavailable for Ses
     enabled: false, state: 'off',
   });
   assert.deepEqual(calls, [['bot_one', 'direct', false]]);
+});
+
+function checkedFixture() {
+  const service = createDeliveryService();
+  const adapter = memoryAdapter({channel: 'feishu'});
+  const fingerprint = 'a'.repeat(64);
+  adapter.describeAccount = async () => ({version: 1, botId: 'bot_one', channel: 'feishu',
+    connected: true, capabilities: ['proactive-text-checked'], account: {fingerprint}});
+  return {service, adapter, fingerprint};
+}
+
+async function checkedTarget(fx) {
+  const target = {targetId: 'self', kind: 'user', route: {openId: 'ou_self'}};
+  await fx.service.createTarget('bot_one', target);
+  const {createHash} = await import('node:crypto');
+  return createHash('sha256').update(JSON.stringify({kind: target.kind, route: target.route})).digest('hex');
+}
+
+test('checked sending rejects changed targets and account identities before a side effect', async () => {
+  const fx = checkedFixture(); fx.service.registerAdapter(fx.adapter);
+  const digest = await checkedTarget(fx);
+  await assert.rejects(fx.service.sendChecked('bot_one', 'self', 'hello', {
+    expectedFingerprint: 'b'.repeat(64), expectedTargetDigest: digest,
+  }), {code: 'account-changed'});
+  await fx.service.updateTarget('bot_one', 'self', {kind: 'user', route: {openId: 'ou_other'}});
+  await assert.rejects(fx.service.sendChecked('bot_one', 'self', 'hello', {
+    expectedFingerprint: fx.fingerprint, expectedTargetDigest: digest,
+  }), {code: 'target-changed'});
+  assert.equal(fx.adapter.sends.length, 0);
+});
+
+test('checked sending freezes the authorized route across an alias edit during account verification', async () => {
+  const fx = checkedFixture(); fx.service.registerAdapter(fx.adapter);
+  const digest = await checkedTarget(fx);
+  const describe = fx.adapter.describeAccount;
+  fx.adapter.describeAccount = async () => {
+    await fx.adapter.updateTarget('bot_one', 'self', {kind: 'user', route: {openId: 'ou_other'}});
+    return describe();
+  };
+  assert.deepEqual(await fx.service.sendChecked('bot_one', 'self', 'hello', {
+    expectedFingerprint: fx.fingerprint, expectedTargetDigest: digest,
+  }), {sent: true});
+  assert.deepEqual(fx.adapter.sends[0][1].route, {openId: 'ou_self'});
+  assert.equal(fx.adapter.sends[0][3].expectedFingerprint, fx.fingerprint);
+});
+
+test('checked sending fails closed when its Registration is disposed during preflight', async () => {
+  const fx = checkedFixture(); const dispose = fx.service.registerAdapter(fx.adapter);
+  const digest = await checkedTarget(fx);
+  const describe = fx.adapter.describeAccount;
+  fx.adapter.describeAccount = async () => {dispose(); return describe();};
+  await assert.rejects(fx.service.sendChecked('bot_one', 'self', 'hello', {
+    expectedFingerprint: fx.fingerprint, expectedTargetDigest: digest,
+  }), {code: 'capability-unavailable'});
+  assert.equal(fx.adapter.sends.length, 0);
+});
+
+test('legacy providers cannot advertise checked sending implicitly', async () => {
+  const fx = checkedFixture(); delete fx.adapter.describeAccount; fx.service.registerAdapter(fx.adapter);
+  await assert.rejects(fx.service.describeBot('bot_one'), {code: 'capability-unavailable'});
+});
+
+
+test('checked account discovery fences replacement even when the same adapter object is registered again', async () => {
+  const service = createDeliveryService();
+  const adapter = memoryAdapter();
+  let calls = 0;
+  adapter.describeAccount = async () => {
+    ++calls;
+    service.registerAdapter(adapter);
+    return {version: 1, botId: 'bot_one', channel: 'telegram', account: {fingerprint: 'a'.repeat(64)}, connected: true, capabilities: ['proactive-text-checked']};
+  };
+  service.registerAdapter(adapter);
+  await assert.rejects(service.describeBot('bot_one'), {code: 'capability-unavailable'});
+  assert.equal(calls, 1);
+  assert.equal(adapter.sends.length, 0);
+});
+
+test('checked receipt requires capability and exact frozen group correspondence, never resends', async () => {
+  const fx = checkedFixture(); fx.service.registerAdapter(fx.adapter);
+  const target = { targetId: 'group', kind: 'group', route: { chatId: 'oc_group' } };
+  await fx.service.createTarget('bot_one', target);
+  const { createHash } = await import('node:crypto');
+  const expectedTargetDigest = createHash('sha256').update(JSON.stringify({ kind: target.kind, route: target.route })).digest('hex');
+  const options = { expectedFingerprint: fx.fingerprint, expectedTargetDigest, receipt: true };
+  await assert.rejects(fx.service.sendChecked('bot_one', 'group', 'report', options), { code: 'capability-unavailable' });
+  assert.equal(fx.adapter.sends.length, 0);
+  fx.adapter.describeAccount = async () => ({ version: 1, capabilities: ['proactive-text-checked', 'proactive-receipt-checked'], account: { fingerprint: fx.fingerprint } });
+  let calls = 0;
+  fx.adapter.sendText = async (_id, saved, _text, opts) => {
+    calls++; assert.equal(saved.route.chatId, 'oc_group'); assert.equal(opts.receipt, true);
+    return { sent: true, receipt: { version: 1, messageId: 'om_report', conversationId: 'oc_group', secret: 'not exposed' } };
+  };
+  assert.deepEqual(await fx.service.sendChecked('bot_one', 'group', 'report', options), { sent: true, receipt: { version: 1, messageId: 'om_report', conversationId: 'oc_group' } });
+  fx.adapter.sendText = async () => { calls++; return { sent: true, receipt: { version: 1, messageId: 'om_other', conversationId: 'oc_other' } }; };
+  await assert.rejects(fx.service.sendChecked('bot_one', 'group', 'report', options), { code: 'send-result-unknown' });
+  assert.equal(calls, 2);
+});
+
+test('consumer replacement aborts the old account lease and stale dispose cannot remove its successor', async () => {
+  const fx = checkedFixture();
+  let lease;
+  fx.adapter.consumeInbound = async (_id, options) => {
+    lease = options;
+    return () => {};
+  };
+  const oldDispose = fx.service.registerAdapter(fx.adapter);
+  await fx.service.consumeInbound('bot_one', { expectedFingerprint: fx.fingerprint, onEvent: async () => ({ accepted: true }) });
+  fx.service.registerAdapter(fx.adapter);
+  assert.equal(lease.signal.aborted, true);
+  assert.equal(oldDispose(), false);
+  await assert.rejects(lease.onEvent({}, {}), { code: 'capability-unavailable' });
+  assert.equal((await fx.service.describeBot('bot_one')).account.fingerprint, fx.fingerprint);
+});
+
+test('a reply waiting for provider preflight cannot send after its Registration disappears', async () => {
+  const fx = checkedFixture();
+  let entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  let resume;
+  const ready = new Promise(resolve => { resume = resolve; });
+  let sends = 0;
+  fx.adapter.replyChecked = async (_id, _route, _text, options) => {
+    entered(); await ready;
+    options.signal.throwIfAborted();
+    sends++;
+    return { sent: true };
+  };
+  const dispose = fx.service.registerAdapter(fx.adapter);
+  const result = fx.service.replyChecked('bot_one', { messageId: 'message' }, 'hello', { expectedFingerprint: fx.fingerprint });
+  await started;
+  dispose(); resume();
+  await assert.rejects(result, { code: 'provider-unavailable' });
+  assert.equal(sends, 0);
+});
+
+test('optional checked history refuses legacy adapters and preserves public read refusals', async () => {
+ const fx=checkedFixture();fx.service.registerAdapter(fx.adapter);
+ await assert.rejects(fx.service.historyChecked('bot_one',{}, {}, {expectedFingerprint:fx.fingerprint}),{code:'capability-unavailable'});
+ for(const code of ['history-permission-denied','stale-route','thread-unavailable','untrusted-source']) {
+  fx.adapter.historyChecked=async()=>{throw Object.assign(new Error('refused'),{code});};
+  await assert.rejects(fx.service.historyChecked('bot_one',{}, {}, {expectedFingerprint:fx.fingerprint}),{code});
+ }
+});
+
+test('checked history discards an in-flight result after provider replacement or caller cancellation', async () => {
+ for(const cancel of [false,true]) {
+  const fx=checkedFixture();fx.service.registerAdapter(fx.adapter);let entered,release;
+  const started=new Promise(resolve=>{entered=resolve;});const gate=new Promise(resolve=>{release=resolve;});
+  fx.adapter.historyChecked=async()=>{entered();await gate;return {events:['must not escape']};};
+  const abort=new AbortController();
+  const pending=fx.service.historyChecked('bot_one',{}, {}, {expectedFingerprint:fx.fingerprint,signal:abort.signal});
+  await started;
+  if(cancel)abort.abort();else fx.service.registerAdapter(fx.adapter);
+  release();await assert.rejects(pending,{code:cancel?'cancelled':'capability-unavailable'});
+ }
+});
+
+function approvalAdapter(channel, keys, { present = async () => true } = {}) {
+  const botId = `bot_${channel.replaceAll('-', '_')}`;
+  const adapter = memoryAdapter({ channel, botId });
+  const offers = [];
+  const notices = [];
+  Object.assign(adapter, {
+    setSessionSync() {},
+    listSessionSyncTargets: () => keys.map((_, index) => ({ botId, targetId: `target${index}` })),
+    describeSessionSyncApprovalTarget: (_bot, targetId) => ({ conversationKey: keys[Number(targetId.slice(6))] }),
+    sendSessionSyncText: async (...args) => notices.push(args),
+    presentSessionSyncApproval: async (...args) => { offers.push(args); return present(...args); },
+  });
+  return { adapter, offers, notices };
+}
+
+for (const scenario of ['aliases', 'multiple-chats', 'unresolved', 'unsupported', 'failed']) {
+  test(`synced questions: ${scenario} routes to one private chat or sends a desktop notice`, async () => {
+    const service = createDeliveryService();
+    const keys = scenario === 'multiple-chats' ? ['p2p:a', 'p2p:b'] : ['p2p:a', 'p2p:a'];
+    const { adapter, notices } = approvalAdapter('feishu', keys);
+    const offered = [];
+    adapter.describeSessionSyncQuestionTarget = (_bot, id) => {
+      if (scenario === 'unresolved' && id === 'target1') throw new Error('binding unavailable');
+      return { conversationKey: keys[Number(id.slice(6))] };
+    };
+    if (scenario !== 'unsupported') adapter.presentSessionSyncQuestion = async (...args) => {
+      offered.push(args);
+      return scenario !== 'failed';
+    };
+    service.registerAdapter(adapter);
+    assert.equal(await service.presentSessionSyncQuestion('session', { kind: 'question' }), scenario === 'aliases');
+    assert.equal(offered.length, ['aliases', 'failed'].includes(scenario) ? 1 : 0);
+    if (scenario === 'aliases') assert.equal(notices.length, 0);
+    else {
+      assert.equal(notices.length, 2);
+      assert.match(notices[0][3], /桌面端回答/);
+    }
+  });
+}
+
+for (const channel of ['feishu', 'weixin', 'dingtalk', 'wecom', 'wecom-app', 'qq', 'telegram', 'slack', 'discord', 'whatsapp', 'matrix']) {
+  test(`${channel}: one real bound private chat gets one approval despite target aliases`, async () => {
+    const service = createDeliveryService();
+    const { adapter, offers, notices } = approvalAdapter(channel, ['private:actor', 'private:actor']);
+    service.registerAdapter(adapter);
+    const interaction = { payload: { toolName: 'bash' } };
+    assert.equal(await service.presentSessionSyncApproval('session', interaction, {
+      completion: new Promise(() => {}),
+    }), true);
+    assert.equal(offers.length, 1);
+    assert.equal(offers[0][3], interaction);
+    assert.equal(notices.length, 0);
+  });
+}
+
+test('multiple bound chats receive a Web notice and cannot compete for approval', async () => {
+  const service = createDeliveryService();
+  const first = approvalAdapter('feishu', ['p2p:a']);
+  const second = approvalAdapter('telegram', ['direct:2']);
+  service.registerAdapter(first.adapter);
+  service.registerAdapter(second.adapter);
+  let finish;
+  const completion = new Promise((resolve) => { finish = resolve; });
+  assert.equal(await service.presentSessionSyncApproval('session', { payload: { toolName: 'bash' } }, { completion }), false);
+  assert.equal(first.offers.length + second.offers.length, 0);
+  assert.match(first.notices[0][3], /Web/);
+  finish('unavailable');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(first.notices.at(-1)[3], /未获批准/);
+});
+
+for (const channel of ['imessage', 'email', 'office']) {
+  test(`${channel}: excluded channels never receive competitive approvals`, async () => {
+    const service = createDeliveryService();
+    const { adapter, offers, notices } = approvalAdapter(channel, ['private:actor']);
+    service.registerAdapter(adapter);
+    assert.equal(await service.presentSessionSyncApproval('session', { payload: { toolName: 'bash' } }), false);
+    assert.equal(offers.length + notices.length, 0);
+  });
+}
+
+
+test('an unresolved second binding cannot make the first chat look unique', async () => {
+  const service = createDeliveryService();
+  const first = approvalAdapter('feishu', ['p2p:a']);
+  const second = approvalAdapter('telegram', ['direct:2']);
+  second.adapter.describeSessionSyncApprovalTarget = () => { throw new Error('state unavailable'); };
+  service.registerAdapter(first.adapter);
+  service.registerAdapter(second.adapter);
+  assert.equal(await service.presentSessionSyncApproval('session', { payload: { toolName: 'bash' } }, {
+    completion: new Promise(() => {}),
+  }), false);
+  assert.equal(first.offers.length + second.offers.length, 0);
 });

@@ -1,3 +1,4 @@
+import { BusyMessageDispatcher, canAutomaticallySteer } from '../shared/busy-message-dispatcher.mjs';
 import { createDeferredDeliveryCoordinator, deferredOutcomeText } from '../shared/deferred-delivery-coordinator.mjs';
 import {
   DEFAULT_WEIXIN_MAX_MESSAGE_CHARS,
@@ -21,6 +22,7 @@ import {
   isBatchInputCommand,
 } from '../shared/batch-input.mjs';
 import { runCompactCommand } from '../shared/compact-command.mjs';
+import { isClearCommand, runClearCommand } from '../shared/clear-command.mjs';
 import { isHistoryCommand, runHistoryCommand } from '../shared/history-command.mjs';
 import {
   isControlCommand,
@@ -91,6 +93,7 @@ const HELP_TEXT = () => [
   t('直接发送文字、图片、文件或带文字识别结果的语音即可继续当前会话。'),
   t('/new  开启一个全新会话'),
   t('/compact  压缩当前会话的较早上下文'),
+  t('/clear  清空当前会话上下文（保留 Session 绑定和历史记录）'),
   t('/history [数量]  查看最近历史消息（默认 3 条，最多 5 条）'),
   t('/workspace 工作区序号或绝对路径  切换工作区'),
   t('/workspacelist  列出工作区绝对路径'),
@@ -314,6 +317,7 @@ export class WeixinHarnessBridge {
   #typingKeepaliveMs;
   #signal;
   #queues = new Map();
+  #busyMessages = new BusyMessageDispatcher();
   #pendingInteractions = new Map();
   #interactionKeys = new Map();
   // Keep the accepted configuration through the existing queue/reply lifecycle.
@@ -460,7 +464,8 @@ export class WeixinHarnessBridge {
         );
       }
     }
-    const commandRunner = isHistoryCommand(commandText) ? runHistoryCommand
+    const commandRunner = isClearCommand(commandText) ? runClearCommand
+      : isHistoryCommand(commandText) ? runHistoryCommand
       : hasWeixinFileItems(message) ? null : isControlCommand(commandText)
       ? runControlCommand
       : (isModelCommand(commandText)
@@ -545,7 +550,20 @@ export class WeixinHarnessBridge {
       pending.queue = current;
       return current;
     }
-    return this.#enqueueMessage(message, messageId, key);
+    return this.#busyMessages.dispatch({
+      key, messageId, text: commandText,
+      eligible: () => isNativeWeixinText(message) && !extractWeixinReplyReference(message)
+        && canAutomaticallySteer(this.#accessPolicy, 'direct', sender),
+      harness: this.#harness, state: this.#state, status: this.#status,
+      signal: this.#signal, control: { owner: this, key }, logger: this.#logger,
+      acceptedMessageIds: this.#acceptedMessageIds,
+      pendingInteraction: () => this.#pendingInteractions.has(key) || this.#approvals.hasPending(key),
+      enhancement: this.#acceptedMessageIds.get(messageId),
+      isQueued: () => this.#queues.has(key),
+      enqueue: (options) => this.#enqueueMessage(message, messageId, key, options),
+      send: (reply) => this.#sendOutOfBand(key, sender, reply, contextToken, runId),
+      onError: (error) => this.#handleInteractionFailure(message, messageId, error),
+    });
   }
 
   #enqueueMessage(message, messageId, key, {
@@ -687,6 +705,7 @@ export class WeixinHarnessBridge {
   }
 
   async waitForIdle() {
+    await this.#busyMessages.whenIdle();
     await Promise.allSettled([
       ...this.#queues.values(),
       ...[...this.#pendingInteractions.values()].flatMap((pending) => (
@@ -727,6 +746,7 @@ export class WeixinHarnessBridge {
       hasFiles: hasWeixinFileItems(message),
       pendingInteraction: this.#pendingInteractions.has(key)
         || this.#approvals.hasPending(key),
+      busy: this.#queues.has(key) || this.#batchInputs.status(key).phase !== 'idle',
       control: { owner: this, key },
       deferredDelivery: this.#deferred,
       enhancement: captureContextEnhancementSource(
@@ -852,6 +872,7 @@ export class WeixinHarnessBridge {
         await this.#state.markSeen(messageId);
         promptRecorded = true;
         ({ answer, artifacts = [] } = await askInWorkspaceSession({
+          onNotice: (notice) => this.#send(sender, notice, contextToken, runId, { stopTyping: false }),
           deferredDelivery: () => ({ coordinator: this.#deferred, target: { toUserId: sender } }),
           harness: this.#harness,
           state: this.#state,
@@ -1106,6 +1127,12 @@ export class WeixinHarnessBridge {
         pending.runId,
       ).catch(() => undefined);
     }
+  }
+
+  async presentSessionSyncApproval(interaction, context, options = {}) {
+    return this.#approvals.handleSessionSyncRequested(interaction, context, {
+      ...options, runtimeSignal: this.#signal, accessPolicy: this.#accessPolicy,
+    });
   }
 
   async #handleInteraction(interaction, {

@@ -85,6 +85,7 @@
 1. DSH Web／CLI 向该私聊当前绑定的 Session 提交的用户文字，会以 `[来自 DSH]` 开头发送到私聊。
 2. 该 Turn 成功完成后，按 step 合并的最终助手文字会以 `[DSH 助手]` 开头再发送一次。
 3. IM 用户自己的普通提问和 `/steer` 仍走原回复链，不会被同步逻辑重复发送或转发给其他目标。
+4. 定时任务（`schedule`、`deliveryMode: host`）在绑定 Session 中成功完成后，也会同步最终助手文字；内部提醒提示不会以 `[来自 DSH]` 消息回显到私聊。
 
 开关只保存私聊目标，不保存 `sessionId`，因此会自动跟随 `/session` 切换。执行 `/new` 或切换工作区后，状态暂时显示「等待该私聊建立新会话」；该私聊下一次建立 Session 后自动恢复，无需重新开关。
 
@@ -174,9 +175,24 @@ await ctx.dshIm.send(botId, targetId, '# 每日报告\n\n**检查完成**', {
 });
 ```
 
-`format` 只接受 `plain` 和 `markdown`，省略时为 `plain`。当前 Markdown 格式适配用于飞书/Lark：私聊和群聊均通过原生 Markdown 卡片发送，不启动会话或流式输出；其他渠道保留原有发送行为，不保证 Markdown 渲染。HTTP 和 `message.send` RPC 可在请求体中添加同名 `format` 字段。
+`format` 只接受 `plain` 和 `markdown`，省略时为 `plain`。HTTP 和 `message.send` RPC 可添加同名字段。Markdown 复用各渠道的发送路径，不启动 Session 或新的流式输出：
 
-Markdown 原文（含换行）完整传递，不进行静默截断或自动分段；消息仍受平台大小和 Markdown 语法限制。平台拒绝、超时或取消时沿用已有错误处理，不自动回退成纯文本重发，以免重复投递。旧版本 dsh-im 的 Host API 可能忽略这个新选项；调用方与 dsh-im 都需要加载支持该选项的代码。
+| 渠道 | Markdown 呈现方式 |
+| --- | --- |
+| 飞书/Lark | 原生 Markdown 卡片 |
+| Telegram | Rich Markdown，复用既有文本回退 |
+| QQ | Markdown 消息；已知格式拒绝时仅当前分段回退文本 |
+| 钉钉 | 主动 Markdown 消息；明确格式拒绝时回退文本 |
+| Slack | 标准 Markdown block，保留通知文本；明确 block 拒绝时使用原有文本发送 |
+| 企业微信机器人 | 现有 Markdown 消息类型 |
+| Matrix | 清理后的 HTML，并附带文本正文 |
+| Discord | 消息正文的原生 Markdown |
+| WhatsApp | 有限转换常用格式，保护代码，复杂语法保留原文 |
+| 企业微信应用／微信 | 完整文本，保留代码和链接目标 |
+
+长消息按渠道限制分段。飞书主动卡片保留原有不自动分段的行为，平台拒绝或结果未知时不自动改发文本。其他新增回退仅针对本地格式处理错误或明确的格式拒绝，不重发已成功的分段，不因网络结果未知而改格式重试。旧 Host 可能忽略 `format`，需要加载更新后的插件。
+
+会话同步的最终助手回答请求 Markdown，用户回显继续使用原有默认文字行为。飞书继续使用专用镜像卡片，无法确认最终答案可见时仍走现有纯文本兜底。同步目标范围不变。
 
 同 Host 插件也可以列出某个机器人的已保存目标：
 
@@ -184,6 +200,21 @@ Markdown 原文（含换行）完整传递，不进行静默截断或自动分�
 const targets = await ctx.dshIm.listTargets(botId);
 // [{ targetId, name?, kind, route }, ...]
 ```
+
+同 Host 插件也可以把已知的会话路由注册成投递目标。注册后该 `targetId` 可直接用于 `send`，并出现在设置页的目标列表里。下面以飞书私聊为例，`botId` 必须属于飞书机器人：
+
+```js
+await ctx.dshIm.createTarget(botId, {
+  targetId: 'release-alerts',
+  kind: 'user',
+  route: { openId: 'ou_xxx' },
+  name: '发布提醒',              // 可选
+});
+```
+
+`kind` 和 `route` 必须匹配机器人的渠道，参见[九渠道手动填写字段](#九渠道手动填写字段)。例如飞书群聊使用 `kind: 'group'` 和 `route: { chatId: 'oc_xxx' }`；Telegram 私聊或群聊使用 `kind: 'chat'` 和 `route: { chatId: '123456789' }`，Chat ID 必须是十进制字符串。
+
+`targetId` 已存在时以 `target-conflict` 拒绝；修改或删除已有目标仍走管理 RPC 的 `target.update` / `target.delete`。
 
 同 Host 插件可以通过同一个服务发现已配置机器人：
 
@@ -307,6 +338,7 @@ HTTP 协议层还可能返回 `method-not-allowed`（405）、`unsupported-media
 - 机器人离线时仍可编辑目标，但不能测试或主动发送。
 - 微信主动投递、连接测试和延迟任务结果会使用该机器人最近收到的对应用户 `context_token`。上下文仅保存在 Host 的账号状态中，重启后恢复，不放进投递目标或返回给调用方；重新绑定并更换登录凭据后清理。升级后需要收到一次用户消息才能建立缓存。
 - 微信是否接受发送仍受 iLink 服务端规则约束。长轮询在线不保证主动发送可用；若持续出现 `ret=-2 prepare failed`，不要通过反复发送心跳尝试续期。可让目标用户发一条消息后重试；这不是登录凭据失效的确定证据，也不能仅凭此错误确定上下文过期或额度耗尽。
+- 微信主动长文本沿用 1,800 字符分段预算，同步助手的 Markdown 代码块在各段补齐围栏。每一段都占用平台发送次数；分段不会解除平台额度限制。中途拒发或结果不确定时停止并报告失败，不重发已经接受的段；诊断会标明失败段序号和总段数。
 
 - 微信主动发送失败会保留在账号的最近消息错误中，包含平台错误码和是否携带上下文等脱敏诊断；健康轮询不会清除此错误，后续成功投递会清除。HTTP/RPC 仍返回既有的 `delivery-failed`，不会自动重试或断开正常的长轮询连接。
 
@@ -353,3 +385,35 @@ Connection RPC 默认只允许当前 Host 的回环调用。若 Web profile 明�
 ### 测试成功但对方没有看到消息
 
 测试成功只证明平台接口接受发送。请继续检查机器人权限、平台限制、目标是否正确，以及客户端侧的消息过滤或归档设置。
+
+## Companion Plugin 的条件主动发送
+
+same-Host `dshIm` Service 新增 `contractVersion:1`、`describeBot(botId)` 和 `sendChecked(botId,targetId,text,options)`。首版认证账号实现只支持飞书/Lark；其他渠道在实现此契约前明确返回 `capability-unavailable`。现有 `send`、HTTP 与管理 RPC 不变。
+
+`describeBot` 返回 `{version:1,botId,channel,account:{fingerprint,name?},connected,capabilities}`；`proactive-text-checked` capability 不是用户授权。飞书/Lark 通过 credentials service 解析凭据，并向平台验证当前 Bot Open ID。fingerprint 为按固定字段顺序 `JSON.stringify({provider:'feishu',domain,appId,botOpenId})` 的 UTF-8 小写 SHA-256，不返回凭据或 token；平台身份与已配置的 verified bot 不同则拒绝。Host 启动时账号异步初始化，需要后续刷新 discovery。
+
+options 必须包含 `expectedFingerprint`、`expectedTargetDigest`，可选 `signal`、`format`。目标 digest 为 `JSON.stringify({kind,route})` 的 UTF-8 小写 SHA-256，route keys 按 JavaScript 字符串 code-unit 升序排列；名称和 alias 不参与。发送检查当前 saved target，冻结规范化 route，再在账号 transition 内重新验证认证身份后使用此 route；验证期间编辑 alias 不会改投。lookup 前删除或改址会拒绝；请求已经开始后，修改不能撤销外部效果。
+
+`account-unverified`、`account-changed`、`target-changed`、`capability-unavailable` 是发送前拒绝；凭据读取与平台认证失败也返回 `account-unverified`。`{sent:true}` 仍只代表平台接受，不代表送达/已读。SDK 开始后的取消、超时和含糊失败不能证明没有发送；调用者持有 durable authorization／intent／attempt 与 reconciliation，不得盲重试。Provider Registration 撤销或控制器关闭会拒绝尚未开始 SDK 请求的条件投递，包括在最后一次账号核验期间发生的撤销；不能撤回已开始的 SDK 请求。
+
+## 飞书/Lark 独占文本收件（同 Host）
+
+拥有独立持久消息存储的应用，可通过 `ctx.dshIm`（`inboundVersion: 1`）独占接收文本消息，并使用 `replyChecked` 沿校验过的原消息/话题回复。此能力仅适用于明确选择外部消费模式的飞书/Lark 账号；其他平台及未启用此模式的账号沿用现有行为。
+
+调用 `describeBot(botId)` 校验身份和 `exclusive-text-consumer`、`reply-text-checked` 能力，然后调用 `consumeInbound(botId, {expectedFingerprint, signal, onEvent})`。`onEvent(event, {signal})` 应先进行群授权、去重和应用持久提交，再返回 `{accepted: true}`。返回的释放函数应随应用 Registration/Fiber 释放。回调仅用于同 Host Service，不暴露至浏览器 RPC 或 HTTP。完整示例见[英文契约](PROACTIVE_DELIVERY.en.md#exclusive-feishulark-text-intake-same-host)。
+
+事件 v1 携带平台、账号和可信 fingerprint、eventId/messageId、发送人原始 ID、群/私聊 ID、mentions、mentionedAccount、ISO 时间、原始文本和原消息回复路由（messageId/conversationId/actorId/threadId/rootId/parentId）。平台提供的可选姓名仅用于展示；此切片不提供头像或附件，有界历史读取见下文。应用自行决定收件范围和唤醒策略。
+
+每个账号只能有一个 Consumer；冲突返回 `consumer-conflict`。`consumerMode: external-consumer` 持久保存后，不创建独立 Session，不执行原生卡片或 slash command。释放 Consumer、Registration 替换、Host 重启均不自动回退独立处理；需重新注册 Consumer，或者明确修改账号模式并重连。应用持久提交需响应取消；已完成的提交不能被释放操作撤销。
+
+`replyChecked` 在发送前读取原消息，核对发送人、群以及 thread/root/parent 路由；同话题回复不回退群主线。来源消失或变化返回 `stale-route`。发送请求已尝试后的 SDK 失败返回 `reply-result-unknown`，应先核对外部会话再决定是否重试。平台重投递可能有缺口、无恢复游标；本契约不保证传输恰好一次，不提供消息已读回执或跨账号回复。去重和持久发送意图归应用管理。
+
+## 有界飞书／Lark 上下文读取（同一 Host）
+
+活跃的独占接收方可调用可选的 `dshIm.historyChecked(botId, source.reply, query, {expectedFingerprint, signal})`。先检查 `history-text-checked`；读取话题另需 `thread-history-text-checked`。query 为 `{scope: 'group' | 'nearby' | 'thread', limit: 1..20, cursor?: string}`。不提供浏览器／HTTP 历史端点；必须使用已验证的 Bot 身份及当前接收权，standalone 账号无法通过此契约读取。
+
+每次读取先重新获取来源，核对发送人、群、thread、root、parent ID。`group` 列出来源群；`nearby` 用消息前后各五分钟的群时间窗口，不声称是原生“附近消息”接口；`thread` 按原生话题读取。返回 `{version:1, scope, events, omitted, hasMore, nextCursor?, window?, coverage:'provider-visible-human-text'}`。每次最多检查 limit 条平台记录；不支持的消息、撤回、应用发言及无效文本计入 omitted。一次只读一页，后续页显式调用；调用方将 continuation 绑定原来源和查询。历史事件 ID 为 `history:<messageId>`，应用应以平台 messageId 和实时事件一起去重。
+
+只返回该 Bot 可见的 Human 文本，沿用标准事件格式。平台返回的可选 `sender_name` 和 mention `name` 仅用于展示，不能用于身份或授权；缺失时不猜测，不查通讯录、不使用 Human token。读取不自动投递普通消息到 Inbox、不唤醒、不回复、不标记已读、不同步撤回；这些决定及 canonical 持久化由消费应用负责。
+
+Bot 权限不足返回 `history-permission-denied`；来源消失或改变返回 `stale-route`；来源没有话题返回 `thread-unavailable`；平台故障及无效分页返回 `history-unavailable`；混入其他群／话题返回 `untrusted-source`。调用取消、接收权释放、Host 关闭、Provider 替换都会丢弃未返回结果。消费方需保留接收生命周期直到读取结束。本能力不保证完整历史，也不提供全平台搜索。

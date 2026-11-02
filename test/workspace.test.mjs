@@ -22,6 +22,7 @@ import {
 import {
   runWorkspaceCommand,
   splitWorkspaceCommandMessage,
+  workspacePathSnapshot,
 } from '../src/channels/shared/workspace-command.mjs';
 import { TextHarnessBridge } from '../src/channels/shared/text-harness-bridge.mjs';
 import {
@@ -483,6 +484,7 @@ test('an old workspace session handle cannot read history, list, select, stop, o
   const harness = {
     async readSessionHistory(...args) { targetCalls.push(['history', ...args]); },
     async getSessionModels(...args) { targetCalls.push(['models', ...args]); },
+    async getSessionPermissions(...args) { targetCalls.push(['permissions', ...args]); },
     async selectSessionModel(...args) { targetCalls.push(['select', ...args]); },
     async stopActiveTurn(...args) { targetCalls.push(['stop', ...args]); },
     async steerActiveTurn(...args) { targetCalls.push(['steer', ...args]); },
@@ -501,6 +503,7 @@ test('an old workspace session handle cannot read history, list, select, stop, o
   for (const operation of [
     () => oldSession.readHistory(),
     () => oldSession.models(),
+    () => oldSession.permissions(),
     () => oldSession.selectModel({ provider: 'provider', model: 'model' }),
     () => oldSession.stopActiveTurn(control),
     () => oldSession.steerActiveTurn('continue', control),
@@ -1116,7 +1119,15 @@ test('/workspace command supports fresh list numbers, preserves paths, and retur
   };
 
   assert.equal(await runWorkspaceCommand('hello', harness), null);
-  assert.match((await runWorkspaceCommand('/workspace', harness)).message, /用法/);
+  // Merged command: a bare /workspace lists the switchable workspaces instead of
+  // pointing at /wsl; the text list itself stays exactly what /wsl always sent.
+  const bare = await runWorkspaceCommand('/workspace', harness);
+  assert.match(bare.message, /当前 Harness Host 上存在的工作区（/);
+  assert.deepEqual(bare.listing, {
+    current: defaultWorkspace,
+    paths: [defaultWorkspace, alternateWorkspace],
+    titles: {},
+  });
   assert.match(
     (await runWorkspaceCommand(`/workspace ${alternateWorkspace}`, harness)).message,
     new RegExp(alternateWorkspace.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')),
@@ -1210,6 +1221,52 @@ test('/workspacelist returns existing absolute paths with the current workspace 
   assert.match((await runWorkspaceCommand('/workspacelist', {
     async listWorkspaces() { return []; },
   })).message, /没有仍然存在/);
+});
+
+test('workspace snapshots keep titles attached to canonical paths through sorting and deduplication', async (t) => {
+  const { root, defaultWorkspace, alternateWorkspace } = await fixture(t);
+  const link = join(root, 'alias');
+  if (!(await createDirectoryLink(t, alternateWorkspace, link))) return;
+  const signal = new AbortController().signal;
+  let calls = 0;
+  let scopeChecks = 0;
+  const harness = {
+    currentWorkspace: () => defaultWorkspace,
+    listWorkspaces() { assert.fail('title snapshot must not fetch a second list'); },
+    async listWorkspaceEntries(options) {
+      calls += 1;
+      assert.deepEqual(options, { signal });
+      return [
+        { path: alternateWorkspace, title: '\u202e\n' },
+        { path: link, title: '  交流\n区  ' },
+        { path: defaultWorkspace, title: '策略研究' },
+        { path: link, title: 'later duplicate' },
+        { path: join(root, 'missing'), title: 'missing' },
+        { path: 'relative', title: 'invalid' }, null,
+      ];
+    },
+    assertWorkspaceScope() { scopeChecks += 1; },
+  };
+  assert.deepEqual(await workspacePathSnapshot(harness, { signal, includeTitles: true }), {
+    current: defaultWorkspace, paths: [defaultWorkspace, alternateWorkspace],
+    titles: { [alternateWorkspace]: '交流 区', [defaultWorkspace]: '策略研究' },
+  });
+  assert.equal(calls, 1);
+  assert.equal(scopeChecks, 1);
+  harness.listWorkspaceEntries = async () => [];
+  assert.deepEqual(await workspacePathSnapshot(harness, { includeTitles: true }), {
+    current: defaultWorkspace, paths: [defaultWorkspace], titles: {},
+  });
+  harness.listWorkspaceEntries = async () => { throw new Error('RPC failed'); };
+  await assert.rejects(workspacePathSnapshot(harness, { includeTitles: true }), /RPC failed/);
+  delete harness.listWorkspaceEntries;
+  harness.listWorkspaces = async () => [alternateWorkspace];
+  assert.deepEqual(await workspacePathSnapshot(harness, { includeTitles: true }), {
+    current: defaultWorkspace, paths: [defaultWorkspace, alternateWorkspace], titles: {},
+  });
+  assert.deepEqual(await workspacePathSnapshot(harness), {
+    current: defaultWorkspace, paths: [defaultWorkspace, alternateWorkspace],
+  });
 });
 
 test('/workspacelist splits a long registry without dropping paths', async (t) => {
@@ -1570,28 +1627,30 @@ test('all nine channel bridge families advertise and fan out workspace command r
   }
 });
 
-test('a stale bot scope cannot finish listing workspaces after same-id rebinding', async (t) => {
-  const { path, defaultWorkspace, alternateWorkspace } = await fixture(t);
-  const workspaces = await new BotWorkspaceStore(path, { defaultWorkspace }).load();
-  await workspaces.ensure('bot_list');
-  let finishList;
-  const harness = {
-    listWorkspaces() {
-      return new Promise((resolve) => { finishList = resolve; });
-    },
-  };
-  const oldScope = createBotScopedHarness(harness, {
-    botId: 'bot_list',
-    workspaces,
-    state: { async clearSessions() {} },
-  });
-  const pending = oldScope.listWorkspaces();
-  await workspaces.retireAfterConfigCommit('bot_list');
-  await workspaces.ensure('bot_list', { workspace: alternateWorkspace });
-  finishList([defaultWorkspace]);
+for (const listMethod of ['listWorkspaces', 'listWorkspaceEntries']) {
+  test(`a stale bot scope cannot finish ${listMethod} after same-id rebinding`, async (t) => {
+    const { path, defaultWorkspace, alternateWorkspace } = await fixture(t);
+    const workspaces = await new BotWorkspaceStore(path, { defaultWorkspace }).load();
+    await workspaces.ensure('bot_list');
+    let finishList;
+    const harness = {
+      [listMethod]() {
+        return new Promise((resolve) => { finishList = resolve; });
+      },
+    };
+    const oldScope = createBotScopedHarness(harness, {
+      botId: 'bot_list',
+      workspaces,
+      state: { async clearSessions() {} },
+    });
+    const pending = oldScope[listMethod]();
+    await workspaces.retireAfterConfigCommit('bot_list');
+    await workspaces.ensure('bot_list', { workspace: alternateWorkspace });
+    finishList([defaultWorkspace]);
 
-  await assert.rejects(pending, { code: 'workspace-bot-not-found' });
-});
+    await assert.rejects(pending, { code: 'workspace-bot-not-found' });
+  });
+}
 
 test('a stale bot scope cannot finish listing workspace sessions after same-id rebinding', async (t) => {
   const { path, defaultWorkspace, alternateWorkspace } = await fixture(t);

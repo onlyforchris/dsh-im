@@ -85,6 +85,7 @@ A saved direct-message target has an opt-in **Two-way Session sync** switch. Whe
 1. User text submitted from DSH Web/CLI to the DM's current Session is sent to the DM with a `[来自 DSH]` prefix.
 2. After that turn completes successfully, the final assistant text merged in step order is sent once more with a `[DSH 助手]` prefix.
 3. Ordinary IM prompts and `/steer` continue through the existing reply path. They are neither duplicated nor forwarded to another target.
+4. Scheduled tasks (`schedule`, `deliveryMode: host`) also sync their final assistant text after successful completion in the bound Session. Internal reminder framing is not echoed as a `[来自 DSH]` message.
 
 The setting stores the private conversation target, never a `sessionId`, so it follows `/session` changes automatically. After `/new` or a workspace change, its status becomes **Waiting for this DM to establish a new Session** and recovers as soon as that DM creates one; the switch does not need to be toggled again.
 
@@ -174,9 +175,24 @@ await ctx.dshIm.send(botId, targetId, '# Daily report\n\n**Checks complete**', {
 });
 ```
 
-`format` accepts only `plain` and `markdown`, defaulting to `plain`. Markdown formatting is currently implemented for Feishu/Lark: both direct and group destinations receive a native Markdown card without starting a Session or a stream. Other channels retain their existing delivery behavior; Markdown rendering is not guaranteed there. HTTP and `message.send` RPC accept the same optional `format` field in their payloads.
+`format` accepts only `plain` and `markdown`, defaulting to `plain`. HTTP and `message.send` RPC accept the same optional field. Markdown uses the existing channel delivery paths, without starting a Session or a new stream:
 
-The original Markdown, including whitespace, is preserved without silent truncation or automatic splitting; platform message-size and Markdown-syntax limits still apply. Rejection, timeout, and cancellation use the existing error handling, with no automatic plain-text resend that could duplicate delivery. Older dsh-im Host APIs may ignore this option; both the consumer and dsh-im must load the updated code.
+| Channel | Markdown presentation |
+| --- | --- |
+| Feishu/Lark | Native Markdown card |
+| Telegram | Rich Markdown, with the existing text fallback |
+| QQ | Markdown message; known format rejection falls back for the current chunk |
+| DingTalk | Proactive Markdown message; definite format rejection falls back to text |
+| Slack | Standard Markdown block with top-level notification text; explicit block rejection falls back to the existing text sender |
+| WeCom bot | Existing Markdown message type |
+| Matrix | Sanitized HTML with a text body |
+| Discord | Native Markdown in message content |
+| WhatsApp | Limited conversion of common formatting; code is protected and complex syntax stays literal |
+| WeCom app / Weixin | Full text, including code and link destinations |
+
+Channels apply their own message limits and splitting. Feishu proactive cards retain their existing unsplit behavior and do not automatically resend as text after rejection or an uncertain result. Other newly added fallback paths only handle local formatting errors or definite format rejection; they do not resend accepted chunks or retry ambiguous network outcomes. Older Hosts may ignore `format`; load the updated plugin on the Host.
+
+Session sync requests Markdown for final assistant answers and retains the existing default text behavior for user echoes. Feishu keeps its dedicated mirror cards and existing plain-text fallback when the mirror cannot confirm the final answer. This does not expand the supported sync targets.
 
 A same-Host plugin may also list the saved targets for one bot:
 
@@ -184,6 +200,21 @@ A same-Host plugin may also list the saved targets for one bot:
 const targets = await ctx.dshIm.listTargets(botId);
 // [{ targetId, name?, kind, route }, ...]
 ```
+
+A same-Host plugin may also register a known conversation route as a delivery target. Once registered, that `targetId` can be used with `send` and appears in the settings target list. This example registers a Feishu direct message, so `botId` must belong to a Feishu bot:
+
+```js
+await ctx.dshIm.createTarget(botId, {
+  targetId: 'release-alerts',
+  kind: 'user',
+  route: { openId: 'ou_xxx' },
+  name: 'Release alerts',       // optional
+});
+```
+
+Both `kind` and `route` must match the bot's channel; see [Native fields for all nine channels](#native-fields-for-all-nine-channels). For example, a Feishu group uses `kind: 'group'` with `route: { chatId: 'oc_xxx' }`. A Telegram direct message or group uses `kind: 'chat'` with `route: { chatId: '123456789' }`, where the Chat ID must be a decimal string.
+
+An existing `targetId` is rejected with `target-conflict`; updating or deleting a saved target still goes through the management RPC's `target.update` / `target.delete`.
 
 Companion plugins can discover configured bots through the same Host service:
 
@@ -307,6 +338,7 @@ The HTTP protocol layer may also return `method-not-allowed` (405), `unsupported
 - Targets remain editable while a bot is offline, but testing and delivery require a connected bot.
 - WeChat proactive sends, connection tests, and deferred task results use the latest `context_token` received from the corresponding user by that bot. Context is stored only in the Host account state and restored after restart; it is never included in delivery targets or returned to callers. Rebinding with a different login credential clears it. After upgrading, an inbound user message is needed to populate the cache.
 - iLink server rules still govern whether WeChat accepts a send. Healthy long polling does not guarantee proactive delivery. If `ret=-2 prepare failed` persists, avoid repeated heartbeat messages as a renewal strategy; ask the recipient to send a message before retrying. This error alone does not establish login expiry, context expiry, or exhausted quota.
+- Long proactive WeChat text uses the existing 1,800-character chunk budget. Synced assistant Markdown keeps complete code fences in each chunk. Each chunk consumes a platform send; splitting does not remove server quotas. A rejection or uncertain result stops delivery and reports failure without resending accepted chunks. Diagnostics identify the failed chunk and total chunk count.
 
 - Failed WeChat proactive sends remain visible in the account’s latest message error, with sanitized diagnostics including the provider code and whether context was included. Healthy polling does not clear this error; a successful outbound send does. HTTP/RPC still return the existing `delivery-failed` error, with no automatic retry or disconnection of healthy long polling.
 
@@ -353,3 +385,63 @@ A `sessionId` identifies a Harness Session. It is not a uniform, stable message 
 ### The test succeeded, but the recipient cannot see the message
 
 A successful test proves only that the platform accepted the send. Check bot permissions, platform restrictions, target accuracy, and client-side filtering or archive settings.
+
+## Checked proactive sending for companion plugins
+
+The same-Host `dshIm` Service exposes `contractVersion: 1`, `describeBot(botId)` and `sendChecked(botId, targetId, text, options)`. The initial authenticated-account implementation supports Feishu/Lark; other channels explicitly report `capability-unavailable` until they implement the contract. Existing `send`, HTTP and management RPC behavior remains unchanged.
+
+`describeBot` returns `{version: 1, botId, channel, account: {fingerprint, name?}, connected, capabilities}`. The `proactive-text-checked` capability is not a user grant. Feishu/Lark resolves credentials through the credentials service and verifies the current platform Bot Open ID. Its lowercase SHA-256 fingerprint is derived from UTF-8 `JSON.stringify({provider:'feishu', domain, appId, botOpenId})` in that field order. It never returns credentials or tokens and rejects a principal different from the configured verified bot. Discovery is asynchronous during Host startup; refresh after channel initialization.
+
+Options require `expectedFingerprint` and `expectedTargetDigest` and optionally accept `signal` and `format`. Derive the target digest from lowercase SHA-256 of UTF-8 `JSON.stringify({kind, route})`, with route keys sorted by ascending JavaScript string code-unit order. Names and aliases do not affect this digest. The service checks the currently saved target, freezes its normalized route, revalidates the authenticated account inside the account transition and sends that frozen route. Editing an alias during verification cannot redirect the request. Removing or changing a target before lookup rejects the request; after a request starts, changes cannot undo its external effect.
+
+`account-unverified`, `account-changed`, `target-changed` and `capability-unavailable` are pre-send refusals; credential lookup and platform authentication failures also return `account-unverified`. `{sent:true}` still means platform acceptance, not delivery/read. SDK cancellation after start, timeout and other ambiguous outcomes are not proof that nothing was sent. The caller owns durable authorization, intent/attempt records and reconciliation and must not blindly retry. Provider Registration disposal or controller closure rejects checked sends whose SDK request has not started, including disposal during the final account verification; it cannot unsend an already started SDK request.
+
+## Exclusive Feishu/Lark text intake (same Host)
+
+Applications with their own durable message store can use `ctx.dshIm` (`inboundVersion: 1`) instead of the standalone DSH Session bridge. This is an opt-in Feishu/Lark capability; other channels and accounts that have never opted in retain their existing behavior.
+
+```js
+const account = await ctx.dshIm.describeBot(botId);
+const dispose = await ctx.dshIm.consumeInbound(botId, {
+  expectedFingerprint: account.account.fingerprint,
+  signal: lifecycleSignal,
+  async onEvent(event, { signal }) {
+    // Authorize the conversation, deduplicate by provider event/message ID,
+    // and commit into the application's canonical store before acknowledging.
+    await application.acceptDurably(event, { signal });
+    return { accepted: true };
+  },
+});
+// Later, use the same verified account and the exact event.reply route:
+await ctx.dshIm.replyChecked(botId, event.reply, 'Acknowledged', {
+  expectedFingerprint: account.account.fingerprint,
+  signal: lifecycleSignal,
+});
+// Release with the application's Registration/Fiber lifecycle:
+dispose();
+```
+
+Check the account's `exclusive-text-consumer` and `reply-text-checked` capabilities before enabling reception. Only one consumer may own an account; conflicts fail with `consumer-conflict`. The Host-only callback is not exposed through browser RPC or HTTP.
+
+A version-1 event contains `channel`, `botId`, authenticated `fingerprint`, `eventId`, `messageId`, `actor: {kind: 'user', id}`, `conversation: {kind: 'group' | 'dm', id}`, `mentions: [{id, key}]`, `mentionedAccount`, ISO `at`, original `text`, and `reply: {messageId, conversationId, actorId, threadId?, rootId?, parentId?}`. These are platform-native IDs; optional server names are display-only; avatars and attachments are outside this slice. Bounded history is described below. Applications decide which conversations/messages to accept and when to wake an agent.
+
+The mode is saved per account as `consumerMode: 'external-consumer'`. In that mode the native Session bridge, card callbacks and slash commands do not run. Releasing the consumer, losing its Registration, or restarting the Host does not restore standalone processing; intake fails closed until a consumer registers again. Returning to standalone requires an explicit configuration change and reconnect. A consumer must cooperate with cancellation while committing; releasing a consumer cannot undo an application commit already completed.
+
+Checked replies re-read the original message and compare sender, conversation, thread, root and parent IDs before sending. A topic reply uses Lark's original-topic reply operation; it never falls back to the group mainline. Missing/changed sources fail with `stale-route`. An SDK failure after attempting the reply returns `reply-result-unknown`: inspect the external conversation before retrying. Provider redelivery has no resume cursor and may have gaps; this contract does not promise exactly-once transport, message-read receipts, or cross-account replies. Keep deduplication and durable delivery intents in the application.
+
+## Bounded Feishu/Lark context reads (same Host)
+
+An active exclusive consumer may call the optional `dshIm.historyChecked(botId, source.reply, query, {expectedFingerprint, signal})`. Check `history-text-checked`, and also `thread-history-text-checked` for a thread. Query is `{scope: 'group' | 'nearby' | 'thread', limit: 1..20, cursor?: string}`. There is no browser/HTTP history endpoint. The verified account and live consumer lease are required; standalone accounts cannot read through this contract.
+
+Each call re-fetches the source and compares its author, chat, thread, root and parent IDs before listing. `group` lists the source chat; `nearby` uses a bounded five-minute-before/after chat time window, not a native around-message API; `thread` lists the native thread. The response is `{version:1, scope, events, omitted, hasMore, nextCursor?, window?, coverage:'provider-visible-human-text'}`. At most `limit` provider records are inspected; unsupported, deleted, application-sent or invalid text is counted as omitted. Pagination is explicit, one page per call. The caller binds its continuation to the same source/query. History-derived events use `history:<messageId>` as event ID; deduplicate with the native message ID alongside received events.
+
+Only visible Human text is returned, with the same normalized event shape. Optional platform `sender_name` and mention `name` are display labels, never identity or authorization; missing names remain absent. No directory lookup or Human token fallback is performed. A read does not admit ordinary messages to an Inbox, wake an agent, reply, mark a message read, or synchronize withdrawal. The companion application owns those decisions and canonical persistence.
+
+Missing Bot permissions return `history-permission-denied`; missing/changed source IDs return `stale-route`; an anchor without a thread returns `thread-unavailable`; provider failures or malformed pagination return `history-unavailable`. Unrelated chat/thread records fail with `untrusted-source`. Caller cancellation, consumer release, Host close and Provider replacement discard in-flight results. The consumer must retain its lifetime until the read completes. This capability is neither a complete transcript guarantee nor provider-wide search.
+
+```js
+const page = await ctx.dshIm.historyChecked(botId, event.reply,
+  { scope: 'thread', limit: 10 },
+  { expectedFingerprint: account.account.fingerprint, signal: lifecycleSignal });
+// Persist/reconcile only after application authorization. Do not turn reads into intake.
+```

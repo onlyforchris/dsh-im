@@ -16,6 +16,8 @@ export function validWorkspacePayload(payload) {
 
 export function publicWorkspaceError(error) {
   if (![
+    'workspace-manual-edit-disabled',
+    'conversation-directory-invalid',
     'workspace-not-absolute',
     'workspace-not-found',
     'workspace-not-directory',
@@ -26,6 +28,7 @@ export function publicWorkspaceError(error) {
     'model-selection-unavailable',
     'model-reasoning-unavailable',
     'context-enhancement-invalid',
+    'access-policy-invalid',
   ].includes(error?.code)) return null;
   return { code: error.code, message: error.message };
 }

@@ -8,6 +8,8 @@ import {
 import { t } from '../shared/i18n.mjs';
 import { evaluateInboundAccess } from '../shared/inbound-access.mjs';
 import { createQqBridgeStatus, QqHarnessBridge } from './qq-bridge.mjs';
+import { isQqMessageAddressed, normalizeQqMentions } from './qq-mention.mjs';
+import { sendMarkdownReply } from './markdown-reply.mjs';
 
 function timeoutError() {
   const error = new Error('QQ WebSocket did not become ready in time');
@@ -34,6 +36,7 @@ export class QqRuntime {
   #harness;
   #state;
   #contextEnhancement;
+  #groupHistory;
   #accessPolicy;
   #logger;
   #diagnostics;
@@ -55,6 +58,7 @@ export class QqRuntime {
     harness,
     state,
     contextEnhancement,
+    groupHistory,
     accessPolicy,
     logger = console,
     replyTimeoutMs = 600_000,
@@ -71,6 +75,7 @@ export class QqRuntime {
     this.#harness = harness;
     this.#state = state;
     this.#contextEnhancement = contextEnhancement;
+    this.#groupHistory = groupHistory;
     this.#accessPolicy = accessPolicy;
     this.#logger = logger; this.#diagnostics = createConnectionDiagnostics({ channel: 'qq', logger });
     this.#replyTimeoutMs = replyTimeoutMs;
@@ -106,7 +111,17 @@ export class QqRuntime {
     return { sent: true };
   }
 
-  async sendProactiveText(target, text, { signal } = {}) {
+  async presentSessionSyncApproval(target, interaction, options = {}) {
+    if (!this.#status.ready || !this.#bridge) return false;
+    const actor = typeof target?.route?.userOpenId === 'string' ? target.route.userOpenId.trim() : '';
+    if (!actor) return false;
+    return this.#bridge.presentSessionSyncApproval(interaction, {
+      key: options.key, actor, validate: options.validate,
+      send: (text) => this.sendProactiveText(target, text),
+    }, options);
+  }
+
+  async sendProactiveText(target, text, { signal, format = 'plain' } = {}) {
     const nativeId = target?.kind === 'user'
       ? (typeof target?.route?.userOpenId === 'string' ? target.route.userOpenId.trim() : '')
       : target?.kind === 'group'
@@ -123,10 +138,17 @@ export class QqRuntime {
       throw error;
     }
     signal?.throwIfAborted();
-    return this.#bot.sendText({
+    const replyTarget = {
       scope: target.kind === 'user' ? 'c2c' : 'group',
       targetId: nativeId,
-    }, text);
+    };
+    if (format === 'markdown') {
+      await sendMarkdownReply(this.#bot, replyTarget, text, {
+        logger: this.#logger, signal, requireComplete: true,
+      });
+      return { sent: true };
+    }
+    return this.#bot.sendText(replyTarget, text);
   }
 
   async start() {
@@ -175,12 +197,18 @@ export class QqRuntime {
       harness: this.#harness,
       state: this.#state,
       contextEnhancement: this.#contextEnhancement,
+      groupHistory: this.#groupHistory,
       accessPolicy: this.#accessPolicy,
       status: this.#status,
       logger: this.#logger,
       replyTimeoutMs: this.#replyTimeoutMs,
       sourceChannelLabel: this.#sourceChannelLabel,
       signal: controller.signal,
+    });
+    const botMentionIds = new Set([this.#config.appId]);
+    bot.use(async (ctx, next) => {
+      ctx.message = normalizeQqMentions(ctx.message, botMentionIds);
+      await next();
     });
     // QQ delivers emoji/face messages as opaque `<faceType=..,faceId="..",ext="..">`
     // tags. Parse them into readable text so the Harness sees what the sender
@@ -190,8 +218,7 @@ export class QqRuntime {
       keepAlive: true,
       predicate: (ctx) => {
         const message = ctx?.message;
-        if (!message || (message.kind === 'group'
-          && message.rawEventType !== 'GROUP_AT_MESSAGE_CREATE')) return false;
+        if (!isQqMessageAddressed(message)) return false;
         if (!this.#accessPolicy) {
           return message.kind === 'group'
             || this.#config.ownerUserOpenid === '*'
@@ -211,7 +238,10 @@ export class QqRuntime {
       readyResolve = resolve;
       readyReject = reject;
     });
-    const onReady = () => {
+    const onReady = (data) => {
+      if (typeof data?.user?.id === 'string' && data.user.id.trim()) {
+        botMentionIds.add(data.user.id.trim());
+      }
       const now = Date.now();
       this.#status.ready = true;
       this.#status.qqConnectionState = 'connected';

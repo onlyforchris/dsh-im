@@ -1856,6 +1856,63 @@ test('a mail thread survives a restart', async () => {
   }
 });
 
+test('a reply that quotes only its parent still joins the thread', async (t) => {
+  // iOS Mail quotes only the immediate parent: its References header holds a
+  // single id, our own reply's Message-ID. That id is minted by nodemailer on
+  // the way out and was never mapped, so the resolver found nothing familiar
+  // and forked a brand-new session on every phone reply — one mail thread ran
+  // as two Harness sessions that never saw each other's turns.
+  let repliesSent = 0;
+  let firstDelivered = false;
+  let secondDelivered = false;
+  const mailbox = async () => {
+    if (!firstDelivered) { firstDelivered = true; return [inboundMail(1)]; }
+    // The phone can only reply after our answer went out, so the second mail is
+    // released once the first reply is on the wire.
+    if (repliesSent > 0 && !secondDelivered) {
+      secondDelivered = true;
+      return [inboundMail(2, { references: '<sent-1@x>', inReplyTo: '<sent-1@x>' })];
+    }
+    return [];
+  };
+  const sessionIds = [];
+  const { runtime, asks, state } = await startDeliveryRuntime(t, {
+    mailbox,
+    harnessOverrides: {
+      createSession: async () => {
+        const id = `session-${sessionIds.length + 1}`;
+        sessionIds.push(id);
+        return id;
+      },
+    },
+    createApi: () => ({
+      connect: async () => {}, disconnect: async () => {}, latestUid: async () => 'msg_0',
+      listMessages: mailbox,
+      sendReply: async () => {
+        repliesSent += 1;
+        return { sent: true, messageId: '<sent-1@x>' };
+      },
+      sendText: async () => {},
+    }),
+  });
+  await runtime.start();
+
+  await waitFor(() => repliesSent > 0, () => 'the first reply was never sent');
+  await waitFor(() => asks.length === 2, () => 'the parent-only reply never reached the Harness');
+
+  assert.equal(
+    state.conversationForThreadId('<sent-1@x>'),
+    state.conversationForThreadId('<rfc-1@x>'),
+    'our own reply id is registered against the thread it answers',
+  );
+  assert.equal(
+    asks[1].sessionId,
+    asks[0].sessionId,
+    'the parent-only reply reuses the same Harness session instead of forking',
+  );
+  assert.equal(sessionIds.length, 1, `created ${sessionIds.length} sessions for one thread`);
+});
+
 test('a rate-limited poll backs off instead of hammering the API', async () => {
   // The Agent mailbox allows 10 requests a minute. Retrying on the fixed
   // interval kept the limit exceeded, so the mailbox never recovered.
@@ -2052,29 +2109,41 @@ test('a delivery that fails is retried on a later poll, not lost', async (t) => 
   // The runtime no longer marks a message seen before the bridge has run, so a
   // rejected `accept` must leave the mail eligible for the next poll instead of
   // silently consuming it.
-  const seenKeys = [];
-  const { runtime, asks } = await startDeliveryRuntime(t, {
-    mailbox: async () => [inboundMail(1)],
-    onHarnessAsk: () => { seenKeys.push(1); },
+  let polls = 0;
+  const { runtime, asks, state } = await startDeliveryRuntime(t, {
+    mailbox: async () => { polls += 1; return [inboundMail(1)]; },
   });
   await runtime.start();
   const bridge = runtime.bridge;
-  let rejectFirst = true;
+  let attempts = 0;
+  const retried = Promise.withResolvers();
   const accept = bridge.accept.bind(bridge);
-  bridge.accept = (message, options) => {
-    if (rejectFirst) {
-      rejectFirst = false;
-      return Promise.reject(new Error('queue unavailable'));
+  t.mock.method(bridge, 'accept', async (message, options) => {
+    attempts += 1;
+    if (attempts === 1) throw new Error('queue unavailable');
+    try {
+      await accept(message, options);
+      retried.resolve();
+    } catch (error) {
+      retried.reject(error);
+      throw error;
     }
-    return accept(message, options);
-  };
+  });
 
-  await waitFor(
-    () => asks.length > 0,
-    () => 'the retry never ran after the first delivery was rejected',
-  );
+  // Await the completed delivery, not a two-second race against CI disk load.
+  // The watchdog also keeps the event loop alive: the poll timer is unref'd.
+  const watchdog = setTimeout(() => retried.reject(new Error(
+    `the retry did not complete (${polls} polls, ${attempts} delivery attempts)`,
+  )), 10_000);
+  try {
+    await retried.promise;
+  } finally {
+    clearTimeout(watchdog);
+  }
+  assert.ok(polls >= 2, 'the retry happens on a later poll');
+  assert.equal(attempts, 2, 'one rejected delivery is followed by one retry');
   assert.equal(asks.length, 1, 'the retry runs the turn exactly once');
-  assert.equal(seenKeys.length, 1);
+  assert.equal(state.hasSeen('<rfc-1@x>'), true, 'the successful retry is recorded as handled');
 });
 
 // ── first bind against a real workspace store ──────────────────────────────

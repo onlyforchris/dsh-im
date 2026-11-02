@@ -8,6 +8,7 @@ import {
   sendRememberedConnectionTest,
 } from '../shared/connection-test.mjs';
 import { t } from '../shared/i18n.mjs';
+import { chunkMarkdownText } from '../shared/markdown-chunks.mjs';
 
 // 通知图片上传超时；独立于回复链路的 replyTimeoutMs。
 const NOTIFICATION_FILE_UPLOAD_TIMEOUT_MS = 30_000;
@@ -41,9 +42,12 @@ export class WecomRuntime {
   #logger;
   #diagnostics;
   #replyTimeoutMs;
+  #streamRotateAfterMs;
+  #streamSilentProbeMs;
   #connectTimeoutMs;
   #maxReconnectAttempts;
   #createClient;
+  #createBridge;
   #sourceChannelLabel;
   #status = createWecomRuntimeStatus();
   #client = null;
@@ -62,9 +66,12 @@ export class WecomRuntime {
     accessPolicy,
     logger = console,
     replyTimeoutMs = 600_000,
+    streamRotateAfterMs = 510_000,
+    streamSilentProbeMs = 120_000,
     connectTimeoutMs = 20_000,
     maxReconnectAttempts = 10,
     createClient = (options) => new WSClient(options),
+    createBridge = (options) => new WecomHarnessBridge(options),
   }) {
     if (!config || !secret || !harness || !state) {
       throw new TypeError('WecomRuntime requires config, secret, Harness, and state');
@@ -76,7 +83,10 @@ export class WecomRuntime {
     this.#contextEnhancement = contextEnhancement;
     this.#accessPolicy = accessPolicy;
     this.#logger = logger; this.#diagnostics = createConnectionDiagnostics({ channel: 'wecom', logger });
+    this.#createBridge = createBridge;
     this.#replyTimeoutMs = replyTimeoutMs;
+    this.#streamRotateAfterMs = streamRotateAfterMs;
+    this.#streamSilentProbeMs = streamSilentProbeMs;
     this.#connectTimeoutMs = connectTimeoutMs;
     this.#maxReconnectAttempts = maxReconnectAttempts;
     this.#createClient = createClient;
@@ -110,7 +120,14 @@ export class WecomRuntime {
     await atConnectionStage('harness.check', () => this.#harness.ensureRunning());
     this.#status.harnessReachable = true;
 
-    const silentSdkLogger = { debug() {}, info() {}, warn() {}, error() {} };
+    // The SDK's own logger reports reply ack errors (errcode/errmsg) that are
+    // invisible otherwise; keep debug/info quiet but surface warn/error.
+    const silentSdkLogger = {
+      debug() {},
+      info() {},
+      warn: (...args) => this.#logger.warn?.('[dsh-im:wecom-sdk]', ...args),
+      error: (...args) => this.#logger.error?.('[dsh-im:wecom-sdk]', ...args),
+    };
     const client = this.#createClient({
       botId: this.#config.remoteBotId,
       secret: this.#secret,
@@ -121,7 +138,7 @@ export class WecomRuntime {
       throw new TypeError('Enterprise WeChat client factory returned an invalid client');
     }
     this.#client = client;
-    this.#bridge = new WecomHarnessBridge({
+    this.#bridge = this.#createBridge({
       client,
       harness: this.#harness,
       state: this.#state,
@@ -130,6 +147,8 @@ export class WecomRuntime {
       status: this.#status,
       logger: this.#logger,
       replyTimeoutMs: this.#replyTimeoutMs,
+      streamRotateAfterMs: this.#streamRotateAfterMs,
+      streamSilentProbeMs: this.#streamSilentProbeMs,
       sourceChannelLabel: this.#sourceChannelLabel,
       signal,
     });
@@ -274,7 +293,17 @@ export class WecomRuntime {
     return { sent: true, mode };
   }
 
-  async sendProactiveText(target, text, { signal } = {}) {
+  async presentSessionSyncApproval(target, interaction, options = {}) {
+    if (!this.#status.ready || !this.#bridge) return false;
+    const actor = typeof target?.route?.chatId === 'string' ? target.route.chatId.trim() : '';
+    if (!actor) return false;
+    return this.#bridge.presentSessionSyncApproval(interaction, {
+      key: options.key, actor, validate: options.validate,
+      send: (text) => this.sendProactiveText(target, text),
+    }, options);
+  }
+
+  async sendProactiveText(target, text, { signal, format = 'plain' } = {}) {
     const chatId = typeof target?.route?.chatId === 'string'
       ? target.route.chatId.trim() : '';
     if ((target?.kind !== 'user' && target?.kind !== 'group') || !chatId) {
@@ -288,10 +317,15 @@ export class WecomRuntime {
       throw error;
     }
     signal?.throwIfAborted();
-    await this.#client.sendMessage(chatId, {
-      msgtype: 'markdown',
-      markdown: { content: text },
-    });
+    // At most three UTF-8 bytes per UTF-16 unit: stay within the existing
+    // bridge's 18,000-byte budget while keeping Markdown structures intact.
+    const chunks = format === 'markdown' ? chunkMarkdownText(text, 6_000) : [text];
+    for (const content of chunks) {
+      signal?.throwIfAborted();
+      await this.#client.sendMessage(chatId, {
+        msgtype: 'markdown', markdown: { content },
+      });
+    }
     return { sent: true };
   }
 
