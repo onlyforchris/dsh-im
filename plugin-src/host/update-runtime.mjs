@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 import semver from 'semver';
 
-export const PACKAGE_NAME = '@xmanrui/dsh-im';
+export const PACKAGE_NAME = '@onlyforchris/dsh-im';
 export const NPM_REGISTRY = 'https://registry.npmjs.org/';
 
 const INSTALL_TIMEOUT_MS = 15 * 60_000;
@@ -254,7 +254,7 @@ export function createUpdateRuntime(options = {}) {
   }
 
   async function checkRegistry(runtime, signal) {
-    const args = ['config', 'get', '@xmanrui:registry', '--json'];
+    const args = ['config', 'get', '@onlyforchris:registry', '--json'];
     const result = await run(
       (childSignal) => runtime.desktop
         ? runtime.desktop.run(args, childSignal)

@@ -63,6 +63,8 @@ test('state store retains sessions, deduplication, and the getUpdates cursor', a
   assert.equal(restored.sessionFor('p2p:user'), 'session-1');
   assert.equal(restored.hasSeen('message-1'), true);
   assert.equal(restored.getUpdatesBuf(), 'cursor-2');
+  await restored.clearSessions();
+  assert.equal(restored.sessionFor('p2p:user'), null);
   await assertRestrictiveMode(path, 0o600);
 });
 

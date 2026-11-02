@@ -313,6 +313,7 @@ export class WeixinHarnessBridge {
   #logger;
   #replyTimeoutMs;
   #maxMessageChars;
+  #sourceChannelLabel;
   #typingKeepaliveMs;
   #signal;
   #queues = new Map();
@@ -347,6 +348,7 @@ export class WeixinHarnessBridge {
     logger = console,
     replyTimeoutMs = 600_000,
     maxMessageChars = DEFAULT_WEIXIN_MAX_MESSAGE_CHARS,
+    sourceChannelLabel,
     typingKeepaliveMs = DEFAULT_TYPING_KEEPALIVE_MS,
     signal,
   }) {
@@ -368,6 +370,7 @@ export class WeixinHarnessBridge {
     this.#logger = logger;
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#maxMessageChars = maxMessageChars;
+    this.#sourceChannelLabel = sourceChannelLabel;
     this.#typingKeepaliveMs = typingKeepaliveMs;
     this.#signal = signal;
     this.#deferred = createDeferredDeliveryCoordinator({ harness, state, signal, logger,
@@ -879,6 +882,9 @@ export class WeixinHarnessBridge {
           titleText: batchSubmission?.title,
           sourceGuidance: captured?.snapshot?.config?.guidance,
           contextEnhanced,
+          channelLabel: this.#sourceChannelLabel,
+          fromUserId: sender,
+          msgId: messageId,
           createOptions: { signal: this.#signal },
           existsOptions: { signal: this.#signal },
           askOptions: {

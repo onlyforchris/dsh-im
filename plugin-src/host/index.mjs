@@ -27,6 +27,7 @@ import { installInjectedContext } from './injected-context.mjs';
 import { installSessionSyncCoordinator } from './session-sync-coordinator.mjs';
 import { installSessionTitlePrefix } from './session-title-prefix.mjs';
 import { installUpdateRpc } from './update-rpc.mjs';
+import { installImPreAsk } from '../../src/channels/shared/im-pre-ask.mjs';
 
 export const name = 'dsh-im-host';
 export const inject = [
@@ -137,6 +138,18 @@ export function createImHostPlugin(internals = {}) {
           createTarget: (botId, target) => deliveryService.createTarget(botId, target),
           listBots: () => deliveryService.listBots(),
         }));
+      }
+      // 通用扩展点：业务插件 ctx.on('im/pre-ask') 可短路固定回执（不进 LLM）
+      const disposePreAsk = installImPreAsk(async (payload) => {
+        if (typeof ctx.waterfall !== 'function') return { kind: 'continue' };
+        return ctx.waterfall(
+          'im/pre-ask',
+          payload,
+          () => Promise.resolve({ kind: 'continue' }),
+        );
+      });
+      if (typeof ctx?.effect === 'function') {
+        ctx.effect(() => disposePreAsk, 'dsh-im: im/pre-ask gate');
       }
       const activate = async (readyCtx) => {
         await activateChannels(readyCtx, config, deliveryService);

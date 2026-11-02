@@ -339,7 +339,7 @@ test('every literal t() key in src/channels has an English and a Russian entry',
   const missingEnglish = [];
   const missingRussian = [];
   for (const file of files) {
-    const source = readFileSync(file, 'utf8');
+    const source = readFileSync(file, 'utf8').replace(/\r\n?/g, '\n');
     for (const key of literalKeys(source)) {
       if (!/[\u4e00-\u9fff]/.test(key)) continue;
       if (!Object.hasOwn(EN, key)) missingEnglish.push(`${file}: ${key}`);

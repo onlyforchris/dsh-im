@@ -335,7 +335,7 @@ export function IMSettingsTab({
       h('span', { className: 'dim-githubAction' },
         h('a', {
           className: 'dim-githubLink',
-          href: 'https://github.com/xmanrui/dsh-im',
+          href: 'https://github.com/onlyforchris/dsh-im',
           target: '_blank',
           rel: 'noopener noreferrer',
           'aria-label': 'dsh-im GitHub',
@@ -629,7 +629,7 @@ export function apply(ctx) {
       stopSettings = ctx.slots.inject('settings.section', () => {
         const unregister = ctx.slots.register({
           name: 'settings.section',
-          id: 'xmanrui-dsh-im',
+          id: 'onlyforchris-dsh-im',
           order: 21,
           label: () => t('IM机器人'),
           locale: IM_LOCALE_NAMESPACE,

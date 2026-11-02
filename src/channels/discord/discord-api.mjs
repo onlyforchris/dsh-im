@@ -291,7 +291,7 @@ export class DiscordApi {
         headers: {
           authorization: `Bot ${this.#token}`,
           ...(multipart ? {} : { 'content-type': 'application/json' }),
-          'user-agent': 'DeepSeek-Harness-dsh-im (https://github.com/xmanrui/dsh-im, 1.1.0)',
+          'user-agent': 'DeepSeek-Harness-dsh-im (https://github.com/onlyforchris/dsh-im, 1.1.0)',
         },
         ...(body === undefined ? {} : { body: multipart ? body : JSON.stringify(body) }),
         signal: requestSignal(signal, timeoutMs),

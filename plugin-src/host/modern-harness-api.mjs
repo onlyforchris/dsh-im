@@ -44,6 +44,7 @@ function remoteRequest(namespace, method, args, signal, peer) {
     namespace,
     method,
     args,
+    ...(peer === undefined ? {} : { peer }),
     ...(signal === undefined ? {} : { signal }),
     ...(peer === undefined ? {} : { peer }),
   };
@@ -218,6 +219,7 @@ class ModernHarnessApi {
 
   constructor(ctx, gateway, scope) {
     this.#gateway = gateway;
+    this.#peer = harnessPeer(ctx);
     this.#scope = scope;
     this.#peer = harnessPeer(ctx);
 

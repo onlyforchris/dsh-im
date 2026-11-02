@@ -66,6 +66,7 @@ import {
 } from '../shared/semantic/delivery.mjs';
 import {
   clearLastMessageFailure,
+  messageFailureDiagnostic,
   messageFailureText,
   setLastMessageFailure,
 } from '../shared/message-failure.mjs';
@@ -590,6 +591,7 @@ export class WecomHarnessBridge {
   #streamRotateAfterMs;
   #streamSilentProbeMs;
   #generateReqId;
+  #sourceChannelLabel;
   #signal;
   #fileUploadTimeoutMs;
   #queues = new Map();
@@ -619,6 +621,7 @@ export class WecomHarnessBridge {
     streamRotateAfterMs = 510_000,
     streamSilentProbeMs = 120_000,
     generateStreamId = generateReqId,
+    sourceChannelLabel,
     fileUploadTimeoutMs = DEFAULT_FILE_UPLOAD_TIMEOUT_MS,
     signal,
   }) {
@@ -640,6 +643,7 @@ export class WecomHarnessBridge {
     this.#streamRotateAfterMs = streamRotateAfterMs;
     this.#streamSilentProbeMs = streamSilentProbeMs;
     this.#generateReqId = generateStreamId;
+    this.#sourceChannelLabel = sourceChannelLabel;
     this.#fileUploadTimeoutMs = Math.min(fileUploadTimeoutMs, DEFAULT_FILE_UPLOAD_TIMEOUT_MS);
     this.#signal = signal;
     this.#deferred = createDeferredDeliveryCoordinator({ harness, state, signal, logger,
@@ -1014,7 +1018,7 @@ export class WecomHarnessBridge {
         });
         this.#logger.error?.(
           `[dsh-im:wecom] failed to process a command [${failure.referenceId}]`,
-          wecomSendDiagnostic(error),
+          { ...messageFailureDiagnostic(error, failure), ...wecomSendDiagnostic(error) },
         );
         if (this.#cardFrames.has(frame) && error?.wecomOperation
           && error.code !== 'channel-delivery-failed') return;
@@ -1175,6 +1179,7 @@ export class WecomHarnessBridge {
       const failure = setLastMessageFailure(this.#status, error);
       this.#logger.error?.(
         `[dsh-im:wecom] failed to process a batch input message [${failure.referenceId}]`,
+        { ...messageFailureDiagnostic(error, failure), ...wecomSendDiagnostic(error) },
       );
       await this.#sendImmediate(frame, chatId, messageFailureText(failure))
         .catch(() => undefined);
@@ -1472,6 +1477,9 @@ export class WecomHarnessBridge {
         key,
         text,
         content,
+        channelLabel: this.#sourceChannelLabel,
+        fromUserId: senderId,
+        msgId: messageId,
         titleText: batchSubmission?.title,
         sourceGuidance: snapshot?.config?.guidance,
         contextEnhanced,
@@ -1606,7 +1614,7 @@ export class WecomHarnessBridge {
       });
       this.#logger.error?.(
         `[dsh-im:wecom] failed to process an inbound message [${failure.referenceId}]`,
-        wecomSendDiagnostic(error),
+        { ...messageFailureDiagnostic(error, failure), ...wecomSendDiagnostic(error) },
       );
       const errorText = messageFailureText(failure);
       const visibleError = batchFailureMessage

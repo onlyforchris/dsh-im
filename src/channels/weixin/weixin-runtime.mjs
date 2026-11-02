@@ -124,6 +124,7 @@ export class WeixinRuntime {
   #startContext = {};
   #replyTimeoutMs;
   #maxMessageChars;
+  #sourceChannelLabel;
   #startRetryDelaysMs;
   #status = createWeixinRuntimeStatus();
   #bridge = null;
@@ -135,6 +136,7 @@ export class WeixinRuntime {
     api,
     config,
     token,
+    sourceChannelLabel,
     harness,
     state,
     contextEnhancement,
@@ -159,6 +161,7 @@ export class WeixinRuntime {
     this.#diagnostics = diagnostics ?? createWeixinDiagnostics({ logger });
     this.#replyTimeoutMs = replyTimeoutMs;
     this.#maxMessageChars = maxMessageChars;
+    this.#sourceChannelLabel = sourceChannelLabel;
     this.#startRetryDelaysMs = startRetryDelays(startRetryDelaysMs);
   }
 
@@ -206,6 +209,7 @@ export class WeixinRuntime {
         logger: this.#logger,
         replyTimeoutMs: this.#replyTimeoutMs,
         maxMessageChars: this.#maxMessageChars,
+        sourceChannelLabel: this.#sourceChannelLabel,
         signal,
       });
       this.#status.ready = true;
@@ -349,6 +353,40 @@ export class WeixinRuntime {
       signal: this.#abortController.signal,
     });
     return { sent: true };
+  }
+
+  /**
+   * 发送主动通知（S5 outbox 消费路径，04_13 P0-B）。
+   * 目标：记住的私聊 toUserId ?? 账号 ownerUserId；微信图片链路不达，
+   * media 存在时按 fork 0.16.7 决策统一 text-fallback，通知事实不因表现层失败丢失。
+   */
+  async sendNotification(text, media) {
+    const remembered = connectionTestTarget(this.#state);
+    const toUserId = typeof remembered?.toUserId === 'string' && remembered.toUserId.trim()
+      ? remembered.toUserId.trim()
+      : typeof this.#config.ownerUserId === 'string' && this.#config.ownerUserId.trim()
+        ? this.#config.ownerUserId.trim()
+        : null;
+    if (!toUserId) throw connectionTestTargetUnavailable(t('微信机器人'));
+    if (!this.#status.ready || !this.#abortController) {
+      throw new Error('Weixin runtime is not connected');
+    }
+    const contextToken = typeof remembered?.contextToken === 'string' && remembered.contextToken.trim()
+      ? remembered.contextToken.trim()
+      : undefined;
+    const runId = typeof remembered?.runId === 'string' && remembered.runId.trim()
+      ? remembered.runId.trim()
+      : undefined;
+    await this.#api.sendText({
+      baseUrl: this.#config.baseUrl,
+      token: this.#token,
+      toUserId,
+      text,
+      contextToken,
+      runId,
+      signal: this.#abortController.signal,
+    });
+    return { sent: true, mode: media ? 'text-fallback' : 'text' };
   }
 
   async #sendTrackedText({ toUserId, text, signal, fullText = text, chunkIndex = 0, chunkCount = 1 }) {

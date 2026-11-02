@@ -1,4 +1,4 @@
-export const WECOM_APP_STYLE_ID = 'xmanrui-dsh-im-wecom-app-settings';
+export const WECOM_APP_STYLE_ID = 'onlyforchris-dsh-im-wecom-app-settings';
 
 const CSS = String.raw`
 .dwecomapp-page { --ddt-accent: #07c160; --ddt-accent-deep: #059a4c; --ddt-accent-wash: #eefaf3; }
@@ -17,7 +17,7 @@ export function installWecomAppStyles() {
   const existing = document.querySelector(`style[data-plugin-css="${WECOM_APP_STYLE_ID}"]`);
   if (existing) return () => {};
   const style = document.createElement('style');
-  style.dataset.plugin = '@xmanrui/dsh-im';
+  style.dataset.plugin = '@onlyforchris/dsh-im';
   style.dataset.pluginCss = WECOM_APP_STYLE_ID;
   style.textContent = CSS;
   document.head.appendChild(style);

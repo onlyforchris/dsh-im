@@ -1,4 +1,4 @@
-export const OFFICE_STYLE_ID = 'xmanrui-dsh-im-office-settings';
+export const OFFICE_STYLE_ID = 'onlyforchris-dsh-im-office-settings';
 
 const CSS = `
 .dof-page { --dof-accent: var(--dsw-alias-brand-primary, #3964fe); }

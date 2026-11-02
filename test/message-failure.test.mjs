@@ -7,6 +7,7 @@ import {
   classifyMessageFailure,
   messageFailureText,
   publicMessageFailure,
+  messageFailureDiagnostic,
 } from '../src/channels/shared/message-failure.mjs';
 
 const options = { referenceId: 'MF-TEST01', at: 123 };
@@ -113,6 +114,19 @@ test('English transport failures include translated diagnostics and preserve unc
     assert.match(messageFailureText(failure), /Error code: .*reference: MF-TEST01/u);
     assert.doesNotMatch(JSON.stringify(failure), /[\u4e00-\u9fff]/u);
   }
+});
+
+test('unknown Harness failures retain safe call diagnostics without exposing exception text', () => {
+  const error = Object.assign(new TypeError('secret token and private path'), { method: 'workspace.list', code: 'internal' });
+  const failure = classifyMessageFailure(error, options);
+  assert.equal(messageFailureDiagnostic(error, failure).errors[0].type, 'TypeError');
+  assert.equal(failure.details.method, 'workspace.list');
+  assert.deepEqual(publicMessageFailure(failure).details, failure.details);
+  assert.equal(messageFailureDiagnostic(error, failure).details.method, 'workspace.list');
+  assert.doesNotMatch(JSON.stringify(failure), /secret|private/);
+  const unsafe = classifyMessageFailure({ name: 'secret', method: '/private/path' }, options);
+  assert.equal(messageFailureDiagnostic({ name: 'secret' }, unsafe).errors[0].type, 'Error');
+  assert.equal(unsafe.details.method, undefined);
 });
 
 for (const code of ['model-unavailable', 'session/model-unavailable'])

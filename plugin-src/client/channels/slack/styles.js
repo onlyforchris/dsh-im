@@ -1,4 +1,4 @@
-export const SLACK_STYLE_ID = 'xmanrui-dsh-im-slack-settings';
+export const SLACK_STYLE_ID = 'onlyforchris-dsh-im-slack-settings';
 
 const CSS = String.raw`
 .dsl-page { --ddt-accent: #4a154b; --ddt-accent-deep: #321033; --ddt-accent-wash: #f7eef7; }
@@ -26,7 +26,7 @@ export function installSlackStyles() {
   const existing = document.querySelector(`style[data-plugin-css="${SLACK_STYLE_ID}"]`);
   if (existing) return () => {};
   const style = document.createElement('style');
-  style.dataset.plugin = '@xmanrui/dsh-im';
+  style.dataset.plugin = '@onlyforchris/dsh-im';
   style.dataset.pluginCss = SLACK_STYLE_ID;
   style.textContent = CSS;
   document.head.appendChild(style);

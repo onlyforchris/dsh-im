@@ -355,6 +355,18 @@ export class WecomController {
     });
   }
 
+  async sendNotification(botId, text, media) {
+    const config = this.#configStore.get(botId);
+    if (!config) throw new Error('Unknown Enterprise WeChat bot');
+    return this.#withBotTransition(botId, async () => {
+      const runtime = this.#runtimes.get(botId);
+      if (!runtime?.status?.ready || typeof runtime.sendNotification !== 'function') {
+        throw connectionTestTargetUnavailable('企业微信机器人');
+      }
+      return runtime.sendNotification(text, media);
+    });
+  }
+
   async sendProactiveText(botId, target, text, options = {}) {
     const config = this.#configStore.get(botId);
     if (!config) throw new Error('Unknown Enterprise WeChat bot');

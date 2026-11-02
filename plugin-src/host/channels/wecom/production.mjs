@@ -20,6 +20,7 @@ import { listAgentPresetCatalog } from '../../../../src/channels/shared/agent-pr
 import { listModelCatalog } from '../../../../src/channels/shared/model-setting.mjs';
 import { createDeliveryAdapter } from '../../delivery-adapter.mjs';
 import { createConnectionSupervisor } from './connection-supervisor.mjs';
+import { startNotificationOutbox } from './notification-outbox-wiring.mjs';
 import { createHarnessCommandExecutor } from '../../harness-command-executor.mjs';
 import { harnessConnection } from '../../harness-connection.mjs';
 import { createHarnessSessionExecutors } from '../../harness-session-coordinator.mjs';
@@ -129,6 +130,7 @@ export async function createProductionController(ctx, config = {}, internals = {
       return new Runtime({
         config: botConfig,
         secret,
+        sourceChannelLabel: '企微',
         harness: workspaceScope.harness,
         state: workspaceScope.state,
         contextEnhancement: { botId, getSettings: () => workspaces.contextEnhancementFor(botId) },
@@ -176,13 +178,18 @@ export async function createProductionController(ctx, config = {}, internals = {
     retryDelaysMs: config.retryDelaysMs,
     healthyIntervalMs: config.healthyIntervalMs,
   }).start();
+  // S5 通知 outbox：由当前 WeCom production 入口实例化并消费（04_13 P0-B）。
+  // 仅当 profile 配置了 notificationOutboxDir 时启用；未配置则保持原行为。
+  const notificationOutbox = await startNotificationOutbox({ config, controller, logger });
   return {
     controller,
     deliveryAdapter: createDeliveryAdapter({ dsBot: config.deliveryService?.dsBot,
       channel: 'wecom', workspaces, coreController, stateFor,
     }),
     ready: supervisor.ready,
+    notificationOutbox,
     async close() {
+      await notificationOutbox?.close();
       await supervisor.close();
       await controller.close();
       harness.stopManagedProcess();

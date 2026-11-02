@@ -115,8 +115,9 @@ async function readyStatus(browser, channel = 'feishu') {
   for (;;) {
     const response = await rpc(browser, channel);
     const result = response.status === 200 ? JSON.parse(response.body).result : null;
-    if (result?.ok !== false || result.error?.code !== `${channel}-initializing`
-      || Date.now() >= deadline) return response;
+    const initializing = response.status === 404
+      || (result?.ok === false && result.error?.code === `${channel}-initializing`);
+    if (!initializing || Date.now() >= deadline) return response;
     await delay(100);
   }
 }
@@ -178,12 +179,12 @@ try {
   const packages = {
     '@deepseek-ai/dsh-base': resolve(harnessRoot, 'packages/bundle/base'),
     '@deepseek-ai/dsh-web-app': resolve(harnessRoot, 'packages/bundle/web-app'),
-    '@xmanrui/dsh-im': pluginRoot,
+    '@onlyforchris/dsh-im': pluginRoot,
   };
   for (const [name, path] of Object.entries(packages)) {
     const target = join(profile, 'node_modules', name);
     await mkdir(dirname(target), { recursive: true });
-    await symlink(path, target, 'dir');
+    await symlink(path, target, process.platform === 'win32' ? 'junction' : 'dir');
   }
   await writeFile(join(profile, 'cordis.yml'), '[]\n');
   await writeFile(join(profile, 'package.json'), JSON.stringify({
@@ -256,8 +257,9 @@ try {
   await verifyDenied('Trusted management hosts still require matching Origin', trustedDomain, 403, { origin: otherTrustedOrigin.origin });
 
   await stop();
-  await writeFile(join(profile, 'cordis.patch.yml'), '- id: xmanrui-dsh-im\n  config:\n    rpcAuthority: loopback\n');
+  await writeFile(join(profile, 'cordis.patch.yml'), '- id: onlyforchris-dsh-im\n  config:\n    rpcAuthority: loopback\n');
   const restrictedUrl = await start();
+  await readyStatus(await login(restrictedUrl, '127.0.0.1'));
   expectStatus('Explicit loopback rejects LAN', await rpc(await login(restrictedUrl, lanIp)), 403);
   await verifyDenied('Explicit loopback management rejects LAN', await login(restrictedUrl, lanIp), 403);
   expectStatus('Explicit loopback accepts 127.0.0.1', await readyStatus(await login(restrictedUrl, '127.0.0.1')), 200, true);

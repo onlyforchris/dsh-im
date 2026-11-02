@@ -15,7 +15,12 @@ function cleanText(value) {
 export function rememberConnectionTestTarget(state, target) {
   if (!state || !target || typeof target !== 'object') return false;
   try {
-    targets.set(stateIdentity(state), structuredClone(target));
+    const snapshot = structuredClone(target);
+    targets.set(stateIdentity(state), snapshot);
+    const persisted = typeof state.setConnectionTestTarget === 'function'
+      ? state.setConnectionTestTarget(snapshot)
+      : null;
+    persisted?.catch?.(() => undefined);
     return true;
   } catch {
     return false;
@@ -24,7 +29,15 @@ export function rememberConnectionTestTarget(state, target) {
 
 export function connectionTestTarget(state) {
   const target = state ? targets.get(stateIdentity(state)) : null;
-  return target ? structuredClone(target) : null;
+  if (target) return structuredClone(target);
+  try {
+    const persisted = typeof state?.connectionTestTarget === 'function'
+      ? state.connectionTestTarget()
+      : null;
+    return persisted ? structuredClone(persisted) : null;
+  } catch {
+    return null;
+  }
 }
 
 export function connectionTestMessage(botName, channelLabel = t('机器人')) {

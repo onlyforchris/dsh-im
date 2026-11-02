@@ -554,6 +554,7 @@ export class DiscordRuntime {
   #createApi;
   #createWebSocket;
   #random;
+  #sourceChannelLabel;
   #status = createDiscordRuntimeStatus();
   #api = null;
   #bridge = null;
@@ -587,6 +588,7 @@ export class DiscordRuntime {
     createApi = (options) => new DiscordApi(options),
     createWebSocket = (url) => new WebSocket(url),
     random = Math.random,
+    sourceChannelLabel,
   }) {
     if (!config || !token || !harness || !state) {
       throw new TypeError('DiscordRuntime requires config, token, Harness, and state');
@@ -605,6 +607,7 @@ export class DiscordRuntime {
     this.#createApi = createApi;
     this.#createWebSocket = createWebSocket;
     this.#random = random;
+    this.#sourceChannelLabel = sourceChannelLabel;
   }
 
   get status() {
@@ -695,6 +698,7 @@ export class DiscordRuntime {
         status: this.#status,
         logger: this.#logger,
         replyTimeoutMs: this.#replyTimeoutMs,
+        sourceChannelLabel: this.#sourceChannelLabel,
         signal: controller.signal,
       });
       let timer;

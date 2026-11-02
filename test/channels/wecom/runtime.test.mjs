@@ -37,28 +37,28 @@ test('Enterprise WeChat runtime sends a connection test only to the remembered p
     code: 'test-target-unavailable',
   });
   rememberConnectionTestTarget(state, { chatId: 'member-private' });
-  assert.deepEqual(await runtime.sendConnectionTest('测试'), { sent: true });
-  assert.deepEqual(client.sent, [{
-    chatId: 'member-private',
-    body: { msgtype: 'markdown', markdown: { content: '测试' } },
-  }]);
+  assert.deepEqual(await runtime.sendConnectionTest('测试'), { sent: true, mode: 'text' });
+  assert.deepEqual(
+    await runtime.sendNotification('图片通知摘要', { type: 'image' }),
+    { sent: true, mode: 'text-fallback' },
+  );
   assert.deepEqual(await runtime.sendProactiveText({
     kind: 'group',
     route: { chatId: 'group-target' },
   }, '主动投递'), { sent: true });
-  assert.deepEqual(client.sent[1], {
+  assert.deepEqual(client.sent[2], {
     chatId: 'group-target',
     body: { msgtype: 'markdown', markdown: { content: '主动投递' } },
   });
   await runtime.sendProactiveText({ kind: 'user', route: { chatId: 'member-private' } },
     '**同步回答**', { format: 'markdown' });
-  assert.deepEqual(client.sent[2], {
+  assert.deepEqual(client.sent[3], {
     chatId: 'member-private', body: { msgtype: 'markdown', markdown: { content: '**同步回答**' } },
   });
   const rows = Array.from({ length: 500 }, (_, i) => `row_${i} = "中文😀";`);
   await runtime.sendProactiveText({ kind: 'user', route: { chatId: 'member-private' } },
     '```js\n' + rows.join('\n') + '\n```', { format: 'markdown' });
-  const chunks = client.sent.slice(3).map(call => call.body.markdown.content);
+  const chunks = client.sent.slice(4).map(call => call.body.markdown.content);
   assert.ok(chunks.length > 1);
   assert.ok(chunks.every(chunk => Buffer.byteLength(chunk) <= 18_000));
   for (const row of rows) assert.equal(chunks.join('\n').split(row).length - 1, 1);

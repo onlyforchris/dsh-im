@@ -1,4 +1,4 @@
-export const MATRIX_STYLE_ID = 'xmanrui-dsh-im-matrix-settings';
+export const MATRIX_STYLE_ID = 'onlyforchris-dsh-im-matrix-settings';
 
 const CSS = String.raw`
 .dmt-page { --ddt-accent: #1a8f6f; --ddt-accent-deep: #12654f; --ddt-accent-wash: #eef8f4; }
@@ -28,7 +28,7 @@ export function installMatrixStyles() {
   const existing = document.querySelector(`style[data-plugin-css="${MATRIX_STYLE_ID}"]`);
   if (existing) return () => {};
   const style = document.createElement('style');
-  style.dataset.plugin = '@xmanrui/dsh-im';
+  style.dataset.plugin = '@onlyforchris/dsh-im';
   style.dataset.pluginCss = MATRIX_STYLE_ID;
   style.textContent = CSS;
   document.head.appendChild(style);

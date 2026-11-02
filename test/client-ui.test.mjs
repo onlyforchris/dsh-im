@@ -222,7 +222,7 @@ test('IM settings renders twelve IM channels plus the AI Office connector', asyn
   ));
   assert.doesNotMatch(markup, /dim-versionTooltip|当前版本/);
   assert.doesNotMatch(markup, /dim-brandLogo|<img/);
-  assert.match(markup, /href="https:\/\/github\.com\/xmanrui\/dsh-im"/);
+  assert.match(markup, /href="https:\/\/github\.com\/onlyforchris\/dsh-im"/);
   assert.match(markup, /target="_blank"/);
   assert.match(markup, /rel="noopener noreferrer"/);
   assert.match(markup, /aria-label="dsh-im GitHub"/);
@@ -1337,7 +1337,7 @@ test('client registers one top-level bilingual IM settings section with a direct
     assert.deepEqual(Object.keys(dictionaries[0].value.en).sort(), Object.keys(dictionaries[0].value.zh).sort());
     assert.equal(registrations.length, 1);
     assert.equal(registrations[0].options.name, 'settings.section');
-    assert.equal(registrations[0].options.id, 'xmanrui-dsh-im');
+    assert.equal(registrations[0].options.id, 'onlyforchris-dsh-im');
     assert.equal(registrations[0].options.order, 21);
     assert.equal(registrations[0].options.locale, IM_LOCALE_NAMESPACE);
     assert.equal(registrations[0].options.label(), 'IM bots');

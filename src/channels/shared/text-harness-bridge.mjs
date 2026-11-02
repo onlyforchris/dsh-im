@@ -197,6 +197,7 @@ export class TextHarnessBridge {
   #replyTimeoutMs;
   #signal;
   #keepaliveIntervalMs;
+  #sourceChannelLabel;
   #queues = new Map();
   // Crash-recovery for #queues, started with the bridge; see recoverPendingMessages().
   #pendingRecovery = null;
@@ -242,6 +243,7 @@ export class TextHarnessBridge {
     status = createTextBridgeStatus(),
     logger = console,
     replyTimeoutMs = 600_000,
+    sourceChannelLabel,
     signal,
     keepaliveIntervalMs = 4_000,
     interactionCard = null,
@@ -291,6 +293,7 @@ export class TextHarnessBridge {
     this.#deferred = createDeferredDeliveryCoordinator({ harness, state, signal, logger,
       deliver: (entry, outcome) => this.#deliverDeferredOutcome(entry, outcome),
     });
+    this.#sourceChannelLabel = sourceChannelLabel;
     this.#approvals = new HarnessApprovalQueue({
       label: descriptor.key,
       logger,
@@ -1334,6 +1337,9 @@ export class TextHarnessBridge {
         key: conversationKey,
         text,
         content,
+        channelLabel: this.#sourceChannelLabel,
+        fromUserId: senderId,
+        msgId: messageId,
         titleText: batchSubmission?.title,
         sourceGuidance: snapshot?.config?.guidance,
         contextEnhanced,

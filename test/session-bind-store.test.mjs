@@ -301,13 +301,13 @@ test('an ordinary first prompt keeps DSH title handling while model switch share
     key: 'conversation',
     text: 'first prompt',
   });
+  await askStarted.promise;
   const switching = runModelCommand(
     '/model provider/model',
     harness,
     state,
     'conversation',
   );
-  await askStarted.promise;
 
   let switchResult;
   try {
