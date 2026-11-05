@@ -1,6 +1,6 @@
 {
   "name": "@onlyforchris/dsh-im",
-  "version": "5.9.1-2",
+  "version": "5.10.0-1",
   "icon": "./assets/logo-plugin-message-link-gradient.webp",
   "description": "把微信、飞书、企微、钉钉、QQ、Telegram、WhatsApp、Slack、Discord、Matrix接入DSH。 Connect Telegram, WhatsApp, Slack, Discord, Matrix, WeChat, Feishu, WeCom, DingTalk, and QQ to DSH.",
   "keywords": [
@@ -90,11 +90,12 @@
       "platform": "web"
     },
     "compatibility": {
-      "dsh": "0.2.1-rc.5",
+      "dsh": "0.2.2-rc.1",
       "dshReleases": {
         "0.2.0-rc.2": "compatible",
         "0.2.1-rc.2": "compatible",
-        "0.2.1-rc.5": "compatible"
+        "0.2.1-rc.5": "compatible",
+        "0.2.2-rc.1": "compatible"
       },
       "profiles": [
         "web"

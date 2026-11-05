@@ -3,6 +3,18 @@ import test from 'node:test';
 import { installImPreAsk } from '../src/channels/shared/im-pre-ask.mjs';
 import { askInWorkspaceSession } from '../src/channels/shared/workspace-session.mjs';
 
+test('without a pre-ask runner the upstream path does not resolve extra workspace RPCs', async () => {
+  const result = await askInWorkspaceSession({
+    harness: {
+      resolveConversationWorkspace: () => assert.fail('optional recruiting gate is not installed'),
+      sessionExists: async () => true,
+      ask: async () => 'upstream answer',
+    },
+    state: { sessionFor: () => 'session' }, key: 'chat', text: 'hello',
+  });
+  assert.equal(result.answer, 'upstream answer');
+});
+
 test('pre-ask replies bypass Harness and continuing preserves upstream guidance', async () => {
   let decision = { kind: 'reply', text: 'handled' };
   const dispose = installImPreAsk(async payload => {

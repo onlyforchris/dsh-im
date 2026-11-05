@@ -11,6 +11,10 @@
  */
 let preAskRunner = null;
 
+export function hasImPreAsk() {
+  return preAskRunner !== null;
+}
+
 export function installImPreAsk(runner) {
   preAskRunner = typeof runner === 'function' ? runner : null;
   return () => {
